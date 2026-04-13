@@ -224,6 +224,15 @@ class Model:
         self.shape_gap: wp.array[wp.float32] | None = None
         """Shape additional contact detection gap [m], shape [shape_count], float."""
 
+        # New cslc addition
+        self.shape_cslc_spacing: wp.array[wp.float32] | None = None
+        self.shape_cslc_ka: wp.array[wp.float32] | None = None
+        self.shape_cslc_kl: wp.array[wp.float32] | None = None
+        self.shape_cslc_dc: wp.array[wp.float32] | None = None
+        # Python-side config (not GPU arrays — used by CSLCHandler at init)
+        self.shape_cslc_n_iter: list[int] | None = None
+        self.shape_cslc_alpha: list[float] | None = None
+
         # Shape geometry properties
         self.shape_type: wp.array[wp.int32] | None = None
         """Shape geometry type, shape [shape_count], int32."""

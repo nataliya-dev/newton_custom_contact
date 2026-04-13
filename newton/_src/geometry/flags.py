@@ -36,6 +36,10 @@ class ShapeFlags(IntEnum):
     """Indicates that the shape uses hydroelastic collision."""
 
 
+    CSLC = 1 << 5
+    """Indicates that the shape uses cslc."""
+
+
 __all__ = [
     "ParticleFlags",
     "ShapeFlags",

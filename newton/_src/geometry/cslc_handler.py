@@ -1,0 +1,352 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""CSLC collision handler for Newton's CollisionPipeline.
+
+Constructed via CSLCHandler._from_model(model) during CollisionPipeline.__init__.
+Called via CSLCHandler.launch() during CollisionPipeline.collide(), AFTER the
+standard narrow phase has run.
+
+CSLC writes to pre-allocated contact slots at the end of the Contacts buffer,
+avoiding atomic_add for full differentiability.
+
+File location: newton/_src/geometry/cslc_handler.py
+"""
+
+from __future__ import annotations
+
+import warnings
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+import warp as wp
+
+from .cslc_data import CSLCData, CSLCPad, calibrate_kc, create_pad_for_box
+from .cslc_kernels import (
+    compute_cslc_penetration_sphere,
+    jacobi_step,
+    write_cslc_contacts,
+)
+
+if TYPE_CHECKING:
+    from ..sim.contacts import Contacts
+    from ..sim.model import Model
+    from ..sim.state import State
+
+
+# Must match the value in geometry/types.py
+_CSLC_FLAG = 1 << 5
+# GeoType.SPHERE — Newton stores this as int
+_GEOTYPE_SPHERE = 3   # GeoType.SPHERE
+_GEOTYPE_BOX = 7      # GeoType.BOX
+
+
+@dataclass
+class CSLCShapePair:
+    """A shape pair where one shape has the CSLC flag."""
+
+    cslc_shape: int
+    other_shape: int
+    other_geo_type: int
+    # Cached at construction — avoids GPU→CPU sync per step (Bug 3)
+    other_body: int = 0
+    other_local_pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    other_radius: float = 0.0
+
+class CSLCHandler:
+    """CSLC contact generation handler for Newton's collision pipeline.
+
+    Constructed by _from_model() which inspects the Model for CSLC-flagged
+    shapes, auto-generates lattice pads, calibrates kc, and builds CSLCData.
+
+    During collide(), launch() runs the three-kernel pipeline:
+        1. Penetration computation (per surface sphere vs target)
+        2. Jacobi equilibrium solve (warm-started from previous timestep)
+        3. Contact buffer writing (pre-allocated slots, fully differentiable)
+
+    Attributes:
+        contact_count: Number of contact slots CSLC will write (= n_surface_spheres).
+    """
+
+    def __init__(
+        self,
+        cslc_data: CSLCData,
+        shape_pairs: list[CSLCShapePair],
+        n_iter: int,
+        alpha: float,
+        surface_slot_map: wp.array,
+        n_surface_contacts: int,
+        device: Any = None,
+    ):
+        self.cslc_data = cslc_data
+        self.shape_pairs = shape_pairs
+        self.n_iter = n_iter
+        self.alpha = alpha
+        self.surface_slot_map = surface_slot_map
+        self.n_surface_contacts = n_surface_contacts
+        self.device = device or wp.get_device()
+
+        n = cslc_data.n_spheres
+        self.raw_penetration = wp.zeros(n, dtype=wp.float32, device=self.device)
+        self.contact_normal_scratch = wp.zeros(n, dtype=wp.vec3, device=self.device)
+        self._jacobi_a = wp.zeros(n, dtype=wp.float32, device=self.device)
+        self._jacobi_b = wp.zeros(n, dtype=wp.float32, device=self.device)
+
+    @property
+    def contact_count(self) -> int:
+        """Number of pre-allocated contact slots for CSLC."""
+        return self.n_surface_contacts
+
+    @classmethod
+    def _from_model(cls, model: Model) -> CSLCHandler | None:
+        """Create a CSLCHandler from a Model, or None if no CSLC shapes exist.
+
+        Follows the same pattern as HydroelasticSDF._from_model().
+        """
+        shape_flags = model.shape_flags.numpy()
+        shape_types = model.shape_type.numpy()
+
+        cslc_shape_indices = [
+            i for i in range(model.shape_count) if (shape_flags[i] & _CSLC_FLAG)
+        ]
+        if not cslc_shape_indices:
+            return None
+
+        # Find shape pairs involving CSLC shapes
+        cslc_shape_set = set(cslc_shape_indices)
+        shape_pairs: list[CSLCShapePair] = []
+
+        if model.shape_contact_pairs is not None:
+            all_pairs = model.shape_contact_pairs.numpy()
+            for sa, sb in all_pairs:
+                if sa in cslc_shape_set and sb not in cslc_shape_set:
+                    shape_pairs.append(CSLCShapePair(
+                        cslc_shape=int(sa), other_shape=int(sb),
+                        other_geo_type=int(shape_types[sb]),
+                    ))
+                elif sb in cslc_shape_set and sa not in cslc_shape_set:
+                    shape_pairs.append(CSLCShapePair(
+                        cslc_shape=int(sb), other_shape=int(sa),
+                        other_geo_type=int(shape_types[sa]),
+                    ))
+                # Both CSLC: not yet supported
+
+        if not shape_pairs:
+            return None
+
+        # Read per-shape CSLC parameters
+        cslc_spacing = model.shape_cslc_spacing.numpy()
+        cslc_ka_arr = model.shape_cslc_ka.numpy()
+        cslc_kl_arr = model.shape_cslc_kl.numpy()
+        cslc_dc_arr = model.shape_cslc_dc.numpy()
+        shape_ke = model.shape_material_ke.numpy()
+
+        first_cslc = cslc_shape_indices[0]
+        ka = float(cslc_ka_arr[first_cslc])
+        kl = float(cslc_kl_arr[first_cslc])
+        dc = float(cslc_dc_arr[first_cslc])
+
+        # Auto-generate lattice pads
+        pads: list[CSLCPad] = []
+        shape_scale_np = model.shape_scale.numpy()
+        for shape_idx in cslc_shape_indices:
+            geo_type = int(shape_types[shape_idx])
+            spacing = float(cslc_spacing[shape_idx])
+
+            if geo_type == _GEOTYPE_BOX:
+                hx = float(shape_scale_np[shape_idx][0])
+                hy = float(shape_scale_np[shape_idx][1])
+                hz = float(shape_scale_np[shape_idx][2])
+                pad = create_pad_for_box(hx, hy, hz, spacing=spacing, shape_index=shape_idx)
+                pads.append(pad)
+            else:
+                warnings.warn(
+                    f"CSLC shape {shape_idx} has geometry type {geo_type} "
+                    f"which is not yet supported. Only BOX is implemented.",
+                    RuntimeWarning, stacklevel=2,
+                )
+
+        if not pads:
+            return None
+
+        # Calibrate kc from bulk ke
+        ke_bulk = float(shape_ke[first_cslc])
+        kc = calibrate_kc(ke_bulk, pads, ka=ka)
+
+
+
+        cslc_data = CSLCData.from_pads(pads, ka=ka, kl=kl, kc=kc, dc=dc, device=model.device)
+
+
+        # ── Filter CSLC pairs from narrow phase (Bug 2) ──
+        # Prevents double-counting: narrow phase would also generate
+        # contacts for these pairs if we don't exclude them.
+        if not hasattr(model, 'shape_collision_filter_pairs'):
+            model.shape_collision_filter_pairs = set()
+        for pair in shape_pairs:
+            a = min(pair.cslc_shape, pair.other_shape)
+            b = max(pair.cslc_shape, pair.other_shape)
+            model.shape_collision_filter_pairs.add((a, b))
+
+        # ── Cache target info per pair (Bug 3) ──
+        # One-time CPU read at construction instead of per-step .numpy()
+        shape_body_np = model.shape_body.numpy()
+        shape_transform_np = model.shape_transform.numpy()
+        for pair in shape_pairs:
+            if pair.other_geo_type == _GEOTYPE_SPHERE:
+                pair.other_body = int(shape_body_np[pair.other_shape])
+                xform = shape_transform_np[pair.other_shape]
+                pair.other_local_pos = (
+                    float(xform[0]), float(xform[1]), float(xform[2]),
+                )
+                pair.other_radius = float(shape_scale_np[pair.other_shape][0])
+
+        # Build surface slot map: surface sphere i -> sequential slot index
+        is_surface_np = cslc_data.is_surface.numpy()
+        surface_slot_map = np.full(cslc_data.n_spheres, -1, dtype=np.int32)
+        slot = 0
+        for i in range(cslc_data.n_spheres):
+            if is_surface_np[i] == 1:
+                surface_slot_map[i] = slot
+                slot += 1
+
+
+
+
+        # Read solver params from model (Bug 6 fix)
+        if model.shape_cslc_n_iter is not None:
+            n_iter = int(model.shape_cslc_n_iter[first_cslc])
+        else:
+            n_iter = 40
+        if model.shape_cslc_alpha is not None:
+            alpha = float(model.shape_cslc_alpha[first_cslc])
+        else:
+            alpha = 0.3
+
+        return cls(
+            cslc_data=cslc_data,
+            shape_pairs=shape_pairs,
+            n_iter=n_iter,
+            alpha=alpha,
+            surface_slot_map=wp.array(surface_slot_map, dtype=wp.int32, device=model.device),
+            n_surface_contacts=slot,
+            device=model.device,
+        )
+
+    def launch(
+        self,
+        model: Model,
+        state: State,
+        contacts: Contacts,
+        contact_offset: int,
+    ) -> None:
+        """Run CSLC narrow phase: penetration -> Jacobi -> contact writing.
+
+        Called by CollisionPipeline.collide() AFTER the standard narrow phase.
+
+        Args:
+            model: The simulation Model.
+            state: Current State (provides body_q).
+            contacts: Contacts buffer to write to.
+            contact_offset: Starting index in contacts buffer for CSLC slots.
+        """
+        for pair in self.shape_pairs:
+            if pair.other_geo_type == _GEOTYPE_SPHERE:
+                self._launch_vs_sphere(model, state, contacts, contact_offset, pair)
+            else:
+                warnings.warn(
+                    f"CSLC vs geometry type {pair.other_geo_type} not yet implemented. "
+                    f"Only CSLC vs SPHERE is supported.",
+                    RuntimeWarning, stacklevel=2,
+                )
+
+    def _launch_vs_sphere(
+            self,
+            model: Model,
+            state: State,
+            contacts: Contacts,
+            contact_offset: int,
+            pair: CSLCShapePair,
+        ) -> None:
+            """Three-kernel pipeline for CSLC shape vs sphere target."""
+            data = self.cslc_data
+
+            # ── Use cached target info (Bug 3 fix) ──
+            # No .numpy() calls — these were cached at construction
+            target_body = pair.other_body
+            target_local_pos = wp.vec3(
+                pair.other_local_pos[0],
+                pair.other_local_pos[1],
+                pair.other_local_pos[2],
+            )
+            target_radius = pair.other_radius
+
+            # ── Kernel 1: Raw penetration ──
+            wp.launch(
+                kernel=compute_cslc_penetration_sphere,
+                dim=data.n_spheres,
+                inputs=[
+                    data.positions, data.radii, data.sphere_delta,
+                    data.sphere_shape, data.is_surface, data.outward_normals,
+                    state.body_q, model.shape_body, model.shape_transform,
+                    target_body, pair.other_shape, target_local_pos, target_radius,
+                ],
+                outputs=[self.raw_penetration, self.contact_normal_scratch],
+                device=self.device,
+            )
+
+            # ── Kernel 2: Jacobi solve ──
+            wp.copy(self._jacobi_a, data.sphere_delta)
+            src, dst = self._jacobi_a, self._jacobi_b
+
+            for _ in range(self.n_iter):
+                wp.launch(
+                    kernel=jacobi_step,
+                    dim=data.n_spheres,
+                    inputs=[
+                        src, dst, self.raw_penetration, data.is_surface,
+                        data.neighbor_start, data.neighbor_count, data.neighbor_list,
+                        data.ka, data.kl, data.kc, self.alpha,
+                    ],
+                    device=self.device,
+                )
+                src, dst = dst, src
+
+            # Warm-start: write converged delta back
+            wp.copy(data.sphere_delta, src)
+
+            # ── Kernel 3: Write contacts ──
+            # Bug 1 fix: contact_normal_scratch REMOVED from inputs
+            #            (kernel recomputes the normal internally)
+            # Issue 11 fix: material property arrays added at the end
+            wp.launch(
+                kernel=write_cslc_contacts,
+                dim=data.n_spheres,
+                inputs=[
+                    data.positions, data.radii, src,
+                    data.sphere_shape, data.is_surface, data.outward_normals,
+                    state.body_q, model.shape_body, model.shape_transform,
+                    target_body, pair.other_shape, target_local_pos, target_radius,
+                    contact_offset, self.surface_slot_map,
+                    # Contacts buffer arrays
+                    contacts.rigid_contact_shape0,
+                    contacts.rigid_contact_shape1,
+                    contacts.rigid_contact_point0,
+                    contacts.rigid_contact_point1,
+                    contacts.rigid_contact_offset0,
+                    contacts.rigid_contact_offset1,
+                    contacts.rigid_contact_normal,
+                    contacts.rigid_contact_margin0,
+                    contacts.rigid_contact_margin1,
+                    contacts.rigid_contact_tids,
+                    # Per-contact material properties
+                    model.shape_material_mu,
+                    data.kc,
+                    data.dc,
+                    contacts.rigid_contact_stiffness,
+                    contacts.rigid_contact_damping,
+                    contacts.rigid_contact_friction,
+                ],
+                device=self.device,
+            )

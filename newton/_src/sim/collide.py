@@ -21,6 +21,8 @@ from ..geometry.support_function import (
     SupportMapDataProvider,
     pack_mesh_ptr,
 )
+from ..geometry.cslc_handler import CSLCHandler
+
 from ..geometry.types import GeoType
 from ..sim.contacts import Contacts
 from ..sim.model import Model
@@ -53,6 +55,24 @@ class ContactWriterData:
     out_stiffness: wp.array[float]
     out_damping: wp.array[float]
     out_friction: wp.array[float]
+
+
+@wp.kernel(enable_backward=False)
+def _set_cslc_contact_count(
+    contact_count: wp.array(dtype=wp.int32),
+    cslc_offset: int,
+    n_cslc: int,
+):
+    """Ensure rigid_contact_count covers both narrow-phase and CSLC contacts.
+
+    Sets count = max(current_count, cslc_offset + n_cslc) so the solver
+    iterates over all valid contact slots including CSLC's pre-allocated range.
+    """
+    current = contact_count[0]
+    needed = cslc_offset + n_cslc
+    if needed > current:
+        contact_count[0] = needed
+
 
 
 @wp.func
@@ -544,6 +564,54 @@ class CollisionPipeline:
                 )
             self.narrow_phase = narrow_phase
             self.hydroelastic_sdf = self.narrow_phase.hydroelastic_sdf
+
+            # ── CSLC handler (runs after narrow phase in collide()) ──
+            self.cslc_handler = CSLCHandler._from_model(model)
+            if self.cslc_handler is not None:
+                # Expand contact budget to include CSLC's pre-allocated slots
+                n_cslc = self.cslc_handler.contact_count
+                self._rigid_contact_max += n_cslc
+                model.rigid_contact_max = self._rigid_contact_max
+                # CSLC writes to the LAST n_cslc slots in the buffer.
+                # The narrow phase uses slots [0, rigid_contact_max - n_cslc).
+                self.cslc_contact_offset = self._rigid_contact_max - n_cslc
+
+                # ── Bug 2 fix: rebuild excluded pairs ──
+                # _from_model added CSLC pairs to model.shape_collision_filter_pairs.
+                # Rebuild so the broad/narrow phase skips them (prevents double-counting).
+                self.shape_pairs_excluded = self._build_excluded_pairs(model)
+                self.shape_pairs_excluded_count = (
+                    self.shape_pairs_excluded.shape[0]
+                    if self.shape_pairs_excluded is not None
+                    else 0
+                )
+
+                # ── EXPLICIT mode: also filter precomputed pair list ──
+                # In EXPLICIT broad-phase mode, shape_contact_pairs was built
+                # during finalize() and already contains CSLC pairs. The
+                # excluded-pairs array handles SAP/NxN modes, but EXPLICIT
+                # mode iterates shape_contact_pairs directly. Remove CSLC
+                # pairs from that list too.
+                if model.shape_contact_pairs is not None:
+                    pairs_np = model.shape_contact_pairs.numpy()
+                    filter_set = model.shape_collision_filter_pairs
+                    filtered = [
+                        (int(a), int(b)) for a, b in pairs_np
+                        if (min(int(a), int(b)), max(int(a), int(b))) not in filter_set
+                    ]
+                    if len(filtered) < len(pairs_np):
+                        import numpy as _np
+                        model.shape_contact_pairs = wp.array(
+                            _np.array(filtered, dtype=_np.int32).reshape(-1, 2)
+                            if filtered
+                            else _np.zeros((0, 2), dtype=_np.int32),
+                            dtype=wp.vec2i, device=model.device,
+                        )
+                        model.shape_contact_pair_count = len(filtered)
+
+
+            else:
+                self.cslc_contact_offset = 0
         else:
             self.broad_phase_mode = mode_from_broad_phase if mode_from_broad_phase is not None else "explicit"
 
@@ -630,6 +698,57 @@ class CollisionPipeline:
             )
             self.hydroelastic_sdf = self.narrow_phase.hydroelastic_sdf
 
+            # ── CSLC handler (runs after narrow phase in collide()) ──
+            self.cslc_handler = CSLCHandler._from_model(model)
+            if self.cslc_handler is not None:
+                # Expand contact budget to include CSLC's pre-allocated slots
+                n_cslc = self.cslc_handler.contact_count
+                self._rigid_contact_max += n_cslc
+                model.rigid_contact_max = self._rigid_contact_max
+                # CSLC writes to the LAST n_cslc slots in the buffer.
+                # The narrow phase uses slots [0, rigid_contact_max - n_cslc).
+                self.cslc_contact_offset = self._rigid_contact_max - n_cslc
+
+                # ── Rebuild excluded pairs (Bug 2 fix) ──
+                # _from_model added CSLC pairs to model.shape_collision_filter_pairs.
+                # Rebuild so the broad/narrow phase skips them (prevents double-counting).
+                self.shape_pairs_excluded = self._build_excluded_pairs(model)
+                self.shape_pairs_excluded_count = (
+                    self.shape_pairs_excluded.shape[0]
+                    if self.shape_pairs_excluded is not None
+                    else 0
+                )
+
+                # ── EXPLICIT mode: also filter precomputed pair list ──
+                # In EXPLICIT broad-phase mode, shape_contact_pairs was built
+                # during finalize() and already contains CSLC pairs. The
+                # excluded-pairs array handles SAP/NxN modes, but EXPLICIT
+                # mode iterates shape_contact_pairs directly. Remove CSLC
+                # pairs from that list too.
+                if model.shape_contact_pairs is not None:
+                    pairs_np = model.shape_contact_pairs.numpy()
+                    filter_set = model.shape_collision_filter_pairs
+                    filtered = [
+                        (int(a), int(b)) for a, b in pairs_np
+                        if (min(int(a), int(b)), max(int(a), int(b))) not in filter_set
+                    ]
+                    if len(filtered) < len(pairs_np):
+                        import numpy as _np
+                        model.shape_contact_pairs = wp.array(
+                            _np.array(filtered, dtype=_np.int32).reshape(-1, 2)
+                            if filtered
+                            else _np.zeros((0, 2), dtype=_np.int32),
+                            dtype=wp.vec2i, device=model.device,
+                        )
+                        model.shape_contact_pair_count = len(filtered)
+                        # Update the pipeline's filtered pairs reference and max
+                        # so the broad phase iterates the correct (filtered) list.
+                        if self.broad_phase_mode == "explicit":
+                            self.shape_pairs_filtered = model.shape_contact_pairs
+                            self.shape_pairs_max = max(len(filtered), 1)
+            else:
+                self.cslc_contact_offset = 0
+
         # Allocate buffers
         with wp.ScopedDevice(device):
             self.broad_phase_pair_count = wp.zeros(1, dtype=wp.int32, device=device)
@@ -689,7 +808,10 @@ class CollisionPipeline:
             self.soft_contact_max,
             requires_grad=self.requires_grad,
             device=self.model.device,
-            per_contact_shape_properties=self.narrow_phase.hydroelastic_sdf is not None,
+            per_contact_shape_properties=(
+                self.narrow_phase.hydroelastic_sdf is not None
+                or self.cslc_handler is not None
+            ),
             requested_attributes=self.model.get_requested_contact_attributes(),
         )
 
@@ -847,7 +969,11 @@ class CollisionPipeline:
 
         # Create ContactWriterData struct for custom contact writing
         writer_data = ContactWriterData()
-        writer_data.contact_max = contacts.rigid_contact_max
+        # If CSLC is active, narrow phase budget excludes CSLC's reserved slots
+        if self.cslc_handler is not None:
+            writer_data.contact_max = self.cslc_contact_offset
+        else:
+            writer_data.contact_max = contacts.rigid_contact_max
         writer_data.body_q = state.body_q
         writer_data.shape_body = model.shape_body
         writer_data.shape_gap = model.shape_gap
@@ -889,6 +1015,50 @@ class CollisionPipeline:
             writer_data=writer_data,
             device=self.device,
         )
+
+
+
+        # ── CSLC contact generation ──
+        # Runs AFTER the standard narrow phase. Writes to pre-allocated
+        # slots at the end of the contacts buffer (no atomic_add).
+        if self.cslc_handler is not None:
+            self.cslc_handler.launch(
+                model=model,
+                state=state,
+                contacts=contacts,
+                contact_offset=self.cslc_contact_offset,
+            )
+            # Update rigid_contact_count to include CSLC contacts.
+            # The narrow phase has already set the count via atomic_add
+            # for its own contacts. We add CSLC's fixed count on top.
+            # This single wp.atomic_add is the only non-differentiable
+            # operation, but it only affects the COUNT, not the contact
+            # data itself. The solver reads contacts[0..count) and
+            # contacts[cslc_offset..cslc_offset+n_cslc) are already written.
+            #
+            # Actually: the solver reads up to rigid_contact_count, so we
+            # need the count to cover CSLC slots too. Since CSLC slots are
+            # at the END (indices >= cslc_contact_offset), we set count to
+            # max(current_count, cslc_contact_offset + n_cslc).
+            # Simplest: just set count = rigid_contact_max (all slots valid).
+            # Slots between narrow_phase_count and cslc_offset are unused
+            # but have shape0 == -1 from contacts.clear(), so the solver
+            # will skip them (shape lookup yields no valid body).
+            #
+            # For correctness, we set count = cslc_offset + n_cslc:
+            n_cslc = self.cslc_handler.contact_count
+            wp.launch(
+                kernel=_set_cslc_contact_count,
+                dim=1,
+                inputs=[
+                    contacts.rigid_contact_count,
+                    self.cslc_contact_offset,
+                    n_cslc,
+                ],
+                device=self.device,
+                record_tape=False,
+            )
+
 
         # Differentiable contact augmentation: reconstruct world-space contact
         # quantities through body_q so that gradients flow via wp.Tape.

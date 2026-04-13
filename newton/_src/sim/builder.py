@@ -280,6 +280,38 @@ class ModelBuilder:
             Users should choose kh to match their desired force-to-penetration ratio.
         """
 
+        # --- NEW CSLC fields (add after kh) ---
+        is_cslc: bool = False
+        """Whether the shape uses CSLC distributed contact.
+        For CSLC collisions, the CSLC shape provides the lattice pad;
+        the other shape in the pair can be any geometry type.
+        Defaults to False."""
+
+        cslc_spacing: float = 0.004
+        """Spacing between lattice spheres [m]. Controls pad resolution.
+        Smaller = more spheres = higher fidelity but more compute."""
+
+        cslc_ka: float = 5000.0
+        """Anchor spring stiffness [N/m]. Resists sphere displacement from rest."""
+
+        cslc_kl: float = 500.0
+        """Lateral spring stiffness [N/m]. Spreads load to neighbors.
+        Higher = wider pressure distribution. 0 = no coupling (N independent
+        point contacts on a grid)."""
+
+        cslc_dc: float = 2.0
+        """Hunt-Crossley damping coefficient [s/m]. Controls energy dissipation
+        during approach/separation."""
+
+        cslc_n_iter: int = 40
+        """Number of Jacobi iterations for quasistatic solve per timestep.
+        More = better equilibrium. 20-60 typical."""
+
+        cslc_alpha: float = 0.3
+        """Jacobi damping factor (under-relaxation). 0.2-0.5 typical.
+        Lower = more stable, higher = faster convergence."""
+
+
         def configure_sdf(
             self,
             *,
@@ -362,6 +394,15 @@ class ModelBuilder:
                 raise ValueError(
                     "Hydroelastic shapes require an SDF. Set either sdf_max_resolution or sdf_target_voxel_size."
                 )
+            if self.is_cslc and self.is_hydroelastic:
+                raise ValueError(
+                    "A shape cannot be both CSLC and hydroelastic. Choose one."
+                )
+            if self.is_cslc and shape_type in (GeoType.PLANE, GeoType.HFIELD):
+                raise ValueError(
+                    "CSLC is not supported for plane or heightfield shapes."
+                )
+
 
         def mark_as_site(self) -> None:
             """Marks this shape as a site and enforces all site invariants.
@@ -388,6 +429,7 @@ class ModelBuilder:
             shape_flags |= ShapeFlags.COLLIDE_PARTICLES if self.has_particle_collision else 0
             shape_flags |= ShapeFlags.SITE if self.is_site else 0
             shape_flags |= ShapeFlags.HYDROELASTIC if self.is_hydroelastic else 0
+            shape_flags |= ShapeFlags.CSLC if self.is_cslc else 0
             return shape_flags
 
         @flags.setter
@@ -396,6 +438,7 @@ class ModelBuilder:
 
             self.is_visible = bool(value & ShapeFlags.VISIBLE)
             self.is_hydroelastic = bool(value & ShapeFlags.HYDROELASTIC)
+            self.is_cslc = bool(value & ShapeFlags.CSLC)
 
             # Check if SITE flag is being set
             is_site_flag = bool(value & ShapeFlags.SITE)
@@ -936,6 +979,15 @@ class ModelBuilder:
         """Per-shape SDF maximum resolutions retained until :meth:`finalize <ModelBuilder.finalize>`."""
         self.shape_sdf_texture_format: list[str] = []
         """Per-shape SDF texture format retained until :meth:`finalize <ModelBuilder.finalize>`."""
+
+
+        # New CSLC addition
+        self.shape_cslc_spacing: list[float] = []
+        self.shape_cslc_ka: list[float] = []
+        self.shape_cslc_kl: list[float] = []
+        self.shape_cslc_dc: list[float] = []
+        self.shape_cslc_n_iter: list[int] = []
+        self.shape_cslc_alpha: list[float] = []
 
         # Mesh SDF storage (texture SDF arrays created at finalize)
 
@@ -5309,6 +5361,15 @@ class ModelBuilder:
         self.shape_sdf_max_resolution.append(cfg.sdf_max_resolution)
         self.shape_sdf_texture_format.append(cfg.sdf_texture_format)
 
+
+        # new cslc addition
+        self.shape_cslc_spacing.append(cfg.cslc_spacing)
+        self.shape_cslc_ka.append(cfg.cslc_ka)
+        self.shape_cslc_kl.append(cfg.cslc_kl)
+        self.shape_cslc_dc.append(cfg.cslc_dc)
+        self.shape_cslc_n_iter.append(cfg.cslc_n_iter)
+        self.shape_cslc_alpha.append(cfg.cslc_alpha)
+
         if cfg.has_shape_collision and cfg.collision_filter_parent and body > -1 and body in self.joint_parents:
             for parent_body in self.joint_parents[body]:
                 if parent_body > -1:
@@ -9593,6 +9654,15 @@ class ModelBuilder:
             )
             m.shape_material_kh = wp.array(self.shape_material_kh, dtype=wp.float32, requires_grad=requires_grad)
             m.shape_gap = wp.array(self.shape_gap, dtype=wp.float32, requires_grad=requires_grad)
+
+            # CSLC per-shape parameters
+            m.shape_cslc_spacing = wp.array(self.shape_cslc_spacing, dtype=wp.float32)
+            m.shape_cslc_ka = wp.array(self.shape_cslc_ka, dtype=wp.float32)
+            m.shape_cslc_kl = wp.array(self.shape_cslc_kl, dtype=wp.float32)
+            m.shape_cslc_dc = wp.array(self.shape_cslc_dc, dtype=wp.float32)
+            # Python-side solver config (read by CSLCHandler at init, not GPU)
+            m.shape_cslc_n_iter = list(self.shape_cslc_n_iter)
+            m.shape_cslc_alpha = list(self.shape_cslc_alpha)
 
             m.shape_collision_filter_pairs = {
                 (min(s1, s2), max(s1, s2)) for s1, s2 in self.shape_collision_filter_pairs
