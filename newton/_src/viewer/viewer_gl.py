@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import collections
 import ctypes
 import re
 import time
@@ -192,6 +193,7 @@ class ViewerGL(ViewerBase):
         height: int = 1080,
         vsync: bool = False,
         headless: bool = False,
+        plot_history_size: int = 250,
     ):
         """
         Initialize the OpenGL viewer and UI.
@@ -201,10 +203,24 @@ class ViewerGL(ViewerBase):
             height: Window height in pixels.
             vsync: Enable vertical sync.
             headless: Run in headless mode (no window).
+            plot_history_size: Maximum number of samples kept per
+                :meth:`log_scalar` signal for the live time-series plots.
         """
+        if not isinstance(plot_history_size, int) or isinstance(plot_history_size, bool):
+            raise TypeError("plot_history_size must be an integer")
+        if plot_history_size <= 0:
+            raise ValueError("plot_history_size must be > 0")
+
         # Pre-initialize callback registry; clear_model() (called from
         # super().__init__()) resets the "side" slot on each model change.
         self._ui_callbacks = {"side": [], "stats": [], "free": [], "panel": []}
+
+        # Rolling buffers for log_scalar() time-series plots.
+        self._scalar_buffers: dict[str, collections.deque] = {}
+        self._scalar_arrays: dict[str, np.ndarray | None] = {}
+        self._scalar_accumulators: dict[str, list[float]] = {}
+        self._scalar_smoothing: dict[str, int] = {}
+        self._plot_history_size = plot_history_size
 
         super().__init__()
 
@@ -390,8 +406,16 @@ class ViewerGL(ViewerBase):
         and whenever the current model is discarded.
         """
         # Render object and line caches (path -> GL object)
+        for obj in getattr(self, "objects", {}).values():
+            if hasattr(obj, "destroy"):
+                obj.destroy()
         self.objects = {}
+        for obj in getattr(self, "lines", {}).values():
+            obj.destroy()
         self.lines = {}
+        for obj in getattr(self, "arrows", {}).values():
+            obj.destroy()
+        self.arrows = {}
         self._destroy_all_wireframes()
         self.wireframe_shapes = {}
         self._wireframe_vbo_owners: dict[int, WireframeShapeGL] = {}
@@ -415,6 +439,12 @@ class ViewerGL(ViewerBase):
         # Clear example-specific UI callbacks; panel/stats persist
         self._ui_callbacks["side"] = []
         self._ui_callbacks["free"] = []
+
+        # Clear scalar plot buffers
+        self._scalar_buffers.clear()
+        self._scalar_arrays.clear()
+        self._scalar_accumulators.clear()
+        self._scalar_smoothing.clear()
 
         super().clear_model()
 
@@ -558,7 +588,8 @@ class ViewerGL(ViewerBase):
         current_names = {s.name for s in self._shape_instances.values()}
         stale = [k for k, v in self.objects.items() if isinstance(v, MeshInstancerGL) and k not in current_names]
         for k in stale:
-            del self.objects[k]
+            obj = self.objects.pop(k)
+            del obj
 
         shape_scale = self.model.shape_scale
         if shape_scale.device != self.device:
@@ -705,8 +736,10 @@ class ViewerGL(ViewerBase):
             resized = True
         elif transform_count > instancer.num_instances:
             new_capacity = max(transform_count, instancer.num_instances * 2)
+            old = instancer
             instancer = MeshInstancerGL(new_capacity, self.objects[mesh])
             self.objects[name] = instancer
+            del old
             resized = True
 
         needs_update = resized or not hidden
@@ -817,15 +850,20 @@ class ViewerGL(ViewerBase):
         width: float = 0.01,
         hidden: bool = False,
     ):
-        """
-        Log line data for rendering.
+        """Log line data for rendering.
+
+        Lines are drawn as screen-space quads whose pixel width is set by
+        :attr:`RendererGL.line_width`.  The *width* parameter is currently
+        unused and reserved for future world-space width support.
 
         Args:
             name: Unique identifier for the line batch.
             starts: Array of line start positions (shape: [N, 3]) or None for empty.
             ends: Array of line end positions (shape: [N, 3]) or None for empty.
             colors: Array of line colors (shape: [N, 3]) or tuple/list of RGB or None for empty.
-            width: The width of the lines.
+            width: Reserved for future use (world-space line width).
+                Currently ignored; pixel width is controlled by
+                ``RendererGL.line_width``.
             hidden: Whether the lines are initially hidden.
         """
         # Handle empty logs by resetting the LinesGL object
@@ -848,6 +886,8 @@ class ViewerGL(ViewerBase):
             else:
                 # Handle zero lines case
                 colors = wp.array([], dtype=wp.vec3, device=self.device)
+        elif isinstance(colors, wp.array) and colors.dtype == wp.float32:
+            colors = colors.reshape((num_lines, 3)).view(dtype=wp.vec3)
 
         assert isinstance(colors, wp.array)
         assert len(colors) == num_lines, "Number of line colors must match line begins"
@@ -864,6 +904,66 @@ class ViewerGL(ViewerBase):
             self.lines[name] = LinesGL(max_lines, self.device, hidden=hidden)
 
         self.lines[name].update(starts, ends, colors)
+        self.lines[name].hidden = hidden
+
+    @override
+    def log_arrows(
+        self,
+        name: str,
+        starts: wp.array[wp.vec3] | None,
+        ends: wp.array[wp.vec3] | None,
+        colors: (wp.array[wp.vec3] | wp.array[wp.float32] | tuple[float, float, float] | list[float] | None),
+        width: float = 0.01,
+        hidden: bool = False,
+    ):
+        """Log arrow data for rendering (screen-space quad line + arrowhead per segment).
+
+        Arrow size is controlled in screen-space pixels by
+        ``RendererGL.arrow_scale``.
+
+        Args:
+            name: Unique identifier for the arrow batch.
+            starts: Array of arrow start positions (shape: [N, 3]) or None for empty.
+            ends: Array of arrow end positions / arrowhead tips (shape: [N, 3]) or None for empty.
+            colors: Array of arrow colors (shape: [N, 3]) or tuple/list of RGB or None for empty.
+            width: Reserved for future use (world-space line width).
+                Currently ignored; pixel dimensions are controlled by
+                ``RendererGL.arrow_scale``.
+            hidden: Whether the arrows are initially hidden.
+        """
+        if starts is None or ends is None or colors is None:
+            if name in self.arrows:
+                self.arrows[name].update(None, None, None)
+            return
+
+        assert isinstance(starts, wp.array)
+        assert isinstance(ends, wp.array)
+        num_arrows = len(starts)
+        assert len(ends) == num_arrows, "Number of arrow ends must match arrow begins"
+
+        if isinstance(colors, tuple | list):
+            if num_arrows > 0:
+                color_vec = wp.vec3(*colors)
+                colors = wp.zeros(num_arrows, dtype=wp.vec3, device=self.device)
+                colors.fill_(color_vec)
+            else:
+                colors = wp.array([], dtype=wp.vec3, device=self.device)
+        elif isinstance(colors, wp.array) and colors.dtype == wp.float32:
+            colors = colors.reshape((num_arrows, 3)).view(dtype=wp.vec3)
+
+        assert isinstance(colors, wp.array)
+        assert len(colors) == num_arrows, "Number of arrow colors must match arrow begins"
+
+        if name not in self.arrows:
+            max_arrows = max(num_arrows, 1000)
+            self.arrows[name] = LinesGL(max_arrows, self.device, hidden=hidden)
+        elif num_arrows > self.arrows[name].max_lines:
+            self.arrows[name].destroy()
+            max_arrows = max(num_arrows, self.arrows[name].max_lines * 2)
+            self.arrows[name] = LinesGL(max_arrows, self.device, hidden=hidden)
+
+        self.arrows[name].update(starts, ends, colors)
+        self.arrows[name].hidden = hidden
 
     @override
     def log_wireframe_shape(
@@ -958,6 +1058,7 @@ class ViewerGL(ViewerBase):
             old = self.objects[name]
             new_capacity = max(num_points, old.num_instances * 2)
             self.objects[name] = MeshInstancerGL(new_capacity, self._point_mesh)
+            del old
             object_recreated = True
 
         if radii is None:
@@ -1062,8 +1163,10 @@ class ViewerGL(ViewerBase):
             self.objects[name].cast_shadow = False
             recreated = True
         elif n > self.objects[name].num_instances:
-            self.objects[name] = MeshInstancerGL(max(n, self.objects[name].num_instances * 2), self._gaussian_mesh)
+            old = self.objects[name]
+            self.objects[name] = MeshInstancerGL(max(n, old.num_instances * 2), self._gaussian_mesh)
             self.objects[name].cast_shadow = False
+            del old
             recreated = True
 
         instancer = self.objects[name]
@@ -1128,15 +1231,54 @@ class ViewerGL(ViewerBase):
         pass
 
     @override
-    def log_scalar(self, name: str, value: int | float | bool | np.number):
+    def log_scalar(
+        self,
+        name: str,
+        value: int | float | bool | np.number,
+        *,
+        clear: bool = False,
+        smoothing: int = 1,
+    ):
         """
-        Log a scalar value for visualization (not implemented).
+        Log a scalar value as a live time-series plot.
+
+        Each unique *name* creates a separate line plot displayed in an
+        auto-generated "Plots" window.  Values are stored in a rolling
+        buffer of the last ``plot_history_size`` samples.
 
         Args:
             name: Unique path/name for the scalar signal.
-            value: Scalar value to visualize.
+            value: Scalar value to record.
+            clear: If ``True``, discard previously recorded samples for
+                *name* before logging the new value.
+            smoothing: Number of raw samples to average before committing
+                a point to the plot history.  Defaults to ``1`` (no smoothing).
         """
-        pass
+        if smoothing < 1:
+            raise ValueError("smoothing must be >= 1")
+        val = float(value.item() if hasattr(value, "item") else value)
+        buf = self._scalar_buffers.get(name)
+        if buf is None:
+            buf = collections.deque(maxlen=self._plot_history_size)
+            self._scalar_buffers[name] = buf
+        elif clear:
+            buf.clear()
+            self._scalar_accumulators.pop(name, None)
+
+        self._scalar_smoothing[name] = smoothing
+        if smoothing <= 1:
+            buf.append(val)
+        else:
+            acc = self._scalar_accumulators.get(name)
+            if acc is None:
+                acc = []
+                self._scalar_accumulators[name] = acc
+            acc.append(val)
+            if len(acc) >= smoothing:
+                buf.append(sum(acc) / len(acc))
+                acc.clear()
+
+        self._scalar_arrays[name] = None
 
     @override
     def log_state(self, state: nt.State):
@@ -1322,7 +1464,7 @@ class ViewerGL(ViewerBase):
             return
 
         # Render the scene and present it
-        self.renderer.render(self.camera, self.objects, self.lines, self.wireframe_shapes)
+        self.renderer.render(self.camera, self.objects, self.lines, self.wireframe_shapes, self.arrows)
 
         # Always update FPS tracking, even if UI is hidden
         self._update_fps()
@@ -1982,6 +2124,9 @@ class ViewerGL(ViewerBase):
         # Render top-right stats overlay
         self._render_stats_overlay()
 
+        # Render scalar time-series plots (from log_scalar calls)
+        self._render_scalar_plots()
+
         # allow users to create custom windows
         for callback in self._ui_callbacks["free"]:
             callback(self.ui.imgui)
@@ -2040,6 +2185,11 @@ class ViewerGL(ViewerBase):
                     show_contacts = self.show_contacts
                     changed, self.show_contacts = imgui.checkbox("Show Contacts", show_contacts)
 
+                    if self.show_contacts:
+                        _, self.renderer.arrow_scale = imgui.slider_float(
+                            "Arrow Scale", self.renderer.arrow_scale, 0.25, 5.0
+                        )
+
                     # Particle visualization
                     show_particles = self.show_particles
                     changed, self.show_particles = imgui.checkbox("Show Particles", show_particles)
@@ -2067,7 +2217,7 @@ class ViewerGL(ViewerBase):
 
                     if self.sdf_margin_mode != self.SDFMarginMode.OFF:
                         _, self.renderer.wireframe_line_width = imgui.slider_float(
-                            "Line Width (px)", self.renderer.wireframe_line_width, 0.5, 5.0
+                            "Wireframe Width (px)", self.renderer.wireframe_line_width, 0.5, 5.0
                         )
 
                     # Visual geometry toggle
@@ -2173,6 +2323,48 @@ class ViewerGL(ViewerBase):
             # Selection API section
             self._render_selection_panel()
 
+        imgui.end()
+
+    def _render_scalar_plots(self):
+        """Render an ImGui window with live line plots for all logged scalars."""
+        if not self._scalar_buffers:
+            return
+
+        imgui = self.ui.imgui
+        io = self.ui.io
+
+        window_width = 400
+        window_height = min(
+            io.display_size[1] - 20,
+            len(self._scalar_buffers) * 140 + 60,
+        )
+        imgui.set_next_window_pos(
+            imgui.ImVec2(io.display_size[0] - window_width - 10, 10),
+            imgui.Cond_.appearing,
+        )
+        imgui.set_next_window_size(
+            imgui.ImVec2(window_width, window_height),
+            imgui.Cond_.appearing,
+        )
+
+        expanded = imgui.begin("Plots")
+        if expanded:
+            graph_size = imgui.ImVec2(-1, 100)
+            n = self._plot_history_size
+            for name, buf in self._scalar_buffers.items():
+                arr = self._scalar_arrays.get(name)
+                if arr is None:
+                    # Pad with NaN on the left so the x-axis scale is fixed
+                    # but pre-history values are not drawn.
+                    arr = np.full(n, np.nan, dtype=np.float32)
+                    arr[n - len(buf) :] = np.array(buf, dtype=np.float32)
+                    self._scalar_arrays[name] = arr
+                overlay = f"{buf[-1]:.4g}" if buf else ""
+                if imgui.collapsing_header(
+                    name,
+                    imgui.TreeNodeFlags_.default_open.value,
+                ):
+                    imgui.plot_lines(f"##{name}", arr, graph_size=graph_size, overlay_text=overlay)
         imgui.end()
 
     def _render_stats_overlay(self):
