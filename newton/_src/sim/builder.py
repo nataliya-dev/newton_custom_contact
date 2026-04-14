@@ -303,11 +303,11 @@ class ModelBuilder:
         """Hunt-Crossley damping coefficient [s/m]. Controls energy dissipation
         during approach/separation."""
 
-        cslc_n_iter: int = 40
+        cslc_n_iter: int = 20
         """Number of Jacobi iterations for quasistatic solve per timestep.
         More = better equilibrium. 20-60 typical."""
 
-        cslc_alpha: float = 0.3
+        cslc_alpha: float = 0.6
         """Jacobi damping factor (under-relaxation). 0.2-0.5 typical.
         Lower = more stable, higher = faster convergence."""
 

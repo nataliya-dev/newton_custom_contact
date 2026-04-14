@@ -67,7 +67,6 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - This code must fit the paradigm of whatever library you are working with
 - If debug output is warranted, add it, so it is easy to debug on output
 - Make sure mathematical formulations or anything complex is documented
-- If there is a tricky bug that is fixed, document it as well
 - Write as if somebody reading it will be able to follow
 - Prefer to verify and debug rather than fixing something that you are not sure you are fixing
 

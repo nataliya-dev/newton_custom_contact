@@ -1,38 +1,59 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-"""
-CSLC Squeeze Test — Comparison of contact models and solvers.
 
-Scene: Two kinematic box pads squeeze a dynamic sphere under gravity.
-       The pads start already gripping the sphere (initial penetration),
-       then gently squeeze further. Gravity pulls the sphere down;
-       friction from the contacts must hold it.
+"""CSLC diagnostic test suite — viewer + headless benchmark modes.
 
-         ┌─────┐         ┌─────┐
-         │     │  ←───   │     │
-         │ left│  sphere  │right│       ↓ gravity (-z)
-         │ pad │   (●)   │ pad │
-         │     │  ───→   │     │
-         └─────┘         └─────┘
-         body 0          body 1   body 2 (dynamic)
+Two kinematic box pads squeeze a dynamic sphere from both sides, then hold it
+under gravity.  The test compares point contact vs CSLC: CSLC distributes
+contact over a lattice of surface spheres and should hold the object better
+at realistic friction coefficients and resist rotational perturbations.
 
-Key physics:
-  - Point contact: 2 contact points → low aggregate friction stiffness
-  - CSLC:          ~100+ contact points → high aggregate friction → holds object
+Modes
+─────
+  viewer          Interactive OpenGL visualization (default)
+  squeeze         Point vs CSLC squeeze comparison with per-step diagnostics
+  friction-sweep  Sweep μ to show CSLC holds at realistic friction
+  tilt            Tilt perturbation — test rotational stiffness about Y axis
+  twist           Twist perturbation — test torsional friction about X (grip) axis
+  calibrate       Inspect CSLC lattice geometry, stiffness calibration, convergence
+  inspect         Step-by-step dump of every contact and body state
+  all             Run squeeze + friction-sweep + tilt + twist
 
-Friction stability (semi-implicit integrator):
-  The solver uses regularized Coulomb friction: ft = min(kf·|vt|, μ·|fn|).
-  The viscous term (kf·|vt|) acts like a tangential spring, which requires:
-      n_contacts × kf × dt / mass < 2    (stability criterion)
-  Default kf=1000 is UNSTABLE for this scene. We set kf=3.0 so that:
-      point (2 contacts):   2 × 3 × 0.002 / 0.5 = 0.024  ✓
-      CSLC  (128 contacts): 128 × 3 × 0.002 / 0.5 = 1.54  ✓
+Running
+───────
+  # Interactive viewer with CSLC
+  python -m cslc_v2.squeeze_test --mode viewer --contact-model cslc
 
-Usage:
-  python squeeze_test.py                       # run all configs
-  python squeeze_test.py --configs cslc_semi   # run one config
-  python squeeze_test.py --list                # list available configs
+  # Headless squeeze comparison
+  python -m cslc_v2.squeeze_test --mode squeeze
+
+  # Friction sweep (requires MuJoCo solver)
+  python -m cslc_v2.squeeze_test --mode friction-sweep
+
+  # Rotational perturbation tests
+  python -m cslc_v2.squeeze_test --mode tilt
+  python -m cslc_v2.squeeze_test --mode twist
+
+  # Deep lattice diagnostics (no simulation, just geometry + stiffness)
+  python -m cslc_v2.squeeze_test --mode calibrate
+
+  # Step-by-step contact buffer inspection (first 10 steps)
+  python -m cslc_v2.squeeze_test --mode inspect --steps 10
+
+  # Run everything
+  python -m cslc_v2.squeeze_test --mode all
+
+  # Choose solver backend
+  python -m cslc_v2.squeeze_test --mode squeeze --solver semi
+  python -m cslc_v2.squeeze_test --mode squeeze --solver mujoco
+
+Spatial vector convention
+─────────────────────────
+  Warp's wp.spatial_vector stores [wx, wy, wz, vx, vy, vz]:
+    indices [0,1,2] = angular velocity
+    indices [3,4,5] = linear velocity
+  This is the Featherstone convention used throughout Newton.
 """
 
 from __future__ import annotations
@@ -45,611 +66,1090 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
-
 import warp as wp
+
 import newton
+import newton.examples
 from newton.solvers import SolverSemiImplicit
 
-# Optional solvers — graceful fallback if not installed
 try:
     from newton.solvers import SolverMuJoCo
     HAS_MUJOCO = True
 except ImportError:
     HAS_MUJOCO = False
-    warnings.warn("SolverMuJoCo not available — skipping MuJoCo configs.")
+    warnings.warn("SolverMuJoCo not available. MuJoCo configs disabled.")
 
-try:
-    from newton.solvers import SolverXPBD
-    HAS_XPBD = True
-except ImportError:
-    HAS_XPBD = False
-    warnings.warn("SolverXPBD not available — skipping XPBD configs.")
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Formatting helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+_SEP   = "─" * 72
+_HSEP  = "━" * 72
+_DSEP  = "═" * 72
+
+def _section(title):
+    print(f"\n{_DSEP}\n  {title}\n{_DSEP}")
+
+def _sub(title):
+    print(f"\n  {_SEP}\n  {title}\n  {_SEP}")
+
+def _log(msg, indent=0):
+    print(f"  {'  ' * indent}│ {msg}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Scene parameters
 # ═══════════════════════════════════════════════════════════════════════════
 
+GEO_NAMES = {
+    0: "PLANE", 1: "MESH", 2: "HFIELD", 3: "SPHERE", 4: "CAPSULE",
+    5: "CYLINDER", 6: "CONE", 7: "BOX", 8: "CONVEX_MESH", 9: "ELLIPSOID",
+}
+CSLC_FLAG = 1 << 5
+
+
 @dataclass
 class SceneParams:
-    """All physical parameters in one place for fair comparison.
+    """All tunable knobs for the squeeze scene.
 
-    Friction stability note:
-        kf (friction stiffness) must satisfy  n_contacts × kf × dt / mass < 2
-        for the semi-implicit integrator.  With dt=0.002, mass=0.5, and up to
-        ~128 CSLC contacts, kf must be < ~3.9.  We use kf=3.0.
+    Geometry
+    ────────
+    Two kinematic box pads sit on either side of a dynamic sphere.
+    The inner faces start closer than the sphere diameter so there is
+    initial penetration.  During the squeeze phase each pad moves inward,
+    increasing grip.  During the hold phase pads stop and gravity pulls down.
+
+    Material
+    ────────
+    ke, kd, mu are shared by point contact and CSLC for a fair comparison.
+    CSLC additionally needs: cslc_spacing, ka, kl, dc, n_iter, alpha.
     """
-    # Sphere (dynamic object)
-    sphere_radius: float = 0.03          # 30 mm
-    sphere_density: float = 4421.0       # kg/m³  → ~0.5 kg for r=30mm
-    sphere_start_z: float = 0.15         # initial height [m]
 
-    # Boxes (kinematic pads)
-    pad_hx: float = 0.04                 # half-extent in grip (x) direction [m]
-    pad_hy: float = 0.04                 # half-extent in y [m]
-    pad_hz: float = 0.15                 # half-extent in z [m] — tall so sphere can't fall out
+    # ── sphere ──
+    sphere_radius: float = 0.03
+    sphere_density: float = 4421.0       # → ~0.5 kg for r=0.03
+    sphere_start_z: float = 0.15
 
-    # Squeeze kinematics
-    #   Initial gap < sphere diameter → sphere starts already gripped.
-    #   gap=0.04 with sphere_diameter=0.06 → 10mm penetration per side.
-    pad_gap_initial: float = 0.04        # distance between pad inner faces [m]
-    pad_squeeze_speed: float = 0.005     # m/s inward per pad (gentle)
-    pad_squeeze_duration: float = 0.5    # seconds of squeezing
-    pad_hold_duration: float = 1.5       # seconds holding after squeeze
+    # ── pads ──
+    pad_hx: float = 0.01
+    pad_hy: float = 0.02
+    pad_hz: float = 0.05
+    pad_gap_initial: float = 0.04        # distance between inner pad faces
+    pad_squeeze_speed: float = 0.005     # m/s inward per pad
+    pad_squeeze_duration: float = 0.5    # seconds of active squeeze
+    pad_hold_duration: float = 1.5       # seconds of holding under gravity
 
-    # Contact material (shared across ALL contact models for fair comparison)
-    ke: float = 5.0e4                    # elastic stiffness [N/m]
-    kd: float = 5.0e2                    # normal damping [N·s/m]
-    kf: float = 3.0                      # friction stiffness [N·s/m] — LOW for stability
-    mu: float = 0.5                      # friction coefficient
+    # ── material (shared by all contact models) ──
+    ke: float = 5.0e4
+    kd: float = 5.0e2
+    kf: float = 100.0
+    mu: float = 0.5
 
-    # CSLC-specific
-    cslc_spacing: float = 0.005          # lattice spacing [m] (5 mm)
-    cslc_ka: float = 5000.0              # anchor stiffness [N/m]
-    cslc_kl: float = 500.0               # lateral stiffness [N/m]
-    cslc_dc: float = 2.0                 # Hunt-Crossley damping [s/m]
-    cslc_n_iter: int = 40                # Jacobi iterations
-    cslc_alpha: float = 0.3              # under-relaxation
+    # ── CSLC tuning ──
+    cslc_spacing: float = 0.005
+    cslc_ka: float = 5000.0
+    cslc_kl: float = 500.0
+    cslc_dc: float = 2.0
+    cslc_n_iter: int = 20
+    cslc_alpha: float = 0.6
 
-    # Hydroelastic-specific
-    kh: float = 1.0e10                   # hydroelastic pressure modulus
-    sdf_resolution: int = 64             # SDF voxel resolution
+    # ── hydroelastic (for optional comparison) ──
+    kh: float = 1.0e10
+    sdf_resolution: int = 64
 
-    # Simulation
-    dt: float = 1.0 / 500.0             # 500 Hz
+    # ── integration ──
+    dt: float = 1.0 / 500.0
     gravity: tuple = (0.0, 0.0, -9.81)
 
-    @property
-    def sphere_mass(self) -> float:
-        vol = (4.0 / 3.0) * math.pi * self.sphere_radius ** 3
-        return self.sphere_density * vol
+    # ── perturbation (tilt / twist tests) ──
+    perturbation_omega: float = 3.0      # rad/s angular impulse magnitude
+    perturbation_time: float = 0.5       # apply after this many seconds
+
+    # ── derived ──
 
     @property
-    def penetration_per_side(self) -> float:
-        return max(self.sphere_radius - self.pad_gap_initial / 2.0, 0.0)
+    def sphere_mass(self):
+        return self.sphere_density * (4 / 3) * math.pi * self.sphere_radius ** 3
 
     @property
-    def n_squeeze_steps(self) -> int:
+    def n_squeeze_steps(self):
         return int(self.pad_squeeze_duration / self.dt)
 
     @property
-    def n_hold_steps(self) -> int:
+    def n_hold_steps(self):
         return int(self.pad_hold_duration / self.dt)
 
     @property
-    def n_total_steps(self) -> int:
+    def n_total_steps(self):
         return self.n_squeeze_steps + self.n_hold_steps
+
+    def initial_penetration(self):
+        """Penetration on each side at t=0 before any squeezing."""
+        half_gap = self.pad_gap_initial / 2.0
+        return max(self.sphere_radius - half_gap, 0.0)
+
+    def final_penetration(self):
+        """Penetration on each side after full squeeze."""
+        return self.initial_penetration() + self.pad_squeeze_speed * self.pad_squeeze_duration
+
+    def dump(self):
+        """Print a full parameter summary with derived geometry analysis."""
+        _section("SCENE PARAMETERS")
+        m = self.sphere_mass
+        w = m * 9.81
+        pen0 = self.initial_penetration()
+        pen1 = self.final_penetration()
+
+        _log(f"Sphere:  r={self.sphere_radius*1e3:.1f}mm  "
+             f"mass={m:.3f}kg ({m*1e3:.1f}g)  weight={w:.3f}N")
+        _log(f"Pads:    hx={self.pad_hx*1e3:.1f}mm  hy={self.pad_hy*1e3:.1f}mm  "
+             f"hz={self.pad_hz*1e3:.1f}mm")
+        _log(f"Gap:     initial={self.pad_gap_initial*1e3:.1f}mm  "
+             f"sphere_diameter={self.sphere_radius*2e3:.1f}mm")
+        _log(f"Squeeze: speed={self.pad_squeeze_speed*1e3:.2f}mm/s/pad  "
+             f"dur={self.pad_squeeze_duration:.2f}s  "
+             f"travel={self.pad_squeeze_speed * self.pad_squeeze_duration * 1e3:.2f}mm/pad")
+        _log(f"Penetration: initial={pen0*1e3:.2f}mm/side  "
+             f"final={pen1*1e3:.2f}mm/side")
+        _log(f"Material: ke={self.ke:.0f}  kd={self.kd:.0f}  μ={self.mu:.2f}")
+        _log(f"CSLC:    spacing={self.cslc_spacing*1e3:.1f}mm  ka={self.cslc_ka:.0f}  "
+             f"kl={self.cslc_kl:.0f}  dc={self.cslc_dc:.1f}")
+        _log(f"Solver:  n_iter={self.cslc_n_iter}  alpha={self.cslc_alpha}  "
+             f"dt={self.dt*1e3:.2f}ms ({1/self.dt:.0f}Hz)")
+        _log(f"Steps:   {self.n_total_steps} total "
+             f"({self.n_squeeze_steps} squeeze + {self.n_hold_steps} hold)")
+
+        # Friction budget: can two point contacts hold the weight?
+        fn_point = self.ke * pen0
+        ff_point = self.mu * fn_point
+        _log("")
+        _log("Friction budget (point contact, initial penetration):")
+        _log(f"  F_n ≈ ke × pen = {fn_point:.1f}N  →  F_friction = μ × F_n = {ff_point:.1f}N", 1)
+        _log(f"  2 contacts × {ff_point:.1f}N = {2*ff_point:.1f}N  vs  weight = {w:.3f}N  "
+             f"({'OK' if 2*ff_point > w else 'INSUFFICIENT'})", 1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Metrics collector
+#  Metrics
 # ═══════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class Metrics:
-    """Time-series metrics collected during simulation."""
     name: str = ""
     sphere_z: list[float] = field(default_factory=list)
+    sphere_x: list[float] = field(default_factory=list)
+    sphere_angle: list[float] = field(default_factory=list)
     active_contacts: list[int] = field(default_factory=list)
-    normal_force_mean: list[float] = field(default_factory=list)
-    normal_force_std: list[float] = field(default_factory=list)
-    step_times_ms: list[float] = field(default_factory=list)
-    gradient_norm: float | None = None
+    cslc_max_delta: list[float] = field(default_factory=list)
+    cslc_active_surface: list[int] = field(default_factory=list)
+    cslc_max_pen: list[float] = field(default_factory=list)
 
     @property
-    def z_drop_mm(self) -> float:
-        if len(self.sphere_z) < 2:
-            return 0.0
-        z0 = self.sphere_z[0]
-        z_min = min(self.sphere_z)
-        return (z0 - z_min) * 1000.0
+    def z_drop_mm(self):
+        return (self.sphere_z[0] - min(self.sphere_z)) * 1e3 if len(self.sphere_z) >= 2 else 0.0
 
     @property
-    def avg_step_ms(self) -> float:
-        return sum(self.step_times_ms) / len(self.step_times_ms) if self.step_times_ms else 0.0
+    def max_angle_deg(self):
+        return max(abs(a) for a in self.sphere_angle) * 180 / math.pi if self.sphere_angle else 0.0
 
     @property
-    def peak_contacts(self) -> int:
+    def settled(self):
+        if len(self.sphere_angle) < 10:
+            return False
+        tail = self.sphere_angle[-len(self.sphere_angle) // 10:]
+        return max(abs(a) for a in tail) < math.radians(1.0)
+
+    @property
+    def peak_contacts(self):
         return max(self.active_contacts) if self.active_contacts else 0
 
-    def summary(self) -> str:
-        lines = [
-            f"{'─' * 50}",
-            f"  Config: {self.name}",
-            f"  Z-drop:          {self.z_drop_mm:8.3f} mm",
-            f"  Peak contacts:   {self.peak_contacts:8d}",
-            f"  Avg step time:   {self.avg_step_ms:8.3f} ms",
-        ]
-        if self.gradient_norm is not None:
-            lines.append(f"  Gradient norm:   {self.gradient_norm:8.4e}")
-        lines.append(f"{'─' * 50}")
-        return "\n".join(lines)
-
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Scene builders — BODY LAYOUT: 0=left pad, 1=right pad, 2=sphere
+#  Scene builders
 # ═══════════════════════════════════════════════════════════════════════════
 
-
-def _pad_cfg(p: SceneParams, **overrides) -> newton.ModelBuilder.ShapeConfig:
-    """Shape config for kinematic pads (density=0: no mass on kinematic body)."""
-    kwargs = dict(ke=p.ke, kd=p.kd, kf=p.kf, mu=p.mu, gap=0.002, density=0.0)
-    kwargs.update(overrides)
-    return newton.ModelBuilder.ShapeConfig(**kwargs)
+def _pad_cfg(p: SceneParams, **kw) -> newton.ModelBuilder.ShapeConfig:
+    d = dict(ke=p.ke, kd=p.kd, kf=p.kf, mu=p.mu, gap=0.002, density=0.0)
+    d.update(kw)
+    return newton.ModelBuilder.ShapeConfig(**d)
 
 
-def _sphere_cfg(p: SceneParams) -> newton.ModelBuilder.ShapeConfig:
-    """Shape config for the dynamic sphere."""
-    return newton.ModelBuilder.ShapeConfig(
-        ke=p.ke, kd=p.kd, kf=p.kf, mu=p.mu, gap=0.002, density=p.sphere_density,
-    )
+def _sphere_cfg(p: SceneParams, **kw) -> newton.ModelBuilder.ShapeConfig:
+    d = dict(ke=p.ke, kd=p.kd, kf=p.kf, mu=p.mu, gap=0.002, density=p.sphere_density)
+    d.update(kw)
+    return newton.ModelBuilder.ShapeConfig(**d)
 
 
-def _add_pads_and_sphere(
-    b: newton.ModelBuilder,
-    p: SceneParams,
-    pad_cfg: newton.ModelBuilder.ShapeConfig,
-    sphere_cfg: newton.ModelBuilder.ShapeConfig,
-) -> tuple[int, int, int]:
-    """Add the standard two-pad + sphere layout.
-
-    Returns (left_body, right_body, sphere_body) indices.
-    """
-    left_x = -(p.pad_gap_initial / 2.0 + p.pad_hx)
-    right_x =  (p.pad_gap_initial / 2.0 + p.pad_hx)
-
-    left = b.add_body(
-        xform=wp.transform((left_x, 0.0, p.sphere_start_z), wp.quat_identity()),
-        is_kinematic=True,
-        label="left_pad",
-    )
+def _add_pads_and_sphere(b, p, pad_cfg, sphere_cfg):
+    """Add two kinematic pads + one dynamic sphere.  Returns body indices."""
+    lx = -(p.pad_gap_initial / 2 + p.pad_hx)
+    rx =  (p.pad_gap_initial / 2 + p.pad_hx)
+    left = b.add_body(xform=wp.transform((lx, 0, p.sphere_start_z), wp.quat_identity()),
+                       is_kinematic=True, label="left_pad")
     b.add_shape_box(left, hx=p.pad_hx, hy=p.pad_hy, hz=p.pad_hz, cfg=pad_cfg)
-
-    right = b.add_body(
-        xform=wp.transform((right_x, 0.0, p.sphere_start_z), wp.quat_identity()),
-        is_kinematic=True,
-        label="right_pad",
-    )
+    right = b.add_body(xform=wp.transform((rx, 0, p.sphere_start_z), wp.quat_identity()),
+                        is_kinematic=True, label="right_pad")
     b.add_shape_box(right, hx=p.pad_hx, hy=p.pad_hy, hz=p.pad_hz, cfg=pad_cfg)
-
-    sphere = b.add_body(
-        xform=wp.transform((0.0, 0.0, p.sphere_start_z), wp.quat_identity()),
-        label="sphere",
-    )
+    sphere = b.add_body(xform=wp.transform((0, 0, p.sphere_start_z), wp.quat_identity()),
+                         label="sphere")
     b.add_shape_sphere(sphere, radius=p.sphere_radius, cfg=sphere_cfg)
-
     return left, right, sphere
 
 
-def build_point_contact_scene(p: SceneParams) -> newton.Model:
-    """Standard point-contact: box primitives + sphere primitive."""
+def build_point_scene(p):
     b = newton.ModelBuilder()
     _add_pads_and_sphere(b, p, _pad_cfg(p), _sphere_cfg(p))
-    model = b.finalize()
-    model.set_gravity(p.gravity)
-    return model
+    m = b.finalize(); m.set_gravity(p.gravity); return m
 
-
-def build_cslc_scene(p: SceneParams) -> newton.Model:
-    """CSLC contact: box pads with CSLC lattice vs sphere."""
+def build_cslc_scene(p):
     b = newton.ModelBuilder()
-    cslc_pad = _pad_cfg(
-        p,
-        is_cslc=True,
-        cslc_spacing=p.cslc_spacing,
-        cslc_ka=p.cslc_ka,
-        cslc_kl=p.cslc_kl,
-        cslc_dc=p.cslc_dc,
-        cslc_n_iter=p.cslc_n_iter,
-        cslc_alpha=p.cslc_alpha,
-    )
+    cslc_pad = _pad_cfg(p, is_cslc=True,
+        cslc_spacing=p.cslc_spacing, cslc_ka=p.cslc_ka, cslc_kl=p.cslc_kl,
+        cslc_dc=p.cslc_dc, cslc_n_iter=p.cslc_n_iter, cslc_alpha=p.cslc_alpha)
     _add_pads_and_sphere(b, p, cslc_pad, _sphere_cfg(p))
-    model = b.finalize()
-    model.set_gravity(p.gravity)
-    return model
+    m = b.finalize(); m.set_gravity(p.gravity); return m
 
-
-def build_hydroelastic_scene(p: SceneParams) -> newton.Model:
-    """Hydroelastic: both shapes need HYDROELASTIC flag + SDF."""
+def build_hydro_scene(p):
     b = newton.ModelBuilder()
-    hydro_pad = _pad_cfg(
-        p,
-        kh=p.kh,
-        is_hydroelastic=True,
-        sdf_max_resolution=p.sdf_resolution,
-    )
-    hydro_sphere = newton.ModelBuilder.ShapeConfig(
-        ke=p.ke, kd=p.kd, kf=p.kf, mu=p.mu, gap=0.002,
-        density=p.sphere_density,
-        kh=p.kh,
-        is_hydroelastic=True,
-        sdf_max_resolution=p.sdf_resolution,
-    )
-    _add_pads_and_sphere(b, p, hydro_pad, hydro_sphere)
-    model = b.finalize()
-    model.set_gravity(p.gravity)
-    return model
+    hp = _pad_cfg(p, kh=p.kh, is_hydroelastic=True, sdf_max_resolution=p.sdf_resolution)
+    hs = _sphere_cfg(p, kh=p.kh, is_hydroelastic=True, sdf_max_resolution=p.sdf_resolution)
+    _add_pads_and_sphere(b, p, hp, hs)
+    m = b.finalize(); m.set_gravity(p.gravity); return m
+
+BUILDERS = {"point": build_point_scene, "cslc": build_cslc_scene, "hydro": build_hydro_scene}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Kinematic pad controller
+#  Kinematic pad control
+#
+#  Warp spatial_vector layout: [wx, wy, wz, vx, vy, vz]
+#    angular velocity → indices 0, 1, 2
+#    linear  velocity → indices 3, 4, 5
 # ═══════════════════════════════════════════════════════════════════════════
 
-
-def compute_pad_x(step: int, p: SceneParams, sign: float) -> float:
-    """Compute x-position of a pad at a given timestep.
-
-    sign = -1 for left pad, +1 for right pad.
-    Phase 1 (squeeze): pads move inward at constant speed.
-    Phase 2 (hold):    pads stay at final squeezed position.
-    """
-    initial_x = sign * (p.pad_gap_initial / 2.0 + p.pad_hx)
+def compute_pad_x(step, p, sign):
+    """World-frame x position for a pad at the given step."""
+    initial_x = sign * (p.pad_gap_initial / 2 + p.pad_hx)
     t = step * p.dt
-    t_squeeze = min(t, p.pad_squeeze_duration)
-    displacement = p.pad_squeeze_speed * t_squeeze
-    return initial_x - sign * displacement
+    return initial_x - sign * p.pad_squeeze_speed * min(t, p.pad_squeeze_duration)
 
 
-def set_kinematic_pads(state: Any, step: int, p: SceneParams) -> None:
-    """Overwrite body_q for the two kinematic pads (bodies 0 and 1).
+def set_kinematic_pads(state, step, p, debug=False):
+    """Set pad positions + linear velocities each step.
 
-    body_q is wp.array(dtype=wp.transform) → numpy shape (N, 7)
-    layout per row: [px, py, pz, qx, qy, qz, qw]
+    Positions are set directly (kinematic bodies).  We also tell the solver
+    the pads' linear velocity so that relative-velocity-based friction is
+    computed correctly during the active squeeze phase.
+
+    spatial_vector layout: [angular(3), linear(3)]
     """
     q = state.body_q.numpy()
-
-    left_x  = compute_pad_x(step, p, sign=-1.0)
-    right_x = compute_pad_x(step, p, sign=+1.0)
-
-    q[0, 0] = left_x    # body 0 (left pad), px
-    q[1, 0] = right_x   # body 1 (right pad), px
-
+    q[0, 0] = compute_pad_x(step, p, sign=-1.0)   # left pad
+    q[1, 0] = compute_pad_x(step, p, sign=+1.0)    # right pad
     state.body_q.assign(wp.array(q, dtype=wp.transform, device=state.body_q.device))
 
-    # Zero out pad velocities — body_qd is (N, 6) spatial vectors
     qd = state.body_qd.numpy()
     qd[0] = 0.0
     qd[1] = 0.0
+    t = step * p.dt
+    if t < p.pad_squeeze_duration:
+        # Linear velocity along x — indices [3] in spatial_vector
+        qd[0, 3] = +p.pad_squeeze_speed   # left pad → +x (inward)
+        qd[1, 3] = -p.pad_squeeze_speed   # right pad → -x (inward)
     state.body_qd.assign(wp.array(qd, dtype=wp.spatial_vector, device=state.body_qd.device))
 
+    if debug:
+        gap = (q[1, 0] - p.pad_hx) - (q[0, 0] + p.pad_hx)
+        phase = "SQUEEZE" if t < p.pad_squeeze_duration else "HOLD"
+        _log(f"Pads [{phase}] left_x={q[0,0]:+.5f}  right_x={q[1,0]:+.5f}  "
+             f"gap={gap*1e3:.2f}mm  vx=({qd[0,3]:+.4f}, {qd[1,3]:+.4f})")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Contact metrics extraction
+#  Perturbation helpers
+#
+#  Angular velocity is the first three components of spatial_vector.
 # ═══════════════════════════════════════════════════════════════════════════
 
+def apply_angular_impulse(state, body_idx, axis, omega, debug=False):
+    """Add angular velocity to a body.  axis = unit vector, omega = rad/s."""
+    qd = state.body_qd.numpy()
+    if debug:
+        _log(f"PRE-impulse  body_qd[{body_idx}] angular=({qd[body_idx,0]:.4f}, "
+             f"{qd[body_idx,1]:.4f}, {qd[body_idx,2]:.4f})  "
+             f"linear=({qd[body_idx,3]:.4f}, {qd[body_idx,4]:.4f}, {qd[body_idx,5]:.4f})")
 
-def extract_contact_metrics(contacts: Any) -> tuple[int, float, float]:
-    """Extract active contact count and normal force statistics.
+    # Angular velocity at indices [0,1,2] in spatial_vector
+    qd[body_idx, 0] += omega * axis[0]
+    qd[body_idx, 1] += omega * axis[1]
+    qd[body_idx, 2] += omega * axis[2]
+    state.body_qd.assign(wp.array(qd, dtype=wp.spatial_vector, device=state.body_qd.device))
 
-    Returns (n_active, force_mean, force_std).
+    if debug:
+        qd2 = state.body_qd.numpy()
+        _log(f"POST-impulse body_qd[{body_idx}] angular=({qd2[body_idx,0]:.4f}, "
+             f"{qd2[body_idx,1]:.4f}, {qd2[body_idx,2]:.4f})  "
+             f"linear=({qd2[body_idx,3]:.4f}, {qd2[body_idx,4]:.4f}, {qd2[body_idx,5]:.4f})")
+        _log(f"Applied ω={omega:.2f} rad/s about axis {axis}")
+
+
+def get_body_rotation_angle(state, body_idx, axis):
+    """Project the body's orientation quaternion onto an axis → angle in radians."""
+    q = state.body_q.numpy()
+    quat = q[body_idx, 3:7]  # [qx, qy, qz, qw]
+    qw = quat[3]
+    angle = 2 * math.acos(min(abs(qw), 1.0))
+    if angle < 1e-8:
+        return 0.0
+    sin_half = math.sin(angle / 2)
+    rot_axis = np.array([quat[0], quat[1], quat[2]]) / sin_half
+    return angle * np.dot(rot_axis, axis) * np.sign(qw)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Contact inspection
+# ═══════════════════════════════════════════════════════════════════════════
+
+def count_active_contacts(contacts):
+    """Count contacts where shape0 >= 0 (valid, non-ghost)."""
+    n = int(contacts.rigid_contact_count.numpy()[0])
+    if n == 0:
+        return 0
+    return int(np.sum(contacts.rigid_contact_shape0.numpy()[:n] >= 0))
+
+
+def dump_contacts(contacts, label="", max_show=20):
+    """Print the contact buffer in detail."""
+    n = int(contacts.rigid_contact_count.numpy()[0])
+    s0 = contacts.rigid_contact_shape0.numpy()
+    s1 = contacts.rigid_contact_shape1.numpy()
+    nrm = contacts.rigid_contact_normal.numpy()
+    m0 = contacts.rigid_contact_margin0.numpy()
+    m1 = contacts.rigid_contact_margin1.numpy()
+    active = int(np.sum(s0[:n] >= 0)) if n > 0 else 0
+
+    has_props = contacts.rigid_contact_stiffness is not None
+    if has_props:
+        ke = contacts.rigid_contact_stiffness.numpy()
+        kd = contacts.rigid_contact_damping.numpy()
+        mu = contacts.rigid_contact_friction.numpy()
+
+    _sub(f"CONTACTS: {label}")
+    _log(f"count={n}  active={active}  max={contacts.rigid_contact_max}")
+
+    shown = 0
+    for i in range(min(n, contacts.rigid_contact_max)):
+        if s0[i] < 0:
+            continue
+        line = (f"[{i:5d}] s0={s0[i]} s1={s1[i]}  "
+                f"n=({nrm[i,0]:+.3f},{nrm[i,1]:+.3f},{nrm[i,2]:+.3f})  "
+                f"margin=({m0[i]:.4f},{m1[i]:.4f})")
+        if has_props:
+            line += f"  ke={ke[i]:.1f} kd={kd[i]:.2f} μ={mu[i]:.3f}"
+        _log(line)
+        shown += 1
+        if shown >= max_show:
+            if active - shown > 0:
+                _log(f"... {active - shown} more active contacts")
+            break
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CSLC lattice inspection
+# ═══════════════════════════════════════════════════════════════════════════
+
+def inspect_cslc_handler(model, label=""):
+    """Print a full dump of the CSLC handler: lattice geometry, stiffness,
+    shape pairs, neighbor topology, surface normal distribution."""
+    _sub(f"CSLC HANDLER: {label}")
+
+    pipeline = getattr(model, "_collision_pipeline", None)
+    handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
+    if handler is None:
+        _log("No CSLC handler (not a CSLC scene)")
+        return None
+
+    d = handler.cslc_data
+    _log(f"Spheres:        {d.n_spheres} total, {d.n_surface} surface")
+    _log(f"Spring stiffness:  ka={d.ka:.0f} (anchor)  kl={d.kl:.0f} (lateral)  kc={d.kc:.1f} (contact)")
+    _log(f"Damping:        dc={d.dc:.2f}")
+    _log(f"Solver:         {handler.n_iter} iterations, α={handler.alpha}")
+    _log(f"Contact slots:  {handler.n_surface_contacts}  (offset={pipeline.cslc_contact_offset})")
+
+    # Effective per-sphere stiffness at equilibrium (uniform delta, all neighbors equal)
+    eff = d.kc * d.ka / (d.ka + d.kc) if (d.ka + d.kc) > 0 else 0
+    _log(f"Effective per-sphere stiffness (uniform contact): {eff:.1f}")
+    _log(f"Aggregate (all surface): {d.n_surface * eff:.0f}  (vs shape ke={model.shape_material_ke.numpy()[0]:.0f})")
+
+    for pair in handler.shape_pairs:
+        _log(f"Pair: CSLC shape {pair.cslc_shape} vs shape {pair.other_shape}  "
+             f"(geo={GEO_NAMES.get(pair.other_geo_type,'?')} body={pair.other_body} "
+             f"r={pair.other_radius:.4f})")
+
+    # Geometry summary per shape
+    pos = d.positions.numpy()
+    is_surf = d.is_surface.numpy()
+    normals = d.outward_normals.numpy()
+    shape_ids = d.sphere_shape.numpy()
+    nbr_count = d.neighbor_count.numpy()
+
+    for sid in np.unique(shape_ids):
+        mask = shape_ids == sid
+        smask = mask & (is_surf == 1)
+        sp = pos[mask]
+        sn = normals[smask]
+        _log(f"Shape {sid}: {mask.sum()} spheres ({smask.sum()} surface)  "
+             f"pos X=[{sp[:,0].min():.4f},{sp[:,0].max():.4f}]  "
+             f"Y=[{sp[:,1].min():.4f},{sp[:,1].max():.4f}]  "
+             f"Z=[{sp[:,2].min():.4f},{sp[:,2].max():.4f}]")
+        for ax, name in [(0,'X'),(1,'Y'),(2,'Z')]:
+            npos = (sn[:,ax] > 0.9).sum()
+            nneg = (sn[:,ax] < -0.9).sum()
+            if npos or nneg:
+                _log(f"  normals {name}: +{npos}  -{nneg}", 1)
+
+    _log(f"Neighbor count: min={nbr_count.min()} max={nbr_count.max()} mean={nbr_count.mean():.1f}")
+
+    # Convergence estimate
+    avg_nbr = nbr_count.mean()
+    rho = d.kl * avg_nbr / (d.ka + d.kl * avg_nbr + d.kc) if (d.ka + d.kl * avg_nbr + d.kc) > 0 else 1
+    _log(f"Spectral radius ρ ≈ {rho:.4f}  → ~{-1/math.log10(max(rho,0.01)):.0f} iters per decade")
+
+    # Confirm friction comes from material
+    mu_arr = model.shape_material_mu.numpy()
+    _log(f"Shape μ values: {mu_arr}")
+
+    return handler
+
+
+def read_cslc_state(model, state=None):
+    """Read CSLC delta / penetration arrays.  Returns dict or empty."""
+    pipeline = getattr(model, "_collision_pipeline", None)
+    handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
+    if handler is None:
+        return {}
+    d = handler.cslc_data
+    deltas = d.sphere_delta.numpy()
+    is_surf = d.is_surface.numpy()
+    pen = handler.raw_penetration.numpy()
+
+    sm = is_surf == 1
+    sd = deltas[sm]
+    sp = pen[sm]
+    act = sp > 0
+
+    return dict(
+        max_delta=float(sd.max()) if len(sd) else 0,
+        mean_delta=float(sd.mean()) if len(sd) else 0,
+        max_pen=float(sp.max()) if len(sp) else 0,
+        mean_pen_active=float(sp[act].mean()) if act.sum() else 0,
+        n_active_surface=int(act.sum()),
+        n_total_surface=int(sm.sum()),
+    )
+
+
+def print_cslc_state(model, step=-1, inline=False):
+    info = read_cslc_state(model)
+    if not info:
+        return ""
+    s = (f"CSLC: {info['n_active_surface']}/{info['n_total_surface']} active  "
+         f"δ_max={info['max_delta']*1e3:.3f}mm  pen_max={info['max_pen']*1e3:.3f}mm")
+    if not inline:
+        _log(s)
+    return s
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Model inspection
+# ═══════════════════════════════════════════════════════════════════════════
+
+def inspect_model(model, label=""):
+    _sub(f"MODEL: {label}")
+    _log(f"bodies={model.body_count}  shapes={model.shape_count}")
+
+    st = model.shape_type.numpy()
+    sf = model.shape_flags.numpy()
+    sc = model.shape_scale.numpy()
+    sb = model.shape_body.numpy()
+    ske = model.shape_material_ke.numpy()
+    smu = model.shape_material_mu.numpy()
+    sg = model.shape_gap.numpy()
+
+    for i in range(model.shape_count):
+        gn = GEO_NAMES.get(int(st[i]), f"?{st[i]}")
+        cslc = " CSLC" if sf[i] & CSLC_FLAG else ""
+        _log(f"Shape {i}: {gn}{cslc}  body={sb[i]}  "
+             f"scale=({sc[i,0]:.4f},{sc[i,1]:.4f},{sc[i,2]:.4f})  "
+             f"ke={ske[i]:.0f}  μ={smu[i]:.2f}  gap={sg[i]:.4f}")
+
+    pairs = model.shape_contact_pairs
+    if pairs is not None:
+        pnp = pairs.numpy()
+        _log(f"Contact pairs: {len(pnp)}")
+        for a, b in pnp:
+            _log(f"  ({a}, {b})", 1)
+
+    fp = getattr(model, "shape_collision_filter_pairs", set())
+    if fp:
+        _log(f"Filter pairs: {sorted(fp)}")
+
+    _log(f"rigid_contact_max: {getattr(model, 'rigid_contact_max', '?')}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Solver creation
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _make_solver(model, solver_name, p):
+    if solver_name == "mujoco":
+        if not HAS_MUJOCO:
+            raise RuntimeError("MuJoCo solver not available")
+
+        # Estimate contact buffer size (must cover narrow phase + CSLC slots)
+        ncon = 5000
+        if model.shape_cslc_spacing is not None:
+            spacing_np = model.shape_cslc_spacing.numpy()
+            flags_np = model.shape_flags.numpy()
+            scale_np = model.shape_scale.numpy()
+            total_surface = 0
+            for i in range(model.shape_count):
+                if not (flags_np[i] & CSLC_FLAG):
+                    continue
+                sp = float(spacing_np[i])
+                if sp <= 0:
+                    continue
+                hx, hy, hz = float(scale_np[i][0]), float(scale_np[i][1]), float(scale_np[i][2])
+                nx = max(int(round(2*hx/sp))+1, 2)
+                ny = max(int(round(2*hy/sp))+1, 2)
+                nz = max(int(round(2*hz/sp))+1, 2)
+                nt = nx*ny*nz
+                ni = max(nx-2,0)*max(ny-2,0)*max(nz-2,0)
+                total_surface += nt - ni
+                _log(f"Shape {i}: CSLC grid ({nx},{ny},{nz})={nt} spheres, {nt-ni} surface")
+            if total_surface > 0:
+                ncon = total_surface + 5000
+                _log(f"MuJoCo buffer: nconmax={ncon}")
+
+        return SolverMuJoCo(model, use_mujoco_contacts=False,
+                            solver="cg", integrator="implicitfast",
+                            iterations=20, ls_iterations=10,
+                            njmax=ncon, nconmax=ncon)
+    elif solver_name == "semi":
+        return SolverSemiImplicit(model)
+    raise ValueError(f"Unknown solver: {solver_name}")
+
+
+def _reset_cslc(model):
+    pipeline = getattr(model, "_collision_pipeline", None)
+    handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
+    if handler:
+        handler.cslc_data.sphere_delta.zero_()
+        _log("CSLC warm-start reset")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Lattice visualisation helper
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _quat_rotate(q, v):
+    xyz = np.array([q[0], q[1], q[2]])
+    t = 2.0 * np.cross(xyz, v)
+    return v + q[3] * t + np.cross(xyz, t)
+
+
+def get_cslc_lattice_viz_data(model, state):
+    pipeline = getattr(model, "_collision_pipeline", None)
+    handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
+    if handler is None:
+        return None
+    d = handler.cslc_data
+    n = d.n_spheres
+    pl = d.positions.numpy(); nm = d.outward_normals.numpy()
+    dl = d.sphere_delta.numpy(); rd = d.radii.numpy()
+    sf = d.is_surface.numpy(); si = d.sphere_shape.numpy()
+    bq = state.body_q.numpy(); sb = model.shape_body.numpy()
+    sx = model.shape_transform.numpy()
+
+    pw = np.zeros((n, 3), np.float32)
+    for i in range(n):
+        if sf[i] == 0: continue
+        s = si[i]; b = sb[s]
+        ql = pl[i] + dl[i] * nm[i]
+        qb = _quat_rotate(sx[s, 3:7], ql) + sx[s, :3]
+        pw[i] = _quat_rotate(bq[b, 3:7], qb) + bq[b, :3]
+    return pw, dl, rd, sf
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Headless test runners
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_squeeze(name, model, solver, p, verbose=1):
+    """Run the full squeeze→hold sequence with diagnostic output.
+
+    verbose: 0=silent  1=periodic  2=every step  3=full contact dump
     """
-    count_arr = contacts.rigid_contact_count.numpy()
-    n_contacts = int(count_arr[0]) if len(count_arr) > 0 else 0
-    if n_contacts == 0:
-        return 0, 0.0, 0.0
-
-    shape0 = contacts.rigid_contact_shape0.numpy()[:n_contacts]
-    margin0 = contacts.rigid_contact_margin0.numpy()[:n_contacts]
-    margin1 = contacts.rigid_contact_margin1.numpy()[:n_contacts]
-
-    valid_mask = shape0 >= 0
-    n_active = int(np.sum(valid_mask))
-    if n_active == 0:
-        return 0, 0.0, 0.0
-
-    margins = margin0[valid_mask] + margin1[valid_mask]
-    return n_active, float(np.mean(margins)), float(np.std(margins))
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Simulation runner
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def run_config(name: str, model: newton.Model, solver: Any, p: SceneParams) -> Metrics:
-    """Run a single configuration and collect metrics."""
-    print(f"\n{'═' * 60}")
-    print(f"  Running: {name}")
-    print(f"  Sphere mass: {p.sphere_mass:.3f} kg, gravity force: {p.sphere_mass * 9.81:.2f} N")
-    print(f"  Initial penetration/side: {p.penetration_per_side * 1000:.1f} mm")
-    print(f"{'═' * 60}")
-
-    state_0 = model.state()
-    state_1 = model.state()
-    control = model.control()
-    contacts = model.contacts()
-
-    metrics = Metrics(name=name)
-
-    # Warm-up: JIT compile + allocate (use a throwaway state so warm-start is clean)
-    warmup_s0 = model.state()
-    warmup_s1 = model.state()
-    for _ in range(3):
-        set_kinematic_pads(warmup_s0, 0, p)
-        warmup_s0.clear_forces()
-        model.collide(warmup_s0, contacts)
-        solver.step(warmup_s0, warmup_s1, control, contacts, p.dt)
-        warmup_s0, warmup_s1 = warmup_s1, warmup_s0
-    del warmup_s0, warmup_s1
-
-    # Fresh start for actual test
-    state_0 = model.state()
-    state_1 = model.state()
-    contacts = model.contacts()
+    met = Metrics(name=name)
+    s0 = model.state(); s1 = model.state()
+    ctrl = model.control(); con = model.contacts()
+    _reset_cslc(model)
+    is_cslc = "cslc" in name.lower()
 
     for step in range(p.n_total_steps):
-        set_kinematic_pads(state_0, step, p)
-        state_0.clear_forces()
+        dbg_pad = verbose >= 3 and step % 100 == 0
+        set_kinematic_pads(s0, step, p, debug=dbg_pad)
+        s0.clear_forces()
 
         t0 = time.perf_counter()
-        model.collide(state_0, contacts)
-        solver.step(state_0, state_1, control, contacts, p.dt)
+        model.collide(s0, con)
+        solver.step(s0, s1, ctrl, con, p.dt)
         wp.synchronize()
-        t1 = time.perf_counter()
+        dt_ms = (time.perf_counter() - t0) * 1e3
 
-        # ── Diagnostics on first step ──
-        if step == 0:
-            count = int(contacts.rigid_contact_count.numpy()[0])
-            print(f"  [DIAG] step 0: contacts={count}")
-            if contacts.rigid_contact_stiffness is not None:
-                stiff = contacts.rigid_contact_stiffness.numpy()[:count]
-                nonzero = stiff[stiff > 0]
-                if len(nonzero) > 0:
-                    print(f"  [DIAG] per-contact stiffness: min={nonzero.min():.1f} max={nonzero.max():.1f}")
-            # Check sphere velocity after first step
-            qd = state_1.body_qd.numpy()
-            vz = float(qd[2, 2])  # body 2 z-velocity
-            print(f"  [DIAG] sphere vz after step 0: {vz:.4f} m/s")
+        q = s1.body_q.numpy(); qd = s1.body_qd.numpy()
+        sz = float(q[2,2]); sx = float(q[2,0])
+        nc = count_active_contacts(con)
 
-        q = state_1.body_q.numpy()
-        sphere_z = float(q[2, 2])  # body 2 = sphere, pz
-        metrics.sphere_z.append(sphere_z)
+        met.sphere_z.append(sz)
+        met.sphere_x.append(sx)
+        met.active_contacts.append(nc)
 
-        n_active, f_mean, f_std = extract_contact_metrics(contacts)
-        metrics.active_contacts.append(n_active)
-        metrics.normal_force_mean.append(f_mean)
-        metrics.normal_force_std.append(f_std)
-        metrics.step_times_ms.append((t1 - t0) * 1000.0)
+        if is_cslc:
+            ci = read_cslc_state(model)
+            if ci:
+                met.cslc_max_delta.append(ci["max_delta"])
+                met.cslc_active_surface.append(ci["n_active_surface"])
+                met.cslc_max_pen.append(ci["max_pen"])
 
-        state_0, state_1 = state_1, state_0
+        s0, s1 = s1, s0
 
-        if (step + 1) % 200 == 0 or step == p.n_total_steps - 1:
-            phase = "squeeze" if step < p.n_squeeze_steps else "hold"
-            print(
-                f"  step {step + 1:5d}/{p.n_total_steps}  "
-                f"[{phase:7s}]  "
-                f"z={sphere_z:+.4f}  "
-                f"contacts={n_active:4d}  "
-                f"dt={metrics.step_times_ms[-1]:.2f}ms"
-            )
+        phase = "SQUEEZE" if step < p.n_squeeze_steps else "HOLD  "
+        zd = (met.sphere_z[0] - sz) * 1e3
 
-    return metrics
+        do_print = (verbose >= 2 or
+                    (verbose >= 1 and ((step+1) % 100 == 0 or step == p.n_total_steps - 1)))
+        if do_print:
+            line = (f"  {name:20s} {step+1:5d}/{p.n_total_steps}  [{phase}]  "
+                    f"z={sz:+.5f}  drop={zd:+.3f}mm  contacts={nc:4d}  "
+                    f"vz={float(qd[2,5]):.5f}")
+            if is_cslc and met.cslc_max_delta:
+                line += (f"  δ={met.cslc_max_delta[-1]*1e3:.3f}mm"
+                         f"  pen={met.cslc_max_pen[-1]*1e3:.3f}mm"
+                         f"  surf={met.cslc_active_surface[-1]}")
+            print(line)
 
+        if verbose >= 3 and step % 200 == 0:
+            dump_contacts(con, f"step {step+1}", max_show=10)
 
-def run_gradient_test(name: str, model: newton.Model, p: SceneParams) -> float | None:
-    """Forward+backward pass to measure gradient magnitude."""
-    try:
-        solver = SolverSemiImplicit(model)
-        state_0 = model.state()
-        state_1 = model.state()
-        control = model.control()
-        contacts = model.contacts()
-
-        mid_step = p.n_squeeze_steps // 2
-        set_kinematic_pads(state_0, mid_step, p)
-
-        # Gradient test needs a scalar loss
-        loss = wp.zeros(1, dtype=wp.float32, requires_grad=True, device=model.device)
-
-        tape = wp.Tape()
-        with tape:
-            state_0.clear_forces()
-            model.collide(state_0, contacts)
-            solver.step(state_0, state_1, control, contacts, p.dt)
-
-            # Scalar loss: z-position of sphere (body 2)
-            wp.launch(
-                kernel=_scalar_loss_kernel,
-                dim=1,
-                inputs=[state_1.body_q, 2],
-                outputs=[loss],
-                device=model.device,
-            )
-
-        tape.backward(loss=loss)
-        grad = tape.gradients.get(state_0.body_q)
-        if grad is not None:
-            norm = float(np.linalg.norm(grad.numpy()))
-            print(f"  Gradient norm ({name}): {norm:.4e}")
-            return norm
-        print(f"  Gradient not available for {name}")
-        return None
-    except Exception as e:
-        print(f"  Gradient test failed for {name}: {e}")
-        return None
+    return met
 
 
-@wp.kernel
-def _scalar_loss_kernel(
-    body_q: wp.array(dtype=wp.transform),
-    body_index: int,
-    loss: wp.array(dtype=wp.float32),
-):
-    """Extract z-position of a body as a scalar loss for gradient testing."""
-    q = body_q[body_index]
-    pos = wp.transform_get_translation(q)
-    loss[0] = pos[2]
+def run_perturbation(name, model, solver, p, axis, verbose=1):
+    """Squeeze first, then apply angular impulse and track rotation."""
+    met = Metrics(name=name)
+    s0 = model.state(); s1 = model.state()
+    ctrl = model.control(); con = model.contacts()
+    _reset_cslc(model)
+
+    pert_step = int(p.perturbation_time / p.dt)
+    done = False
+    n_steps = p.n_squeeze_steps + int(2.0 / p.dt)
+
+    for step in range(n_steps):
+        set_kinematic_pads(s0, step, p)
+        s0.clear_forces()
+
+        if step == pert_step and not done:
+            _log(f"─── PERTURBATION at step {step}  ω={p.perturbation_omega} rad/s  axis={axis} ───")
+            apply_angular_impulse(s0, 2, axis, p.perturbation_omega, debug=True)
+            done = True
+
+        model.collide(s0, con)
+        solver.step(s0, s1, ctrl, con, p.dt)
+        wp.synchronize()
+
+        q = s1.body_q.numpy(); qd = s1.body_qd.numpy()
+        ang = get_body_rotation_angle(s1, 2, axis)
+        met.sphere_z.append(float(q[2,2]))
+        met.sphere_angle.append(ang)
+        met.active_contacts.append(count_active_contacts(con))
+        s0, s1 = s1, s0
+
+        near = abs(step - pert_step) < 20
+        periodic = (step+1) % 200 == 0
+        if verbose >= 1 and (near or periodic):
+            phase = "SQUEEZE" if step < p.n_squeeze_steps else "POST  "
+            print(f"  {name:20s} {step+1:5d}/{n_steps}  [{phase}]  "
+                  f"angle={ang*180/math.pi:+8.3f}°  z={q[2,2]:+.5f}  "
+                  f"ω=({qd[2,0]:+.4f},{qd[2,1]:+.4f},{qd[2,2]:+.4f})  "
+                  f"v=({qd[2,3]:+.4f},{qd[2,4]:+.4f},{qd[2,5]:+.4f})  "
+                  f"contacts={met.active_contacts[-1]}")
+
+    return met
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Configuration registry
+#  Test orchestrators
 # ═══════════════════════════════════════════════════════════════════════════
 
+def test_squeeze(p, solver_name="mujoco"):
+    results = []
+    for cm in ["point", "cslc"]:
+        label = f"{cm}_{solver_name}"
+        _section(label.upper())
+        model = BUILDERS[cm](p)
+        _ = model.contacts() # forces _init_collision_pipeline() so we can inspect it
+        inspect_model(model, label)
+        if cm == "cslc":
+            inspect_cslc_handler(model, label)
+        solver = _make_solver(model, solver_name, p)
+        m = run_squeeze(label, model, solver, p, verbose=1)
+        results.append(m)
+        _log(f"RESULT: z-drop={m.z_drop_mm:.3f}mm  peak_contacts={m.peak_contacts}")
+    return results
 
-def get_configs(p: SceneParams) -> dict[str, dict]:
-    configs = {}
 
-    configs["point_semi"] = dict(
-        build=lambda: build_point_contact_scene(p),
-        solver_cls=SolverSemiImplicit, solver_kwargs={},
-        label="Point Contact + SemiImplicit",
-    )
-    if HAS_MUJOCO:
-        configs["point_mujoco"] = dict(
-            build=lambda: build_point_contact_scene(p),
-            solver_cls=SolverMuJoCo,
-            solver_kwargs=dict(iterations=20, ls_iterations=10, solver="cg", integrator="implicitfast"),
-            label="Point Contact + MuJoCo",
-        )
-    if HAS_XPBD:
-        configs["point_xpbd"] = dict(
-            build=lambda: build_point_contact_scene(p),
-            solver_cls=SolverXPBD,
-            solver_kwargs=dict(rigid_contact_relaxation=0.8, rigid_contact_con_weighting=True),
-            label="Point Contact + XPBD",
-        )
-    configs["hydro_semi"] = dict(
-        build=lambda: build_hydroelastic_scene(p),
-        solver_cls=SolverSemiImplicit, solver_kwargs={},
-        label="Hydroelastic + SemiImplicit",
-    )
-    if HAS_MUJOCO:
-        configs["hydro_mujoco"] = dict(
-            build=lambda: build_hydroelastic_scene(p),
-            solver_cls=SolverMuJoCo,
-            solver_kwargs=dict(iterations=20, ls_iterations=10, solver="cg", integrator="implicitfast"),
-            label="Hydroelastic + MuJoCo",
-        )
-    configs["cslc_semi"] = dict(
-        build=lambda: build_cslc_scene(p),
-        solver_cls=SolverSemiImplicit, solver_kwargs={},
-        label="CSLC + SemiImplicit",
-    )
-    if HAS_MUJOCO:
-        configs["cslc_mujoco"] = dict(
-            build=lambda: build_cslc_scene(p),
-            solver_cls=SolverMuJoCo,
-            solver_kwargs=dict(iterations=20, ls_iterations=10, solver="cg", integrator="implicitfast"),
-            label="CSLC + MuJoCo",
-        )
-    return configs
+def test_friction_sweep(p):
+    results = []
+    mus = [0.1, 0.2, 0.3, 0.5, 0.7, 1.0]
+
+    for mu in mus:
+        for cm in ["point", "cslc"]:
+            label = f"{cm}_mu{mu}"
+            ps = SceneParams(mu=mu)
+            print(f"\n  {label}...", end="", flush=True)
+            model = BUILDERS[cm](ps)
+            solver = _make_solver(model, "mujoco", ps)
+            m = run_squeeze(label, model, solver, ps, verbose=0)
+            results.append(m)
+            print(f" {'HELD' if m.z_drop_mm < 5 else f'SLIP ({m.z_drop_mm:.1f}mm)'}")
+
+    _sub("Friction sweep  (z-drop < 5mm = HELD)")
+    print(f"  {'μ':>6}  {'Point(mm)':>10}  {'CSLC(mm)':>10}  {'Winner':>8}")
+    for mu in mus:
+        pm = next(m for m in results if m.name == f"point_mu{mu}")
+        cm = next(m for m in results if m.name == f"cslc_mu{mu}")
+        w = "CSLC" if cm.z_drop_mm < pm.z_drop_mm else "point"
+        print(f"  {mu:6.1f}  {pm.z_drop_mm:10.2f}  {cm.z_drop_mm:10.2f}  {w:>8}")
+    return results
+
+
+def test_tilt(p, solver_name="mujoco"):
+    axis = np.array([0.0, 1.0, 0.0])
+    results = []
+    for cm in ["point", "cslc"]:
+        label = f"{cm}_tilt"
+        _section(label.upper())
+        model = BUILDERS[cm](p); solver = _make_solver(model, solver_name, p)
+        m = run_perturbation(label, model, solver, p, axis, verbose=1)
+        results.append(m)
+        _log(f"RESULT: max_angle={m.max_angle_deg:.3f}°  "
+             f"{'SETTLED' if m.settled else 'UNSTABLE'}")
+    return results
+
+
+def test_twist(p, solver_name="mujoco"):
+    axis = np.array([1.0, 0.0, 0.0])
+    results = []
+    for cm in ["point", "cslc"]:
+        label = f"{cm}_twist"
+        _section(label.upper())
+        model = BUILDERS[cm](p); solver = _make_solver(model, solver_name, p)
+        m = run_perturbation(label, model, solver, p, axis, verbose=1)
+        results.append(m)
+        _log(f"RESULT: max_angle={m.max_angle_deg:.3f}°  "
+             f"{'SETTLED' if m.settled else 'UNSTABLE'}")
+    return results
+
+
+def test_calibrate(p):
+    """Deep diagnostic of CSLC calibration — no simulation, just geometry + stiffness."""
+    _section("CSLC CALIBRATION DIAGNOSTIC")
+    p.dump()
+
+    model = build_cslc_scene(p)
+    inspect_model(model, "cslc")
+    handler = inspect_cslc_handler(model, "cslc")
+    if handler is None:
+        _log("ERROR: no CSLC handler was created"); return
+
+    d = handler.cslc_data
+
+    _sub("STIFFNESS ANALYSIS")
+    _log(f"ka={d.ka:.0f}  kl={d.kl:.0f}  kc={d.kc:.1f}  dc={d.dc:.2f}")
+    eff = d.kc * d.ka / (d.ka + d.kc)
+    _log(f"Effective per-sphere stiffness (uniform case): kc·ka/(ka+kc) = {eff:.1f}")
+    _log(f"Total aggregate: {d.n_surface} × {eff:.1f} = {d.n_surface * eff:.0f}")
+
+    _sub("SINGLE-STEP CONVERGENCE TEST")
+    state = model.state(); contacts = model.contacts()
+    set_kinematic_pads(state, 0, p, debug=True)
+    state.clear_forces()
+    model.collide(state, contacts)
+    info = read_cslc_state(model)
+    for k, v in info.items():
+        fmt = f"{v*1e3:.4f}mm" if isinstance(v, float) and ("delta" in k or "pen" in k) else str(v)
+        _log(f"  {k}: {fmt}")
+
+
+def test_inspect(p, solver_name, n_steps=10):
+    """Step-by-step dump: every contact, every body state, every CSLC delta."""
+    _section(f"STEP-BY-STEP INSPECTION ({n_steps} steps)")
+    p.dump()
+
+    for cm in ["point", "cslc"]:
+        label = f"{cm}_{solver_name}"
+        _sub(f"Building {label}")
+        model = BUILDERS[cm](p)
+        inspect_model(model, label)
+        if cm == "cslc":
+            inspect_cslc_handler(model, label)
+
+        solver = _make_solver(model, solver_name, p)
+        s0 = model.state(); s1 = model.state()
+        ctrl = model.control(); con = model.contacts()
+        _reset_cslc(model)
+
+        for step in range(n_steps):
+            _sub(f"{label} — STEP {step+1}/{n_steps}")
+            set_kinematic_pads(s0, step, p, debug=True)
+            s0.clear_forces()
+
+            q = s0.body_q.numpy(); qd = s0.body_qd.numpy()
+            _log(f"Sphere PRE:  pos=({q[2,0]:.5f},{q[2,1]:.5f},{q[2,2]:.5f})  "
+                 f"ω=({qd[2,0]:.5f},{qd[2,1]:.5f},{qd[2,2]:.5f})  "
+                 f"v=({qd[2,3]:.5f},{qd[2,4]:.5f},{qd[2,5]:.5f})")
+
+            model.collide(s0, con)
+            dump_contacts(con, f"{label} step {step+1}", max_show=30)
+            if cm == "cslc":
+                print_cslc_state(model, step)
+
+            solver.step(s0, s1, ctrl, con, p.dt)
+            wp.synchronize()
+
+            q2 = s1.body_q.numpy(); qd2 = s1.body_qd.numpy()
+            _log(f"Sphere POST: pos=({q2[2,0]:.5f},{q2[2,1]:.5f},{q2[2,2]:.5f})  "
+                 f"ω=({qd2[2,0]:.5f},{qd2[2,1]:.5f},{qd2[2,2]:.5f})  "
+                 f"v=({qd2[2,3]:.5f},{qd2[2,4]:.5f},{qd2[2,5]:.5f})")
+            _log(f"Δz = {(q2[2,2]-q[2,2])*1e3:+.4f}mm")
+
+            s0, s1 = s1, s0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Results reporting
+#  CSV output
 # ═══════════════════════════════════════════════════════════════════════════
 
-
-def save_results_csv(all_metrics: list[Metrics], path: str = "squeeze_results.csv"):
+def save_results(all_metrics, path):
     with open(path, "w") as f:
-        f.write("config,z_drop_mm,peak_contacts,avg_step_ms,gradient_norm\n")
+        f.write("config,z_drop_mm,max_angle_deg,settled,peak_contacts\n")
         for m in all_metrics:
-            g = f"{m.gradient_norm:.4e}" if m.gradient_norm is not None else "N/A"
-            f.write(f"{m.name},{m.z_drop_mm:.4f},{m.peak_contacts},{m.avg_step_ms:.4f},{g}\n")
+            s = "yes" if m.settled else ("no" if m.sphere_angle else "n/a")
+            f.write(f"{m.name},{m.z_drop_mm:.4f},{m.max_angle_deg:.2f},{s},{m.peak_contacts}\n")
     print(f"\nResults saved to {path}")
 
 
-def save_timeseries_csv(all_metrics: list[Metrics], p: SceneParams, path: str = "squeeze_timeseries.csv"):
-    with open(path, "w") as f:
-        header = "step,time_s," + ",".join(f"z_{m.name}" for m in all_metrics)
-        f.write(header + "\n")
-        n_steps = max(len(m.sphere_z) for m in all_metrics) if all_metrics else 0
-        for i in range(n_steps):
-            vals = [f"{m.sphere_z[i]:.6f}" if i < len(m.sphere_z) else "" for m in all_metrics]
-            f.write(f"{i},{i * p.dt:.6f},{','.join(vals)}\n")
-    print(f"Timeseries saved to {path}")
+# ═══════════════════════════════════════════════════════════════════════════
+#  Viewer mode
+# ═══════════════════════════════════════════════════════════════════════════
 
+class Example:
+    """Interactive viewer following Newton's Example protocol."""
 
-def print_comparison_table(all_metrics: list[Metrics]):
-    print(f"\n{'═' * 72}")
-    print(f"  SQUEEZE TEST COMPARISON")
-    print(f"{'═' * 72}")
-    print(f"  {'Config':<30s} {'Z-drop':>10s} {'Contacts':>10s} {'Step':>10s} {'Grad':>12s}")
-    print(f"  {'':30s} {'(mm)':>10s} {'(peak)':>10s} {'(ms)':>10s} {'norm':>12s}")
-    for m in all_metrics:
-        g = f"{m.gradient_norm:.2e}" if m.gradient_norm is not None else "—"
-        print(f"  {m.name:<30s} {m.z_drop_mm:10.3f} {m.peak_contacts:10d} {m.avg_step_ms:10.3f} {g:>12s}")
-    print(f"{'═' * 72}")
-    if len(all_metrics) >= 2:
-        print(f"\n  Best grip:       {min(all_metrics, key=lambda m: m.z_drop_mm).name}")
-        print(f"  Fastest:         {min(all_metrics, key=lambda m: m.avg_step_ms).name}")
-        print(f"  Largest patch:   {max(all_metrics, key=lambda m: m.peak_contacts).name}")
+    def __init__(self, viewer, args):
+        self.viewer = viewer
+        self.test_mode = args.test
+        self.fps = 60
+        self.frame_dt = 1.0 / self.fps
+        self.sim_substeps = max(1, int(self.frame_dt / 0.002))
+        self.sim_dt = self.frame_dt / self.sim_substeps
+        self.sim_time = 0.0
+        self.sim_step = 0
+
+        self.contact_model = getattr(args, "contact_model", "cslc")
+        self.solver_name = getattr(args, "solver", "mujoco")
+        self.show_lattice = getattr(args, "show_lattice", True)
+
+        self.p = SceneParams(dt=self.sim_dt)
+        self.p.dump()
+
+        self.model = BUILDERS[self.contact_model](self.p)
+        inspect_model(self.model, self.contact_model)
+        if self.contact_model == "cslc":
+            inspect_cslc_handler(self.model, self.contact_model)
+
+        self.solver = _make_solver(self.model, self.solver_name, self.p)
+        self.state_0 = self.model.state()
+        self.state_1 = self.model.state()
+        self.control = self.model.control()
+        self.contacts = self.model.contacts()
+
+        self.current_z_drop_mm = 0.0
+        self.current_contacts = 0
+        self.initial_z = self.p.sphere_start_z
+
+        self.viewer.set_model(self.model)
+        self.viewer.set_camera(
+            pos=wp.vec3(0.4, -0.4, self.p.sphere_start_z + 0.1),
+            pitch=-10.0, yaw=135.0)
+
+        self._init_lattice_rendering()
+
+        if hasattr(self.viewer, "register_ui_callback"):
+            self.viewer.register_ui_callback(self._render_ui, position="side")
+
+        _log(f"Contact model: {self.contact_model}")
+        _log(f"Solver: {self.solver_name}")
+        _log(f"Sphere mass: {self.p.sphere_mass:.3f} kg")
+
+    def _init_lattice_rendering(self):
+        self._lattice_n = 0
+        pipeline = getattr(self.model, "_collision_pipeline", None)
+        handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
+        if handler is None:
+            return
+        d = handler.cslc_data
+        n = d.n_surface
+        self._lattice_n = n
+        self._lattice_radius = float(d.radii.numpy()[0]) * 0.4
+        self._lattice_xforms = np.zeros((n, 7), np.float32); self._lattice_xforms[:, 6] = 1.0
+        self._lattice_colors = np.zeros((n, 3), np.float32)
+        self._lattice_mats = np.tile([0.5, 0.3, 0.0, 0.0], (n, 1)).astype(np.float32)
+
+    def simulate(self):
+        for _ in range(self.sim_substeps):
+            set_kinematic_pads(self.state_0, self.sim_step, self.p)
+            self.state_0.clear_forces()
+            self.model.collide(self.state_0, self.contacts)
+            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            self.state_0, self.state_1 = self.state_1, self.state_0
+            self.sim_step += 1
+
+    def step(self):
+        self.simulate()
+        self.sim_time += self.frame_dt
+        q = self.state_0.body_q.numpy()
+        self.current_z_drop_mm = (self.initial_z - float(q[2, 2])) * 1e3
+        self.current_contacts = count_active_contacts(self.contacts)
+
+    def render(self):
+        self.viewer.begin_frame(self.sim_time)
+        self.viewer.log_state(self.state_0)
+        self.viewer.log_contacts(self.contacts, self.state_0)
+        if self.show_lattice and self.contact_model == "cslc":
+            self._render_lattice()
+        self.viewer.end_frame()
+
+    def _render_lattice(self):
+        viz = get_cslc_lattice_viz_data(self.model, self.state_0)
+        if viz is None:
+            return
+        pw, dl, rd, sf = viz
+        idx = 0
+        mx = max(float(np.max(np.abs(dl))), 1e-6)
+        for i in range(len(dl)):
+            if sf[i] == 0 or idx >= self._lattice_n:
+                continue
+            self._lattice_xforms[idx, :3] = pw[i]
+            t = min(abs(dl[i]) / mx, 1.0)
+            self._lattice_colors[idx] = [t, 0.2*(1-t), 1-t] if dl[i] > 1e-8 else [0.3, 0.3, 0.35]
+            idx += 1
+        if idx == 0:
+            return
+        self.viewer.log_shapes(
+            "/cslc_lattice", newton.GeoType.SPHERE, self._lattice_radius,
+            wp.array(self._lattice_xforms[:idx], dtype=wp.transform),
+            wp.array(self._lattice_colors[:idx], dtype=wp.vec3),
+            wp.array(self._lattice_mats[:idx], dtype=wp.vec4))
+
+    def _render_ui(self, imgui):
+        imgui.text(f"Contact: {self.contact_model}")
+        imgui.text(f"Z-drop: {self.current_z_drop_mm:.2f} mm")
+        imgui.text(f"Contacts: {self.current_contacts}")
+        imgui.text(f"Step: {self.sim_step}")
+        t = self.sim_step * self.p.dt
+        imgui.text(f"Phase: {'SQUEEZE' if t < self.p.pad_squeeze_duration else 'HOLD'}")
+        if self.contact_model == "cslc":
+            _, self.show_lattice = imgui.checkbox("Show lattice", self.show_lattice)
+
+    def test_final(self):
+        if self.contact_model == "cslc":
+            assert self.current_z_drop_mm < 5.0, f"z-drop too large: {self.current_z_drop_mm:.2f}mm"
+
+    @staticmethod
+    def create_parser():
+        parser = newton.examples.create_parser()
+        parser.add_argument("--contact-model", type=str, default="cslc",
+                            choices=["point", "cslc", "hydro"])
+        parser.add_argument("--solver", type=str, default="mujoco",
+                            choices=["mujoco", "semi"])
+        parser.add_argument("--show-lattice", action="store_true", default=True)
+        parser.add_argument("--no-lattice", dest="show_lattice", action="store_false")
+        parser.add_argument("--mode", type=str, default="viewer",
+                            choices=["viewer","squeeze","friction-sweep","tilt","twist",
+                                     "calibrate","inspect","all"])
+        parser.add_argument("--steps", type=int, default=10,
+                            help="Steps for inspect mode")
+        return parser
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Main
 # ═══════════════════════════════════════════════════════════════════════════
 
-
 def main():
-    parser = argparse.ArgumentParser(description="CSLC Squeeze Test")
-    parser.add_argument("--configs", nargs="*", default=None)
-    parser.add_argument("--list", action="store_true")
-    parser.add_argument("--no-gradient", action="store_true")
-    parser.add_argument("--dt", type=float, default=None)
-    parser.add_argument("--device", type=str, default="cuda:0")
-    args = parser.parse_args()
+    parser = Example.create_parser()
+    args, _ = parser.parse_known_args()
+    mode = args.mode
 
     wp.init()
-    wp.set_device(args.device)
+    print(f"\n{_HSEP}\n  CSLC TEST SUITE — mode: {mode}\n{_HSEP}")
 
-    p = SceneParams()
-    if args.dt is not None:
-        p.dt = args.dt
-
-    configs = get_configs(p)
-
-    if args.list:
-        print("Available configurations:")
-        for key, cfg in configs.items():
-            print(f"  {key:<20s}  {cfg['label']}")
+    if mode == "viewer":
+        viewer, args = newton.examples.init(parser)
+        newton.examples.run(Example(viewer, args), args)
         return
 
-    selected = args.configs if args.configs is not None else list(configs.keys())
-    for key in selected:
-        if key not in configs:
-            print(f"Unknown config: {key}.  Available: {', '.join(configs.keys())}")
-            return
+    args = parser.parse_args()
+    device = getattr(args, "device", "cuda:0")
+    try:
+        wp.set_device(device)
+    except Exception:
+        print(f"  Device '{device}' unavailable → CPU"); wp.set_device("cpu")
 
-    all_metrics: list[Metrics] = []
-    for key in selected:
-        cfg = configs[key]
-        try:
-            model = cfg["build"]()
-            solver = cfg["solver_cls"](model, **cfg["solver_kwargs"])
-            metrics = run_config(name=key, model=model, solver=solver, p=p)
-            if not args.no_gradient and cfg["solver_cls"] == SolverSemiImplicit:
-                metrics.gradient_norm = run_gradient_test(key, cfg["build"](), p)
-            all_metrics.append(metrics)
-            print(metrics.summary())
-        except Exception as e:
-            print(f"\n  ERROR in {key}: {e}")
-            import traceback; traceback.print_exc()
+    p = SceneParams()
+    sn = args.solver if hasattr(args, "solver") else ("mujoco" if HAS_MUJOCO else "semi")
+    all_res = []
 
-    if all_metrics:
-        print_comparison_table(all_metrics)
-        save_results_csv(all_metrics)
-        save_timeseries_csv(all_metrics, p)
+    if mode == "calibrate":
+        test_calibrate(p); return
+    if mode == "inspect":
+        test_inspect(p, sn, args.steps); return
+
+    if mode in ("squeeze", "all"):
+        p.dump()
+        all_res.extend(test_squeeze(p, sn))
+    if mode in ("friction-sweep", "all"):
+        _section("FRICTION SWEEP")
+        if HAS_MUJOCO:
+            all_res.extend(test_friction_sweep(p))
+        else:
+            print("  SKIPPED — MuJoCo required")
+    if mode in ("tilt", "all"):
+        all_res.extend(test_tilt(p, sn))
+    if mode in ("twist", "all"):
+        all_res.extend(test_twist(p, sn))
+
+    if all_res:
+        save_results(all_res, "cslc_results.csv")
+        _section("SUMMARY")
+        print(f"  {'Config':<30} {'Z-drop':>8} {'Angle':>8} {'Settled':>8} {'Contacts':>10}")
+        for m in all_res:
+            s = "yes" if m.settled else ("no" if m.sphere_angle else "—")
+            print(f"  {m.name:<30} {m.z_drop_mm:8.2f} {m.max_angle_deg:8.1f} {s:>8} {m.peak_contacts:10d}")
+        print(f"{_DSEP}")
 
 
 if __name__ == "__main__":
