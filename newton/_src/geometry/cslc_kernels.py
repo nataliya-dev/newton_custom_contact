@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
@@ -62,7 +63,7 @@ def compute_cslc_penetration_sphere(
         X_ws = shape_transform[s_idx]
         X_wb = body_q[b_idx]
 
-        # Displaced lattice sphere position
+        # Displaced lattice sphere position (used for Jacobi equilibrium)
         p_local = sphere_pos_local[tid]
         out_n = sphere_outward_normal[tid]
         delta_val = sphere_delta[tid]
@@ -84,7 +85,6 @@ def compute_cslc_penetration_sphere(
             n_world = diff / dist
         else:
             # Bug #4 fix: transform outward normal to world frame for fallback.
-            # out_n is in shape-local frame; rotate through shape→body→world.
             n_body = wp.transform_vector(X_ws, out_n)
             n_world = wp.transform_vector(X_wb, n_body)
 
@@ -113,17 +113,11 @@ def jacobi_step(
 ):
     """One damped Jacobi iteration for quasistatic lattice equilibrium.
 
-    Bug #1 fix: include kc in the diagonal when contact is active.
-
     The equilibrium per sphere i (when contact is active, phi > delta):
         (ka + kl*|N(i)| + kc) * delta_i = kc * phi_i + kl * sum_j delta_j
 
     When contact is inactive (phi <= delta):
         (ka + kl*|N(i)|) * delta_i = kl * sum_j delta_j
-
-    With kc in the diagonal, the spectral radius drops from
-    kc/(ka+kl|N|) to kl|N|/(ka+kl|N|+kc), allowing alpha=0.6
-    and convergence in ~15-20 iterations instead of 40+.
 
     Under-relaxed: delta_new = (1-alpha)*delta_old + alpha*delta_jacobi
     Clamped to non-negative (sphere cannot retract into the body).
@@ -140,11 +134,6 @@ def jacobi_step(
         j = neighbor_list[start + n]
         neighbor_sum = neighbor_sum + delta_src[j]
 
-    # Contact force and diagonal depend on whether contact is active.
-    # When active: kc enters the diagonal of the linearized system.
-    #   (ka + kl|N| + kc) * delta = kc * phi + kl * Σ delta_j
-    # When inactive:
-    #   (ka + kl|N|) * delta = kl * Σ delta_j
     f_contact = float(0.0)
     k_diag = ka + kl * float(n_neighbors)
 
@@ -152,8 +141,8 @@ def jacobi_step(
         phi = raw_penetration[tid]
         effective_pen = phi - delta_old
         if effective_pen > 0.0:
-            f_contact = kc * phi            # Source: kc * phi (not kc*(phi-delta))
-            k_diag = k_diag + kc            # kc enters diagonal
+            f_contact = kc * phi
+            k_diag = k_diag + kc
 
     # Jacobi update + under-relaxation
     delta_jacobi = (f_contact + kl * neighbor_sum) / k_diag
@@ -167,6 +156,17 @@ def jacobi_step(
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Kernel 3: Write contacts to Newton's Contacts buffer
+#
+#  FIX: Use REST position (not displaced) and reduce margin by delta.
+#
+#  The Jacobi solve determines equilibrium delta for each surface sphere.
+#  The effective penetration the solver should see is (phi_raw - delta),
+#  NOT (phi_raw + delta) which is what the displaced position produces.
+#
+#  By using the REST position and setting margin0 = max(r_lat - delta, 0),
+#  the solver computes:
+#    pen = margin0 + margin1 - dist_rest = (r - delta) + R - D = phi - delta
+#  which is the correct equilibrium contact force.
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -212,13 +212,9 @@ def write_cslc_contacts(
 ):
     """Write one contact per surface sphere into Newton's Contacts buffer.
 
-    Bug #3 fix: non-penetrating spheres are marked invalid (shape0 = -1)
-    so the solver skips them. This cuts ~8000 ghost contacts down to the
-    ~600 that are actually in contact.
-
-    Bug #4 fix: degenerate normal fallback transforms to world frame.
-
-    No atomic_add anywhere -> fully differentiable via wp.Tape.
+    Uses the REST position (no delta displacement) and reduces margin0
+    by delta to encode the equilibrium deformation. This makes the solver
+    compute pen = phi - delta (correct) instead of phi + delta (wrong).
     """
     tid = wp.tid()
 
@@ -237,12 +233,19 @@ def write_cslc_contacts(
     p_local = sphere_pos_local[tid]
     out_n = sphere_outward_normal[tid]
     delta_val = sphere_delta[tid]
-    q_local = p_local + delta_val * out_n
+    r_lat = sphere_radii[tid]
 
-    # Lattice sphere center -> world
+    # FIX: Use REST position (no delta displacement).
+    # The delta is encoded in the reduced margin instead.
+    q_local = p_local  # was: p_local + delta_val * out_n
     q_body = wp.transform_point(X_ws, q_local)
     q_world = wp.transform_point(X_wb, q_body)
-    r_lat = sphere_radii[tid]
+
+    # Effective radius: reduced by lattice deformation.
+    # This makes the solver see pen = (r - delta) + R - D = phi - delta.
+    effective_r = r_lat - delta_val
+    if effective_r < 0.0:
+        effective_r = 0.0
 
     # ── Shape B: target sphere ──
     X_tb = body_q[target_body_idx]
@@ -252,9 +255,8 @@ def write_cslc_contacts(
     diff = t_world - q_world
     dist = wp.length(diff)
 
-    # Bug #3 fix: skip non-penetrating contacts.
-    # After lattice deformation, if no overlap remains, mark invalid.
-    pen = (r_lat + target_radius) - dist
+    # Check penetration using effective radius
+    pen = (effective_r + target_radius) - dist
     if pen <= 0.0:
         out_shape0[buf_idx] = -1
         return
@@ -262,18 +264,18 @@ def write_cslc_contacts(
     if dist > 1.0e-8:
         normal_ab = diff / dist
     else:
-        # Bug #4 fix: transform outward normal to world frame
         n_body = wp.transform_vector(X_ws, out_n)
         normal_ab = wp.transform_vector(X_wb, n_body)
 
-    # ── Body-frame transforms ──
+    # ── Body-frame contact points and offsets ──
     X_wb_inv = wp.transform_inverse(X_wb)
     X_tb_inv = wp.transform_inverse(X_tb)
 
     p0_body = wp.transform_point(X_wb_inv, q_world)
     p1_body = wp.transform_point(X_tb_inv, t_world)
 
-    offset0_body = wp.transform_vector(X_wb_inv, r_lat * normal_ab)
+    # Offsets use effective_r (matching Newton's convention: offset_mag = margin)
+    offset0_body = wp.transform_vector(X_wb_inv, effective_r * normal_ab)
     offset1_body = wp.transform_vector(X_tb_inv, -target_radius * normal_ab)
 
     # ── Write ──
@@ -284,7 +286,7 @@ def write_cslc_contacts(
     out_offset0[buf_idx] = offset0_body
     out_offset1[buf_idx] = offset1_body
     out_normal[buf_idx] = normal_ab
-    out_margin0[buf_idx] = r_lat
+    out_margin0[buf_idx] = effective_r     # was: r_lat
     out_margin1[buf_idx] = target_radius
     out_tids[buf_idx] = 0
 
