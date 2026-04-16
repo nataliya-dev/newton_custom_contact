@@ -111,9 +111,9 @@ class SceneParams:
     drive_kd: float = 1.0e3
 
     # CSLC tuning
-    cslc_spacing: float = 0.005
-    cslc_ka: float = 5000.0
-    cslc_kl: float = 500.0
+    cslc_spacing: float = 0.01
+    cslc_ka: float = 2000.0
+    cslc_kl: float = 100.0
     cslc_dc: float = 2.0
     cslc_n_iter: int = 40
     cslc_alpha: float = 0.6

@@ -77,6 +77,7 @@ class CSLCHandler:
         alpha: float,
         surface_slot_map: wp.array,
         n_surface_contacts: int,
+        n_pair_blocks: int,
         device: Any = None,
     ):
         self.cslc_data = cslc_data
@@ -84,8 +85,16 @@ class CSLCHandler:
         self.n_iter = n_iter
         self.alpha = alpha
         self.surface_slot_map = surface_slot_map
+
+        self.n_pair_blocks = n_pair_blocks
+
+
         self.n_surface_contacts = n_surface_contacts
         self.device = device or wp.get_device()
+
+        self.slot_to_tid = np.full(0, -1, dtype=np.int32)
+        self.debug_reason = wp.zeros(n_surface_contacts, dtype=wp.int32, device=self.device)
+
 
         n = cslc_data.n_spheres
         self.raw_penetration = wp.zeros(n, dtype=wp.float32, device=self.device)
@@ -93,10 +102,12 @@ class CSLCHandler:
         self._jacobi_a = wp.zeros(n, dtype=wp.float32, device=self.device)
         self._jacobi_b = wp.zeros(n, dtype=wp.float32, device=self.device)
 
+
     @property
     def contact_count(self) -> int:
-        """Number of pre-allocated contact slots for CSLC."""
-        return self.n_surface_contacts
+        return self.n_surface_contacts * self.n_pair_blocks
+
+
 
     @classmethod
     def _from_model(cls, model: Model) -> CSLCHandler | None:
@@ -116,6 +127,7 @@ class CSLCHandler:
         # Find shape pairs involving CSLC shapes
         cslc_shape_set = set(cslc_shape_indices)
         shape_pairs: list[CSLCShapePair] = []
+
 
         if model.shape_contact_pairs is not None:
             all_pairs = model.shape_contact_pairs.numpy()
@@ -172,7 +184,7 @@ class CSLCHandler:
 
         # Calibrate kc from bulk ke
         ke_bulk = float(shape_ke[first_cslc])
-        kc = calibrate_kc(ke_bulk, pads, ka=ka)
+        kc = calibrate_kc(ke_bulk, pads, ka=ka, contact_fraction=0.1)
 
 
 
@@ -212,7 +224,23 @@ class CSLCHandler:
                 slot += 1
 
 
+        slot_to_tid = np.full(slot, -1, dtype=np.int32)
+        for tid in range(cslc_data.n_spheres):
+            s = surface_slot_map[tid]
+            if s >= 0:
+                slot_to_tid[s] = tid
 
+
+
+        supported_pairs = [p for p in shape_pairs if p.other_geo_type == _GEOTYPE_SPHERE]
+        n_pair_blocks = len(supported_pairs)
+
+
+        supported_pairs = [p for p in shape_pairs if p.other_geo_type == _GEOTYPE_SPHERE]
+        n_pair_blocks = len(supported_pairs)
+
+        if n_pair_blocks == 0:
+            return None
 
         # Read solver params from model (Bug 6 fix)
         if model.shape_cslc_n_iter is not None:
@@ -224,15 +252,31 @@ class CSLCHandler:
         else:
             alpha = 0.3
 
-        return cls(
+
+
+
+        handler = cls(
             cslc_data=cslc_data,
             shape_pairs=shape_pairs,
             n_iter=n_iter,
             alpha=alpha,
             surface_slot_map=wp.array(surface_slot_map, dtype=wp.int32, device=model.device),
             n_surface_contacts=slot,
+             n_pair_blocks=n_pair_blocks,
             device=model.device,
         )
+        handler.slot_to_tid = slot_to_tid
+        return handler
+
+        # return cls(
+        #     cslc_data=cslc_data,
+        #     shape_pairs=shape_pairs,
+        #     n_iter=n_iter,
+        #     alpha=alpha,
+        #     surface_slot_map=wp.array(surface_slot_map, dtype=wp.int32, device=model.device),
+        #     n_surface_contacts=slot,
+        #     device=model.device,
+        # )
 
     def launch(
         self,
@@ -251,15 +295,21 @@ class CSLCHandler:
             contacts: Contacts buffer to write to.
             contact_offset: Starting index in contacts buffer for CSLC slots.
         """
+
+        sphere_pair_idx = 0
         for pair in self.shape_pairs:
             if pair.other_geo_type == _GEOTYPE_SPHERE:
-                self._launch_vs_sphere(model, state, contacts, contact_offset, pair)
+                pair_contact_offset = contact_offset + sphere_pair_idx * self.n_surface_contacts
+                self._launch_vs_sphere(model, state, contacts, pair_contact_offset, pair)
+                sphere_pair_idx += 1
             else:
                 warnings.warn(
                     f"CSLC vs geometry type {pair.other_geo_type} not yet implemented. "
                     f"Only CSLC vs SPHERE is supported.",
-                    RuntimeWarning, stacklevel=2,
+                    RuntimeWarning,
+                    stacklevel=2,
                 )
+
 
     def _launch_vs_sphere(
             self,
@@ -290,6 +340,7 @@ class CSLCHandler:
                     data.positions, data.radii, data.sphere_delta,
                     data.sphere_shape, data.is_surface, data.outward_normals,
                     state.body_q, model.shape_body, model.shape_transform,
+                    pair.cslc_shape,
                     target_body, pair.other_shape, target_local_pos, target_radius,
                 ],
                 outputs=[self.raw_penetration, self.contact_normal_scratch],
@@ -317,9 +368,6 @@ class CSLCHandler:
             wp.copy(data.sphere_delta, src)
 
             # ── Kernel 3: Write contacts ──
-            # Bug 1 fix: contact_normal_scratch REMOVED from inputs
-            #            (kernel recomputes the normal internally)
-            # Issue 11 fix: material property arrays added at the end
             wp.launch(
                 kernel=write_cslc_contacts,
                 dim=data.n_spheres,
@@ -327,8 +375,10 @@ class CSLCHandler:
                     data.positions, data.radii, src,
                     data.sphere_shape, data.is_surface, data.outward_normals,
                     state.body_q, model.shape_body, model.shape_transform,
+                    pair.cslc_shape,
                     target_body, pair.other_shape, target_local_pos, target_radius,
                     contact_offset, self.surface_slot_map,
+                    self.raw_penetration,
                     # Contacts buffer arrays
                     contacts.rigid_contact_shape0,
                     contacts.rigid_contact_shape1,
@@ -347,6 +397,30 @@ class CSLCHandler:
                     contacts.rigid_contact_stiffness,
                     contacts.rigid_contact_damping,
                     contacts.rigid_contact_friction,
+                    self.debug_reason
                 ],
                 device=self.device,
+
+            )
+
+            shape0_np = contacts.rigid_contact_shape0.numpy()
+            reason_np = self.debug_reason.numpy()
+
+            start = contact_offset
+            end = contact_offset + self.n_surface_contacts
+
+            valid_mask = shape0_np[start:end] != -1
+            active_slots = np.nonzero(valid_mask)[0]
+            active_tids = self.slot_to_tid[active_slots]
+
+            base_count = int(np.sum(shape0_np[:contact_offset] != -1))
+            cslc_count = int(valid_mask.sum())
+
+            vals, counts = np.unique(reason_np, return_counts=True)
+            reason_summary = {int(v): int(c) for v, c in zip(vals, counts)}
+
+            print(
+                f"CSLC_SUMMARY pair=({pair.cslc_shape},{pair.other_shape}) "
+                f"base={base_count} cslc={cslc_count} "
+                f"tids={active_tids.tolist()} reasons={reason_summary}"
             )
