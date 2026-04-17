@@ -76,7 +76,7 @@ class SceneParams:
     # Sphere
     sphere_radius: float = 0.03
     sphere_density: float = 4421.0
-    sphere_start_z: float = 0.03
+    sphere_start_z: float = 0.05
 
     # Pads (box half-extents)
     pad_hx: float = 0.01
@@ -85,23 +85,57 @@ class SceneParams:
     pad_density: float = 1000.0
 
     # Phase timing
+    #
+    # Geometry at dx=0: pad inner face sits at x = ±(approach_gap/2) = ±50 mm.
+    # Sphere surface at ±sphere_radius = ±30 mm.
+    # So the pad-face-to-sphere-surface gap at APPROACH start = 50 − 30 = 20 mm.
+    #
+    # Target:
+    #   APPROACH end  — pad face at the sphere surface (dx_app = 20 mm, face-pen = 0)
+    #   SQUEEZE  end  — pad face 1 mm inside the sphere  (+1 mm face-pen)
+    #
+    # Why 1 mm: matches the paper's weight-capacity experiment (μ=0.5, pen=1 mm,
+    # 2.5 kg object). At that compression the lattice is in its small-deformation
+    # regime (δ << r_lat) and ke_bulk means what you expect it to mean.
     approach_gap: float = 0.10
-    approach_speed: float = 0.02
+    approach_speed: float = 20e-3 / 1.5   # 13.33 mm/s → travels 20 mm over 1.5 s
     approach_duration: float = 1.5
 
-    squeeze_speed: float = 0.005
+    squeeze_speed: float = 1e-3 / 0.5     # 2 mm/s → travels 1 mm over 0.5 s
     squeeze_duration: float = 0.5
 
-    lift_speed: float = 0.05
+    lift_speed: float = 0.015
     lift_duration: float = 1.5
+
+    # Smooth the target-velocity transition between SQUEEZE and LIFT over
+    # this many seconds.  Without ramping, the target velocity jumps 0 →
+    # lift_speed in a single timestep; the high-gain position PD drive
+    # turns that into an ~impulsive pad velocity, which saturates friction
+    # (μ·Fn) against the stationary sphere and launches it ballistically.
+    # A 250 ms smoothstep puts the transition well above the drive's own
+    # time constant (√(m/ke) ≈ 1 ms) so the pad follows the target faithfully
+    # and the sphere accelerates gradually.
+    lift_ramp_duration: float = 0.25
 
     hold_duration: float = 1.0
 
-    # Material (shared by point + CSLC)
-    # Reduced from 5e4 to prevent CSLC force explosion (190 surface spheres × ke = huge).
-    # Friction budget check: F_n = ke × pen = 5000 × 0.0125 = 62.5N per pad.
-    # F_friction = μ × F_n × 2_pads = 0.5 × 62.5 × 2 = 62.5N >> 4.9N weight. OK.
-    ke: float = 5.0e3
+    # Material (shared by point + CSLC).
+    #
+    # The face-lattice CSLC pad places ALL surface spheres on the contact
+    # face (no edges, corners, or wasted non-contact-face spheres).  For a
+    # 40×100 mm inner face at 10 mm spacing that's 5×11 = 55 spheres — and
+    # when the grasped sphere is pressed in, ~30 of those are simultaneously
+    # in contact (vs ~9 with the old volumetric lattice, where most surface
+    # spheres were on non-contact faces and rejected).
+    #
+    # Result: an order-of-magnitude MORE force per unit ke.  Grip-force
+    # budget at face-pen = 1 mm:
+    #   ke= 1000 → μ·Fn_total ≈ 13 N   (≈ 2.6× weight — target)
+    #   ke= 5000 → μ·Fn_total ≈ 64 N   (13× weight — WILL launch sphere)
+    #   ke=25000 → μ·Fn_total ≈ 320 N  (explodes)
+    #
+    # So `ke` needs to drop by ~5–10× versus the volumetric-lattice scene.
+    ke: float = 1.0e3     # tuned for face-lattice; was 1e4 for volumetric
     kd: float = 5.0e1
     kf: float = 100.0
     mu: float = 0.5
@@ -240,7 +274,25 @@ def _build_scene(p: SceneParams, pad_cfg):
         pad = b.add_link(
             xform=wp.transform((x0, 0, z0), wp.quat_identity()),
             label=f"{label}_pad")
-        b.add_shape_box(pad, hx=p.pad_hx, hy=p.pad_hy, hz=p.pad_hz, cfg=pad_cfg)
+
+        # Orient the BOX SHAPE so its local +x face points toward the sphere.
+        # CSLC uses the +x face as its 2-D contact lattice (see handler), so
+        # both pads must present that face inward.
+        #   Left pad  (at world -x): body's local +x already points toward
+        #     the sphere at the origin — no rotation.
+        #   Right pad (at world +x): rotate the SHAPE 180° around z so that
+        #     its local +x maps to world -x (= inward).
+        # We rotate the shape rather than the body so the prismatic joints
+        # (which reference the body frame) are not affected.
+        if label == "right":
+            box_xform = wp.transform(
+                wp.vec3(0.0, 0.0, 0.0),
+                wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), math.pi),
+            )
+        else:
+            box_xform = wp.transform_identity()
+        b.add_shape_box(pad, xform=box_xform,
+                        hx=p.pad_hx, hy=p.pad_hy, hz=p.pad_hz, cfg=pad_cfg)
 
         # Prismatic X: world → slider
         j_x = b.add_joint_prismatic(
@@ -318,7 +370,25 @@ RIGHT_PAD = 3
 # ── Pad trajectory ────────────────────────────────────────────────────────
 
 def _pad_state(step, p: SceneParams):
-    """Compute (dx_inward, dz_up) at a given step."""
+    """Compute (dx_inward, dz_up) at a given step.
+
+    The dz profile during LIFT uses a C¹-smooth velocity ramp over the first
+    `lift_ramp_duration` seconds so the pad's commanded velocity eases from 0
+    to `lift_speed` instead of stepping discontinuously.  This prevents the
+    impulsive friction kick that otherwise launches the sphere upward.
+
+    Velocity profile (s = t / ramp):
+        v(t) = lift_speed · smoothstep(s)   for t ≤ ramp
+        v(t) = lift_speed                   for t  > ramp
+    where smoothstep(s) = 3s² − 2s³ (C¹ at both endpoints).
+
+    Integrating gives position:
+        dz(t) = lift_speed · ramp · (s³ − s⁴/2)         for t ≤ ramp
+        dz(t) = lift_speed · (t − ramp/2)               for t  > ramp
+    The `− ramp/2` is the constant of integration that makes dz continuous
+    at the handoff; intuitively, the ramp's average velocity is lift_speed/2,
+    so after `ramp` seconds you are `ramp/2` behind the no-ramp trajectory.
+    """
     phase, s = p.phase_of(step)
     t = s * p.dt
 
@@ -330,10 +400,19 @@ def _pad_state(step, p: SceneParams):
         return dx_app + p.squeeze_speed * t, 0.0
 
     dx_total = dx_app + p.squeeze_speed * p.squeeze_duration
-    if phase == "LIFT":
-        return dx_total, p.lift_speed * t
 
-    return dx_total, p.lift_speed * p.lift_duration
+    def _lift_dz(t_lift: float) -> float:
+        ramp = p.lift_ramp_duration
+        if ramp <= 0.0 or t_lift >= ramp:
+            return p.lift_speed * (t_lift - 0.5 * ramp)
+        sn = t_lift / ramp
+        return p.lift_speed * ramp * (sn ** 3 - 0.5 * sn ** 4)
+
+    if phase == "LIFT":
+        return dx_total, _lift_dz(t)
+
+    # HOLD: freeze at the position reached at the end of LIFT.
+    return dx_total, _lift_dz(p.lift_duration)
 
 
 def set_pad_targets(control, step, p: SceneParams, dof_map, debug=False):
@@ -351,8 +430,11 @@ def set_pad_targets(control, step, p: SceneParams, dof_map, debug=False):
     if debug:
         phase, _ = p.phase_of(step)
         gap = p.approach_gap - 2 * dx
-        _log(f"[{phase:8s}] step={step:5d}  dx={dx*1e3:.2f}mm  dz={dz*1e3:.2f}mm  "
-             f"gap={gap*1e3:.1f}mm  sphere_d={p.sphere_radius*2e3:.0f}mm")
+        # face_pen > 0 means pad face is INSIDE the sphere surface (squeezing).
+        # face_pen < 0 means pad hasn't reached the sphere yet (approaching).
+        face_pen = p.sphere_radius * 2 - gap       # sphere_diameter − gap
+        _log(f"[{phase:8s}] step={step:5d}  dx={dx*1e3:+6.2f}mm  dz={dz*1e3:+5.2f}mm  "
+             f"gap={gap*1e3:+6.1f}mm  face_pen={face_pen*1e3:+5.2f}mm")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -548,14 +630,24 @@ class Example:
         self.current_contacts = count_active_contacts(self.contacts)
         self.current_phase, _ = self.p.phase_of(self.sim_step)
 
-        if self.sim_step % (self.sim_substeps * 60) < self.sim_substeps:
+        # Print every ~100 ms.  The old `* 60` cadence was once per second,
+        # which is too coarse to see the SQUEEZE→LIFT transition (where
+        # the sphere either tracks the pad or launches past it).
+        # `sim_substeps * 6` with 60 fps / 8 substeps ≈ 100 ms between prints.
+        if self.sim_step % (self.sim_substeps * 6) < self.sim_substeps:
             phase, _ = self.p.phase_of(self.sim_step)
             cslc = read_cslc_state(self.model) if self.contact_model == "cslc" else None
             cslc_str = f"  cslc={cslc['n_active']}/{cslc['n_surface']}" if cslc else ""
+            # Δ = sphere_z − pad_z tells us whether the sphere is following
+            # the pad (small constant Δ) or being launched (growing Δ).
+            sphere_z = float(q[SPHERE_BODY, 2])
+            pad_z    = float(q[LEFT_PAD, 2])
+            delta_z  = sphere_z - pad_z
             _log(f"[{phase:8s}] step={self.sim_step:5d}  "
-                 f"sphere_z={q[SPHERE_BODY,2]:+.5f}  "
-                 f"vz={qd[SPHERE_BODY,5]:+.5f}  "
-                 f"pad_z={q[LEFT_PAD,2]:.4f}  "
+                 f"sphere_z={sphere_z:+.5f}  "
+                 f"pad_z={pad_z:+.5f}  "
+                 f"Δz={delta_z*1e3:+6.2f}mm  "
+                 f"vz={qd[SPHERE_BODY,5]:+.4f}m/s  "
                  f"contacts={self.current_contacts}{cslc_str}")
 
     def render(self):
