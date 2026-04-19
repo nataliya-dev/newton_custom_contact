@@ -202,6 +202,17 @@ def write_cslc_contacts(
     out_damping: wp.array(dtype=wp.float32),
     out_friction: wp.array(dtype=wp.float32),
     debug_reason: wp.array(dtype=wp.int32),
+    # ── Diagnostic outputs (physics-neutral; read back by the handler) ──
+    # Indexed by (diag_offset + slot) where diag_offset =
+    # pair_idx * n_surface_contacts.  This lays each pair's diagnostics
+    # out in its own block (same layout as the contacts buffer), so
+    # pair_1's launch can't overwrite pair_0's diagnostic writes.
+    diag_offset: int,
+    dbg_pen_scale: wp.array(dtype=wp.float32),
+    dbg_solver_pen: wp.array(dtype=wp.float32),
+    dbg_effective_r: wp.array(dtype=wp.float32),
+    dbg_d_proj: wp.array(dtype=wp.float32),
+    dbg_radial: wp.array(dtype=wp.float32),
 ):
     """Stage 1: write one rigid contact per lattice sphere in real 3-D overlap.
 
@@ -235,11 +246,21 @@ def write_cslc_contacts(
     if slot < 0:
         return
     buf_idx = contact_offset + slot
+    # dslot: where THIS pair's diagnostic for THIS slot lives in the
+    # handler's per-pair-per-slot diagnostic arrays.  Mirrors the layout
+    # of the contacts buffer: pair_idx * n_surface_contacts + slot.
+    dslot = diag_offset + slot
 
     # Pair filter.
     if sphere_shape[tid] != active_cslc_shape_idx:
         out_shape0[buf_idx] = -1
         debug_reason[slot]  = 4
+        # Sentinel: negative pen_scale signals "no contact this slot".
+        dbg_pen_scale[dslot]   = -1.0
+        dbg_solver_pen[dslot]  = 0.0
+        dbg_effective_r[dslot] = 0.0
+        dbg_d_proj[dslot]      = 0.0
+        dbg_radial[dslot]      = 0.0
         return
 
     # Shape A: lattice sphere.
@@ -276,6 +297,11 @@ def write_cslc_contacts(
     if d_proj <= 0.0:
         out_shape0[buf_idx] = -1
         debug_reason[slot]  = 3
+        dbg_pen_scale[dslot]   = -1.0
+        dbg_solver_pen[dslot]  = 0.0
+        dbg_effective_r[dslot] = effective_r
+        dbg_d_proj[dslot]      = d_proj
+        dbg_radial[dslot]      = 0.0
         return
 
     # True 3-D overlap.
@@ -283,6 +309,11 @@ def write_cslc_contacts(
     if pen_3d <= 0.0:
         out_shape0[buf_idx] = -1
         debug_reason[slot]  = 1
+        dbg_pen_scale[dslot]   = -1.0
+        dbg_solver_pen[dslot]  = 0.0
+        dbg_effective_r[dslot] = effective_r
+        dbg_d_proj[dslot]      = d_proj
+        dbg_radial[dslot]      = 0.0
         return
 
     # Solver-side projected penetration.  Already > 0 because dist >= d_proj
@@ -305,13 +336,14 @@ def write_cslc_contacts(
         radial_sq = 0.0
     radial = wp.sqrt(radial_sq)
 
-    # OPTIONAL: uncomment to trace a few tids.  Warning: noisy.
-    # if tid == 82 or tid == 137 or tid == 192:
-    #     wp.printf(
-    #         "CSLC_WRITE tid=%d pen3d=%.3fmm solver_pen=%.3fmm scale=%.3f "
-    #         "dproj=%.3fmm radial=%.3fmm delta=%.3fmm\n",
-    #         tid, pen_3d*1e3, solver_pen*1e3, pen_scale,
-    #         d_proj*1e3, radial*1e3, delta_val*1e3)
+    # ── Record per-contact diagnostics (physics-neutral) ──
+    # These arrays are read back by the handler for telemetry.  They're
+    # written only on the success path; cull paths wrote sentinels above.
+    dbg_pen_scale[dslot]   = pen_scale
+    dbg_solver_pen[dslot]  = solver_pen
+    dbg_effective_r[dslot] = effective_r
+    dbg_d_proj[dslot]      = d_proj
+    dbg_radial[dslot]      = radial
 
     out_shape0[buf_idx]    = s_idx
     out_shape1[buf_idx]    = target_shape_idx

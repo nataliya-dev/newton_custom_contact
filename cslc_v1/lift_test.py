@@ -156,6 +156,27 @@ class SceneParams:
     dt: float = 1.0 / 500.0
     gravity: tuple = (0.0, 0.0, -9.81)
 
+    # ── Diagnostic / decoupling options ────────────────────────────────────
+    # no_ground:     skip add_ground_plane().  Eliminates the ground-contact
+    #                elastic-rebound confounder (previous agent's hypothesis C).
+    # start_gripped: place the sphere in the air with pads already at
+    #                squeeze-end position, touching it.  Skips APPROACH
+    #                and SQUEEZE; test begins at LIFT t=0.
+    # The two together isolate "can friction carry the sphere?" from "is
+    # the launch triggered by ground release?".
+    no_ground: bool = False
+    start_gripped: bool = False
+    # Warm-start the sphere's vz to lift_speed at t=0 in start_gripped mode.
+    # Diagnostic for the friction-overshoot hypothesis: if v_rel=0 at t=0,
+    # regularized Coulomb can't drive slip, and the overshoot should not
+    # appear.  If overshoot still appears with this flag, the hypothesis
+    # is wrong and something else is going on.
+    warm_start_sphere_vz: bool = False
+    # Height at which to spawn the sphere in start_gripped mode.  Chosen so
+    # the sphere sits well above where the ground would be even if no_ground
+    # is False, so ground contact never becomes relevant during the test.
+    gripped_spawn_z: float = 0.20
+
     @property
     def sphere_mass(self):
         return self.sphere_density * (4 / 3) * math.pi * self.sphere_radius ** 3
@@ -178,14 +199,26 @@ class SceneParams:
 
     @property
     def total_steps(self):
+        # In start_gripped mode APPROACH + SQUEEZE are skipped: the pads
+        # start at their squeeze-end position via joint_q in _build_scene,
+        # and the test begins directly at LIFT t=0.  Including those phases
+        # in total_steps would just hold the gripped configuration stationary
+        # for 2 s before lifting, which is harmless but wastes wall time.
+        if self.start_gripped:
+            return self.lift_steps + self.hold_steps
         return self.approach_steps + self.squeeze_steps + self.lift_steps + self.hold_steps
 
     def phase_of(self, step):
         s = step
-        for name, dur in [("APPROACH", self.approach_steps),
-                          ("SQUEEZE", self.squeeze_steps),
-                          ("LIFT", self.lift_steps),
-                          ("HOLD", self.hold_steps)]:
+        # When start_gripped, virtually fast-forward past APPROACH+SQUEEZE so
+        # _pad_state sees LIFT from step 0.  The integer shift is exactly the
+        # number of (virtual) steps we skipped; _pad_state's t = s * dt then
+        # starts from t=0 within the LIFT phase, which is what we want.
+        phases = [("LIFT", self.lift_steps), ("HOLD", self.hold_steps)]
+        if not self.start_gripped:
+            phases = [("APPROACH", self.approach_steps),
+                      ("SQUEEZE", self.squeeze_steps)] + phases
+        for name, dur in phases:
             if s < dur:
                 return name, s
             s -= dur
@@ -248,13 +281,30 @@ def _sphere_cfg(p: SceneParams):
 
 
 def _build_scene(p: SceneParams, pad_cfg):
-    """Build ground + 2 articulated pads + 1 free sphere."""
+    """Build (optional) ground + 2 articulated pads + 1 free sphere.
+
+    In start_gripped mode the sphere and pads both spawn at gripped_spawn_z,
+    well above where the ground would be.  The prismatic-X joints are zeroed
+    at the pad's world position, but the pads START at their gripped offset
+    from each pad's joint origin — this is handled by positioning the joint
+    parent_xform at the ungripped zero and setting the initial joint_q in
+    set_initial_joint_q below.
+    """
     b = newton.ModelBuilder()
-    ground_shape = b.add_ground_plane()
+
+    # Ground: optional.  Removing it eliminates the ground-release transient
+    # as a possible launch trigger for CSLC diagnosis.
+    if not p.no_ground:
+        ground_shape = b.add_ground_plane()
+    else:
+        ground_shape = None
 
     lx0 = -(p.approach_gap / 2 + p.pad_hx)
     rx0 = +(p.approach_gap / 2 + p.pad_hx)
-    z0 = p.sphere_start_z
+    # In start_gripped mode we lift everything well above z=0 so any
+    # ground that WOULD exist (if add_ground_plane were called) stays out
+    # of reach for the duration of the test.
+    z0 = p.gripped_spawn_z if p.start_gripped else p.sphere_start_z
 
     # Ghost config for intermediate slider bodies (no collision)
     ghost_cfg = newton.ModelBuilder.ShapeConfig(
@@ -317,7 +367,8 @@ def _build_scene(p: SceneParams, pad_cfg):
         dof_map[f"{label}_z"] = b.joint_qd_start[j_z]
 
         # Filter: ghost slider vs ground (avoid spurious contacts)
-        b.add_shape_collision_filter_pair(slider_shape, ground_shape)
+        if ground_shape is not None:
+            b.add_shape_collision_filter_pair(slider_shape, ground_shape)
 
     # Set joint drives for pad joints (stiff PD position tracking)
     for ji in pad_joints:
@@ -335,12 +386,57 @@ def _build_scene(p: SceneParams, pad_cfg):
     j_free = b.add_joint_free(sphere, label="sphere_free")
     b.add_articulation([j_free], label="sphere")
 
+    # Request the per-contact `force` extended attribute so we can read
+    # actual solver-applied forces (for diagnostics) in Example.step.
+    # Without this the contacts.force array is not allocated.
+    b.request_contact_attributes("force")
+
+    # ── start_gripped mode: pre-position the pads at their squeeze-end X ──
+    # In normal mode the pads start at dx=0 (outside the sphere) and the
+    # APPROACH phase drives them inward.  In start_gripped mode we jump
+    # the pads' prismatic-X joint_q directly to the gripped position so
+    # there is no approach-phase transient, no ground contact, nothing
+    # but the LIFT dynamics under test.
+    if p.start_gripped:
+        dx_gripped = (
+            p.approach_speed * p.approach_duration
+            + p.squeeze_speed * p.squeeze_duration
+        )
+        # joint_q is indexed by DOF.  left_x → +dx_gripped (pad moves +x,
+        # i.e. inward from lx0); right_x → -dx_gripped (inward from rx0).
+        b.joint_q[dof_map["left_x"]]  = +dx_gripped
+        b.joint_q[dof_map["right_x"]] = -dx_gripped
+
+        # ── Warm-start sphere velocity to match LIFT speed ──
+        # Without this, at t=0 the sphere has vz=0 while the pads ramp up
+        # to vz=lift_speed over lift_ramp_duration.  That velocity mismatch
+        # drives regularized Coulomb friction into sustained slip, producing
+        # a ~25mm upward overshoot (classical regularized-friction artifact,
+        # which cannot model true static friction).
+        #
+        # If warm_start_sphere_vz is True, initialize the sphere's free-joint
+        # vz to lift_speed so there is NO relative velocity at t=0, no slip,
+        # and therefore no friction-driven overshoot.  This is a diagnostic
+        # intervention to confirm the overshoot origin, not a production fix
+        # — in real tasks we can't warm-start grasped objects.
+        if p.warm_start_sphere_vz:
+            # Free joint qd is [wx, wy, wz, vx, vy, vz] (Featherstone order).
+            # Sphere body is the last link added; its free joint DOFs are the
+            # last 6 entries of joint_qd.  We only set vz (index 5 of the 6).
+            # Alternative explicit lookup: find the free-joint DOF via joints
+            # metadata, but for this fixed scene layout the last-6 works.
+            sphere_vz_idx = len(b.joint_qd) - 1  # last qd entry == sphere vz
+            b.joint_qd[sphere_vz_idx] = p.lift_speed
+
     m = b.finalize()
     m.set_gravity(p.gravity)
 
     _log(f"DOF map: {dof_map}")
     _log(f"bodies={m.body_count}  shapes={m.shape_count}  "
          f"joints={m.joint_count}  DOFs={m.joint_dof_count}")
+    if p.start_gripped:
+        _log(f"start_gripped=True  dx_initial={dx_gripped*1e3:.2f}mm  "
+             f"spawn_z={z0:.3f}m  no_ground={p.no_ground}")
 
     return m, dof_map
 
@@ -577,7 +673,12 @@ class Example:
         self.contact_model = getattr(args, "contact_model", "cslc")
         self.solver_name = getattr(args, "solver", "mujoco")
 
-        self.p = SceneParams(dt=self.sim_dt)
+        self.p = SceneParams(
+            dt=self.sim_dt,
+            no_ground=getattr(args, "no_ground", False),
+            start_gripped=getattr(args, "start_gripped", False),
+            warm_start_sphere_vz=getattr(args, "warm_start_sphere_vz", False),
+        )
         self.p.dump()
 
         self.model, self.dof_map = BUILDERS[self.contact_model](self.p)
@@ -594,6 +695,21 @@ class Example:
         self.current_z = self.p.sphere_start_z
         self.current_contacts = 0
         self.current_phase = "APPROACH"
+
+        # ── Telemetry state ──
+        # To compute acceleration via double finite difference we need TWO
+        # pieces of history:
+        #   _prev_sphere_z   — sphere_z at the previous telemetry tick
+        #   _prev_vz_sphere  — vz_fd computed at the previous telemetry tick
+        # Then a_z = (vz_fd_now - vz_fd_prev) / dt_print.
+        # Same for the pad so we can sanity-check that the pad is tracking
+        # its kinematic target.
+        # body_qd[SPHERE, 5] was observed to stay at 0 under MuJoCo; FD is
+        # the only trustworthy signal.
+        self._prev_sphere_z = None
+        self._prev_pad_z    = None
+        self._prev_vz_sphere = None
+        self._prev_vz_pad    = None
 
         self.viewer.set_model(self.model)
         self.viewer.set_camera(
@@ -638,17 +754,116 @@ class Example:
             phase, _ = self.p.phase_of(self.sim_step)
             cslc = read_cslc_state(self.model) if self.contact_model == "cslc" else None
             cslc_str = f"  cslc={cslc['n_active']}/{cslc['n_surface']}" if cslc else ""
-            # Δ = sphere_z − pad_z tells us whether the sphere is following
-            # the pad (small constant Δ) or being launched (growing Δ).
             sphere_z = float(q[SPHERE_BODY, 2])
             pad_z    = float(q[LEFT_PAD, 2])
             delta_z  = sphere_z - pad_z
+
+            # ── FD velocity and acceleration ──
+            # dt between consecutive telemetry prints (not per sim-step):
+            #   sim_substeps substeps/frame × 6 frames between prints × sim_dt
+            # Equivalently: 6 * frame_dt.  This is the denominator for ALL
+            # finite-difference derivatives below.
+            dt_print = 6.0 * self.frame_dt
+
+            # Single FD: vz = Δz/Δt.  Reported as vz_fd; compared against
+            # the stored body_qd[5] (vz_qd) which we suspect is always 0.
+            vz_qd = float(qd[SPHERE_BODY, 5])
+            if self._prev_sphere_z is None:
+                vz_sphere = 0.0
+                vz_pad    = 0.0
+            else:
+                vz_sphere = (sphere_z - self._prev_sphere_z) / dt_print
+                vz_pad    = (pad_z    - self._prev_pad_z)    / dt_print
+
+            # Double FD: a = Δv/Δt.  Needs two previous vz samples to
+            # converge; first two prints will show a_z = 0 (no data yet).
+            if self._prev_vz_sphere is None:
+                az_sphere = 0.0
+                az_pad    = 0.0
+            else:
+                az_sphere = (vz_sphere - self._prev_vz_sphere) / dt_print
+                az_pad    = (vz_pad    - self._prev_vz_pad)    / dt_print
+
+            self._prev_sphere_z  = sphere_z
+            self._prev_pad_z     = pad_z
+            self._prev_vz_sphere = vz_sphere
+            self._prev_vz_pad    = vz_pad
+
+            # ── Inferred vertical contact force on the sphere ──
+            # Newton's second law:  m*a_z = Σ F_z = F_contact_z + F_gravity_z
+            # so F_contact_z = m*a_z - m*g_z = m*(a_z + g_mag) because
+            # g_z = -g_mag (gravity points down).  If the sphere is sitting
+            # stationary under gravity in a perfect grip, a_z=0 and this
+            # equals m*g = weight (contacts support the weight).  If the
+            # sphere is being launched upward, F_contact_z >> weight.
+            g_mag = abs(self.p.gravity[2])
+            m_sphere = self.p.sphere_mass
+            F_contact_z_sphere = m_sphere * (az_sphere + g_mag)
+            # For context, print the theoretical static balance force:
+            weight_N = m_sphere * g_mag
+
+            # ── CSLC-specific: aggregate kc and pen_scale distribution ──
+            # If our calibrated kc ended up scaled by MuJoCo's impedance
+            # model, we can see it here: mean(out_stiffness) should equal
+            # data.kc * mean(pen_scale).  Any discrepancy means MuJoCo is
+            # ignoring / transforming our value.
+            #
+            # Buffer layout (n_pair_blocks × n_surface_contacts):
+            #   pair 0 writes real contacts at its own block's valid slots,
+            #   pair 1 at its own block's valid slots.  The diag arrays were
+            #   resized this iteration to match the contacts-buffer layout
+            #   so they no longer race.  Total length = handler.contact_count.
+            cslc_diag_str = ""
+            if self.contact_model == "cslc":
+                handler = self.model._collision_pipeline.cslc_handler
+                if handler is not None:
+                    pen_scale_np  = handler.dbg_pen_scale.numpy()
+                    solver_pen_np = handler.dbg_solver_pen.numpy()
+                    radial_np     = handler.dbg_radial.numpy()
+                    # Active slots have pen_scale > 0 (sentinel is -1.0 from
+                    # kernel cull paths).  Now that per-pair blocks are used,
+                    # this mask picks up BOTH pads' real contacts.
+                    active = pen_scale_np > 0.0
+                    if active.any():
+                        off = self.model._collision_pipeline.cslc_contact_offset
+                        # Read the FULL CSLC slot range (all pair blocks),
+                        # not just the first pair's block.  handler.contact_count
+                        # = n_surface_contacts × n_pair_blocks = total slots.
+                        N_total = handler.contact_count
+                        kstiff = self.contacts.rigid_contact_stiffness.numpy()[off:off+N_total]
+                        # Sanity: sizes must match before masking.
+                        if len(kstiff) == len(pen_scale_np):
+                            k_active = kstiff[active]
+                            # Count active contacts on each pad separately
+                            # (first block = pair 0, second block = pair 1).
+                            N_per = handler.n_surface_contacts
+                            n_active_p0 = int(active[:N_per].sum())
+                            n_active_p1 = int(active[N_per:].sum())
+                            ps_active = pen_scale_np[active]
+                            sp_active = solver_pen_np[active]
+                            r_active  = radial_np[active]
+                            cslc_diag_str = (
+                                f"  [n_active={n_active_p0}+{n_active_p1} "
+                                f"k_mean={k_active.mean():7.1f} "
+                                f"k_min={k_active.min():6.1f} "
+                                f"k_max={k_active.max():6.1f} "
+                                f"ps_mean={ps_active.mean():.3f} "
+                                f"solver_pen_mean={sp_active.mean()*1e3:.2f}mm "
+                                f"radial_max={r_active.max()*1e3:.2f}mm]"
+                            )
+                        else:
+                            cslc_diag_str = (
+                                f"  [DIAG SIZE MISMATCH "
+                                f"kstiff={len(kstiff)} pen_scale={len(pen_scale_np)}]"
+                            )
+
             _log(f"[{phase:8s}] step={self.sim_step:5d}  "
-                 f"sphere_z={sphere_z:+.5f}  "
-                 f"pad_z={pad_z:+.5f}  "
-                 f"Δz={delta_z*1e3:+6.2f}mm  "
-                 f"vz={qd[SPHERE_BODY,5]:+.4f}m/s  "
-                 f"contacts={self.current_contacts}{cslc_str}")
+                 f"sz={sphere_z:+.4f} pz={pad_z:+.4f} Δz={delta_z*1e3:+6.2f}mm  "
+                 f"vz_s={vz_sphere:+.4f} vz_p={vz_pad:+.4f} "
+                 f"az_s={az_sphere:+6.2f}m/s²  "
+                 f"F_c={F_contact_z_sphere:+6.2f}N "
+                 f"(W={weight_N:.2f}N)  "
+                 f"n={self.current_contacts}{cslc_str}{cslc_diag_str}")
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
@@ -676,6 +891,23 @@ class Example:
                             choices=["mujoco", "semi"])
         parser.add_argument("--mode", type=str, default="viewer",
                             choices=["viewer", "headless"])
+        # Decoupling flags for diagnosing the LIFT launch.
+        #   --no-ground      : drop the ground plane entirely.  Eliminates
+        #                      the elastic-rebound hypothesis (ground stores
+        #                      PE during squeeze, releases it at liftoff).
+        #   --start-gripped  : skip APPROACH and SQUEEZE; start at the
+        #                      squeeze-end config with pads already in grip
+        #                      and sphere suspended in air.  Together with
+        #                      --no-ground this isolates pure LIFT dynamics
+        #                      from any ground-contact transient.
+        parser.add_argument("--no-ground", action="store_true",
+                            help="Skip add_ground_plane(); remove ground confounder.")
+        parser.add_argument("--start-gripped", action="store_true",
+                            help="Pads start at squeeze-end dx, skip APPROACH+SQUEEZE.")
+        parser.add_argument("--warm-start-sphere-vz", action="store_true",
+                            help="Initialize sphere vz = lift_speed at t=0 (eliminates "
+                                 "v_rel → tests whether friction overshoot is the "
+                                 "overshoot mechanism).")
         return parser
 
 
@@ -694,7 +926,14 @@ def main():
     else:
         args = parser.parse_args()
         sn = args.solver if HAS_MUJOCO or args.solver != "mujoco" else "semi"
-        test_headless(SceneParams(), sn)
+        test_headless(
+            SceneParams(
+                no_ground=getattr(args, "no_ground", False),
+                start_gripped=getattr(args, "start_gripped", False),
+                warm_start_sphere_vz=getattr(args, "warm_start_sphere_vz", False),
+            ),
+            sn,
+        )
 
 
 if __name__ == "__main__":

@@ -92,6 +92,24 @@ class CSLCHandler:
         self.slot_to_tid = np.full(0, -1, dtype=np.int32)
         self.debug_reason = wp.zeros(n_surface_contacts, dtype=wp.int32, device=self.device)
 
+        # ── Per-contact diagnostic arrays (physics-neutral) ──
+        # Laid out as n_pair_blocks × n_surface_contacts, indexed by the
+        # global offset into the CSLC contact buffer (i.e. pair_idx *
+        # n_surface_contacts + slot).  This MIRRORS the contacts buffer
+        # layout so the CPU reader can index them the same way as
+        # rigid_contact_stiffness[cslc_offset:cslc_offset+n_cslc].
+        #
+        # Previous single-n_surface_contacts sizing had a race: pair 1's
+        # launch would overwrite pair 0's diagnostic writes at the same
+        # slot_map indices (since slot_map is defined globally across
+        # pads).  Per-pair blocks eliminate that race.
+        total_slots = n_surface_contacts * max(n_pair_blocks, 1)
+        self.dbg_pen_scale   = wp.full(total_slots, -1.0, dtype=wp.float32, device=self.device)
+        self.dbg_solver_pen  = wp.zeros(total_slots, dtype=wp.float32, device=self.device)
+        self.dbg_effective_r = wp.zeros(total_slots, dtype=wp.float32, device=self.device)
+        self.dbg_d_proj      = wp.zeros(total_slots, dtype=wp.float32, device=self.device)
+        self.dbg_radial      = wp.zeros(total_slots, dtype=wp.float32, device=self.device)
+
 
         n = cslc_data.n_spheres
         # One raw_penetration buffer per sphere pair.  Kernel 1 zeros all
@@ -456,7 +474,14 @@ class CSLCHandler:
                     contacts.rigid_contact_stiffness,
                     contacts.rigid_contact_damping,
                     contacts.rigid_contact_friction,
-                    self.debug_reason
+                    self.debug_reason,
+                    # Diagnostic outputs (added this iteration)
+                    pair_idx * self.n_surface_contacts,  # diag_offset
+                    self.dbg_pen_scale,
+                    self.dbg_solver_pen,
+                    self.dbg_effective_r,
+                    self.dbg_d_proj,
+                    self.dbg_radial,
                 ],
                 device=self.device,
 

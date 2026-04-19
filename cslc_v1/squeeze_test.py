@@ -282,15 +282,37 @@ def _sphere_cfg(p: SceneParams, **kw) -> newton.ModelBuilder.ShapeConfig:
 
 
 def _add_pads_and_sphere(b, p, pad_cfg, sphere_cfg):
-    """Add two kinematic pads + one dynamic sphere.  Returns body indices."""
+    """Add two kinematic pads + one dynamic sphere.  Returns body indices.
+
+    Both pads must present their local +x face INWARD (toward the sphere)
+    because cslc_handler hardcodes face_axis=0, face_sign=+1 — the CSLC
+    lattice lives on the box's local +x face.  The left pad at world -x
+    naturally satisfies this.  The right pad at world +x needs a 180°
+    rotation around z, applied to the SHAPE (not the body) so kinematic
+    control via body_q still works unchanged.
+
+    Without this rotation the right pad's lattice points away from the
+    sphere, every surface sphere fails the d_proj>0 cull in kernel 1,
+    and — because CSLC pairs are filtered from the standard narrow phase
+    — the right pad produces zero contacts with the sphere.  Result:
+    unilateral grip, sphere slides out of the gripper under gravity.
+    """
     lx = -(p.pad_gap_initial / 2 + p.pad_hx)
     rx =  (p.pad_gap_initial / 2 + p.pad_hx)
+
     left = b.add_body(xform=wp.transform((lx, 0, p.sphere_start_z), wp.quat_identity()),
                        is_kinematic=True, label="left_pad")
     b.add_shape_box(left, hx=p.pad_hx, hy=p.pad_hy, hz=p.pad_hz, cfg=pad_cfg)
+
     right = b.add_body(xform=wp.transform((rx, 0, p.sphere_start_z), wp.quat_identity()),
                         is_kinematic=True, label="right_pad")
-    b.add_shape_box(right, hx=p.pad_hx, hy=p.pad_hy, hz=p.pad_hz, cfg=pad_cfg)
+    right_box_xform = wp.transform(
+        wp.vec3(0.0, 0.0, 0.0),
+        wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), math.pi),
+    )
+    b.add_shape_box(right, xform=right_box_xform,
+                    hx=p.pad_hx, hy=p.pad_hy, hz=p.pad_hz, cfg=pad_cfg)
+
     sphere = b.add_body(xform=wp.transform((0, 0, p.sphere_start_z), wp.quat_identity()),
                          label="sphere")
     b.add_shape_sphere(sphere, radius=p.sphere_radius, cfg=sphere_cfg)
