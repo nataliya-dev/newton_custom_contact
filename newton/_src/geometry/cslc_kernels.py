@@ -12,6 +12,38 @@ import warp as wp
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Smooth differentiable surrogates for ReLU and step
+#
+#  Replace hard `if x > 0` ops with smooth analogues so wp.Tape can backprop
+#  through CSLC contact dynamics for MPC and RL workflows.  All four kernel
+#  branches that gate on continuous physical quantities (pen_3d, d_proj,
+#  effective_pen, delta clamps) are smoothed with eps as the transition
+#  width [m].  eps → 0 recovers the original non-smooth behavior; default
+#  eps = 1e-5 m gives essentially-binary forces above 0.1 mm and a smooth
+#  C^1 transition through the threshold.
+#
+#  smooth_relu(x, eps) = 0.5 * (x + sqrt(x² + eps²))
+#      → max(x, 0) as eps → 0
+#      derivative is smooth_step(x, eps), well-defined at x=0
+#
+#  smooth_step(x, eps) = 0.5 * (1 + x / sqrt(x² + eps²))
+#      → 1 if x >> eps, → 0 if x << -eps, smooth sigmoid-like through 0
+#
+#  Both are C^∞ for eps > 0 and have bounded gradients.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@wp.func
+def smooth_relu(x: float, eps: float) -> float:
+    return 0.5 * (x + wp.sqrt(x * x + eps * eps))
+
+
+@wp.func
+def smooth_step(x: float, eps: float) -> float:
+    return 0.5 * (1.0 + x / wp.sqrt(x * x + eps * eps))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Kernel 1: Penetration (lattice sphere vs target sphere)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -34,22 +66,25 @@ def compute_cslc_penetration_sphere(
     target_shape_idx: int,
     target_local_pos: wp.vec3,
     target_radius: float,
+    eps: float,
     raw_penetration: wp.array(dtype=wp.float32),
     contact_normal_out: wp.array(dtype=wp.vec3),
 ):
-    """raw 3-D sphere-sphere overlap per lattice sphere.
+    """raw 3-D sphere-sphere overlap per lattice sphere (differentiable).
 
-    For surface spheres belonging to the active pad:
-        phi = (r_lat + R_target) − ||t_world − q_world||     if d_proj > 0
-        phi = 0                                              otherwise
-    For everything else: phi = 0.
+    Smoothed:
+        phi = smooth_relu(pen_3d, eps) * smooth_step(d_proj, eps)
+    so that wp.Tape can backprop through the contact-active gate.
+    Recovers the hard `if pen_3d > 0 and d_proj > 0: phi = pen_3d` rule as
+    eps → 0.
     """
     tid = wp.tid()
     phi     = 0.0
     n_world = wp.vec3(0.0, 0.0, 0.0)
 
-    # Active-pad filter.  Other pads get phi=0 so the Jacobi solve sees
-    # no contact force for them during this pair's launches.
+    # Active-pad filter.  Discrete index branch — not differentiable, but
+    # the parameter being indexed (sphere_shape) is integer-valued and
+    # never a learning target.
     if sphere_shape[tid] != active_cslc_shape_idx:
         raw_penetration[tid] = 0.0
         return
@@ -79,14 +114,56 @@ def compute_cslc_penetration_sphere(
 
         pen_3d = (r_lat + target_radius) - dist
 
-        # Only accept the contact if (a) there's real 3-D overlap AND
-        # (b) the target is on the outward side of the face.  No radial gate.
-        if pen_3d > 0.0 and d_proj > 0.0:
-            phi = pen_3d
+        # Smooth contact-active gate:
+        #   phi ≈ pen_3d when pen_3d > 0 AND d_proj > 0
+        #   phi ≈ 0 otherwise
+        # Continuous and C^∞ for eps > 0.
+        phi = smooth_relu(pen_3d, eps) * smooth_step(d_proj, eps)
 
     raw_penetration[tid] = phi
     contact_normal_out[tid] = n_world
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Kernel 2a: Tape-compatible one-shot lattice solve
+#
+#  Closed-form equivalent of the iterative damped Jacobi: solves
+#      (K + kc·I) δ = kc · φ
+#  where K is the CSLC Laplacian (anchor ka + lateral kl).  Uses a
+#  precomputed dense A_inv = (K + kc·I)^-1 (built once in CSLCData.from_pads
+#  when build_A_inv=True) to compute
+#      δ_i = kc · Σ_j  A_inv[i, j] · φ[j]
+#  as a pure matvec.  This is a tape-differentiable drop-in replacement for
+#  jacobi_step + src/dst swap — the Python-side ping-pong buffer alias
+#  breaks wp.Tape backward (see cslc_v1/diff_test.py Phase-2 diagnostic),
+#  but a single matvec is linear and backprops correctly.
+#
+#  Differences vs the iterative Jacobi:
+#    – Ungated: treats all surface spheres as contributing.  For inactive
+#      ones, φ ≈ 0 (smooth_relu(negative, eps) ≈ 0 already applied in
+#      Kernel 1), so their δ stays near zero.  Small residual error from
+#      the smooth-relu's eps/2 floor; decays as eps → 0.
+#    – Lateral kl coupling is preserved (baked into K and therefore A_inv).
+#    – O(n²) time per solve, O(n²) memory for A_inv; for n ≳ 1000 prefer
+#      a sparse Cholesky factorisation plus two triangular solve kernels.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@wp.kernel
+def lattice_solve_equilibrium(
+    A_inv: wp.array2d(dtype=wp.float32),        # (n_spheres, n_spheres)
+    phi: wp.array(dtype=wp.float32),            # (n_spheres,)
+    kc: float,
+    delta_out: wp.array(dtype=wp.float32),      # (n_spheres,)
+):
+    """δ_i = kc · Σ_j  A_inv[i,j] · φ[j]  — tape-compatible CSLC equilibrium."""
+    i = wp.tid()
+    n = A_inv.shape[1]
+    acc = float(0.0)
+    for j in range(n):
+        acc = acc + A_inv[i, j] * phi[j]
+    delta_out[i] = kc * acc
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -108,24 +185,33 @@ def jacobi_step(
     kc: float,
     alpha: float,
     sphere_shape: wp.array(dtype=wp.int32),
-    active_cslc_shape_idx: int
+    active_cslc_shape_idx: int,
+    eps: float,
 ):
 
-    """one damped Jacobi sweep for the ACTIVE pad only.
+    """one damped Jacobi sweep for the ACTIVE pad only (differentiable).
 
     Non-active-pad spheres copy delta through unchanged, preserving the
     warm-start from the previous step.  Without this, each pair launch
     used to drive the OTHER pad's deltas toward zero through the Laplacian
     coupling, destroying the warm-start for the next pair.
 
-    Formulation (unchanged):
-      (ka + kl|N(i)| + kc) · δ_i = kc · φ_i + kl · Σ_j δ_j    (contact)
-      (ka + kl|N(i)|)     · δ_i =            kl · Σ_j δ_j    (no contact)
+    Smoothed differences vs. the original:
+      `if effective_pen > 0` is now smoothed via smooth_step(effective_pen,
+        eps).  At equilibrium with effective_pen >> eps, behaviour matches
+        the hard-gated version.  Within ±eps of zero, contact contribution
+        ramps smoothly between 0 and full.
+      `if delta_new < 0: delta_new = 0` is now smooth_relu(delta_new, eps).
+        The δ ≥ 0 invariant is preserved up to O(eps).
+
+    Formulation (smoothed):
+      gate(eff_pen) = smooth_step(eff_pen, eps)
+      (ka + kl|N(i)| + kc·gate) · δ_i = kc · gate · φ_i + kl · Σ_j δ_j
     """
     tid = wp.tid()
 
-    # Pad filter: non-active pads preserve their delta.  This keeps the
-    # warm-start intact across multi-pair launches in the same step.
+    # Pad filter: non-active pads preserve their delta.  Discrete index
+    # branch — does not flow gradient (sphere_shape is integer-valued).
     if sphere_shape[tid] != active_cslc_shape_idx:
         delta_dst[tid] = delta_src[tid]
         return
@@ -145,14 +231,15 @@ def jacobi_step(
     if is_surface[tid] == 1:
         phi = raw_penetration[tid]
         effective_pen = phi - delta_old
-        if effective_pen > 0.0:
-            f_contact = kc * phi
-            k_diag    = k_diag + kc
+        # Smooth contact-active gate (replaces `if effective_pen > 0:`).
+        gate = smooth_step(effective_pen, eps)
+        f_contact = kc * phi * gate
+        k_diag    = k_diag + kc * gate
 
     delta_jacobi = (f_contact + kl * neighbor_sum) / k_diag
     delta_new    = (1.0 - alpha) * delta_old + alpha * delta_jacobi
-    if delta_new < 0.0:
-        delta_new = 0.0
+    # Smooth lower clamp δ ≥ 0 (replaces `if delta_new < 0: delta_new = 0`).
+    delta_new    = smooth_relu(delta_new, eps)
     delta_dst[tid] = delta_new
 
 
@@ -206,6 +293,7 @@ def write_cslc_contacts(
     shape_material_mu: wp.array(dtype=wp.float32),
     cslc_kc: float,
     cslc_dc: float,
+    eps: float,
     out_stiffness: wp.array(dtype=wp.float32),
     out_damping: wp.array(dtype=wp.float32),
     out_friction: wp.array(dtype=wp.float32),
@@ -285,9 +373,9 @@ def write_cslc_contacts(
     q_body  = wp.transform_point(X_ws, p_local)
     q_world = wp.transform_point(X_wb, q_body)
 
-    effective_r = r_lat - delta_val
-    if effective_r < 0.0:
-        effective_r = 0.0
+    # Smooth lower clamp on effective radius (replaces `if effective_r < 0`).
+    # Recovers max(r_lat - δ, 0) as eps → 0 with a finite derivative at 0.
+    effective_r = smooth_relu(r_lat - delta_val, eps)
 
     # Shape B: target sphere centre in world.
     X_tb    = body_q[target_body_idx]
@@ -326,8 +414,10 @@ def write_cslc_contacts(
 
     # Solver-side projected penetration.  Already > 0 because dist >= d_proj
     # and pen_3d > 0 implies (effective_r + R) > dist >= d_proj.
+    # Smooth floor on the divisor (replaces wp.max(solver_pen, 1e-8)).
+    # sqrt(x² + δ²) ≥ δ smoothly; recovers x for x >> δ with no kink.
     solver_pen = (effective_r + target_radius) - d_proj
-    pen_scale  = pen_3d / wp.max(solver_pen, 1.0e-8)
+    pen_scale  = pen_3d / wp.sqrt(solver_pen * solver_pen + 1.0e-16)
 
     # Body-frame contact geometry.
     X_wb_inv = wp.transform_inverse(X_wb)

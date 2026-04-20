@@ -339,14 +339,45 @@ class CSLCData:
     neighbor_start: wp.array  # (n_spheres,) int32 — CSR row pointer
     neighbor_count: wp.array  # (n_spheres,) int32
     neighbor_list: wp.array   # (n_edges,) int32
+    # Smoothing width [m] for the differentiable surrogates of `[·]_+` and
+    # the contact-active gates in cslc_kernels.py.  eps → 0 recovers the
+    # original non-smooth behaviour; default 1e-5 m is essentially binary
+    # above 0.1 mm penetration with C^∞ derivatives at the threshold so
+    # wp.Tape can backprop through CSLC contact dynamics.
+    smoothing_eps: float = 1.0e-5
+    # Dense inverse of A = K + kc·I where K is the CSLC lattice Laplacian
+    # (anchor ka on the diagonal + lateral kl coupling).  Present only when
+    # CSLCData.from_pads(..., build_A_inv=True); used by the tape-compatible
+    # `lattice_solve_equilibrium` kernel as a one-shot drop-in replacement
+    # for the iterative jacobi_step (which can't be backprop'd through
+    # because of src/dst buffer aliasing — see cslc_v1/diff_test.py
+    # Phase-2 diagnostic).  Solves (K + kc·I) δ = kc·φ in closed form as
+    # δ = kc · A_inv · φ — preserves full lattice physics (ka, kl, kc) in
+    # the differentiable path.  O(n_spheres²) memory; for n > ~1000 a
+    # future follow-up should replace this with a GPU sparse Cholesky
+    # factorisation plus two triangular solves.
+    A_inv: wp.array | None = None
     device: str | None = None
 
     @classmethod
     def from_pads(
         cls, pads: list[CSLCPad], *, ka: float, kl: float, kc: float,
-        dc: float, device: Devicelike | None = None,
+        dc: float, smoothing_eps: float = 1.0e-5,
+        build_A_inv: bool = False,
+        device: Devicelike | None = None,
     ) -> CSLCData:
-        """Merge CSLCPads into GPU-resident CSLCData with global indexing."""
+        """Merge CSLCPads into GPU-resident CSLCData with global indexing.
+
+        Args:
+            pads: one or more CSLCPads to merge (assumed uniform material).
+            ka, kl, kc, dc: spring constants; see CSLCData docstring.
+            smoothing_eps: differentiability width for kernel gates.
+            build_A_inv: if True, precompute the dense inverse of the
+                lattice system matrix A = K + kc·I and store in A_inv
+                for use by the tape-compatible
+                `lattice_solve_equilibrium` kernel.  Default False —
+                production tests (squeeze, lift) don't need it.
+        """
         if device is None:
             device = wp.get_device()
 
@@ -390,6 +421,28 @@ class CSLCData:
             if neighbor_lists else np.zeros(0, dtype=np.int32)
         )
 
+        # Optionally build the dense inverse A_inv = (K + kc·I)^-1 for the
+        # tape-compatible lattice solve.  K is assembled from the pads'
+        # neighbour topology: K_ii = ka + kl·|N(i)|, K_ij = -kl if j ∈ N(i).
+        # K is SPD (Laplacian + ka·I), so A = K + kc·I is SPD; np.linalg.inv
+        # is fine for the small n we use.  For n ≫ 1000, a sparse Cholesky
+        # factorisation + two triangular tri-solve kernels would be the
+        # right follow-up (stored L is O(n·avg_neighbors) vs the dense
+        # A_inv's O(n²)).
+        A_inv_wp = None
+        if build_A_inv:
+            K = np.zeros((n_total, n_total), dtype=np.float64)
+            for pad, glob_off in zip(pads, offsets):
+                for local_i, neighbors in enumerate(pad.neighbor_indices):
+                    gi = int(glob_off + local_i)
+                    K[gi, gi] = ka + kl * len(neighbors)
+                    for nb in neighbors:
+                        gj = int(glob_off + int(nb))
+                        K[gi, gj] = -kl
+            A = K + kc * np.eye(n_total)
+            A_inv_np = np.linalg.inv(A).astype(np.float32)
+            A_inv_wp = wp.array(A_inv_np, dtype=wp.float32, device=device)
+
         return cls(
             n_spheres=n_total,
             n_surface=int(all_surface.sum()),
@@ -403,5 +456,7 @@ class CSLCData:
             neighbor_start=wp.array(all_start, dtype=wp.int32, device=device),
             neighbor_count=wp.array(all_count, dtype=wp.int32, device=device),
             neighbor_list=wp.array(all_neighbor_list, dtype=wp.int32, device=device),
+            smoothing_eps=smoothing_eps,
+            A_inv=A_inv_wp,
             device=device,
         )

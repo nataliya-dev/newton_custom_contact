@@ -414,6 +414,11 @@ class CSLCHandler:
             )
             target_radius = pair.other_radius
 
+            # Smoothing width for the differentiable surrogates in
+            # cslc_kernels.py.  Recovers the original non-smooth behaviour
+            # in the eps → 0 limit.
+            eps = float(data.smoothing_eps)
+
             # ── Kernel 1: Raw penetration ──
             wp.launch(
                 kernel=compute_cslc_penetration_sphere,
@@ -424,6 +429,7 @@ class CSLCHandler:
                     state.body_q, model.shape_body, model.shape_transform,
                     pair.cslc_shape,
                     target_body, pair.other_shape, target_local_pos, target_radius,
+                    eps,
                 ],
                 outputs=[pen_buf, self.contact_normal_scratch],
                 device=self.device,
@@ -440,7 +446,8 @@ class CSLCHandler:
                     inputs=[
                         src, dst, pen_buf, data.is_surface,
                         data.neighbor_start, data.neighbor_count, data.neighbor_list,
-                        data.ka, data.kl, data.kc, self.alpha, data.sphere_shape, pair.cslc_shape
+                        data.ka, data.kl, data.kc, self.alpha, data.sphere_shape, pair.cslc_shape,
+                        eps,
                     ],
                     device=self.device,
                 )
@@ -476,6 +483,7 @@ class CSLCHandler:
                     model.shape_material_mu,
                     data.kc,
                     data.dc,
+                    eps,
                     contacts.rigid_contact_stiffness,
                     contacts.rigid_contact_damping,
                     contacts.rigid_contact_friction,
