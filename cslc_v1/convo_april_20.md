@@ -53,29 +53,23 @@ Three complementary metrics (see *Metric interpretation* below):
 |---|---|---|---|---|
 | `point_mujoco` | 0.926 mm | +0.725 mm | **+0.495 mm/s** | 2 |
 | `cslc_mujoco` (cf=0.46) | 0.159 mm | +0.123 mm | **+0.082 mm/s** | 174 |
-| `hydro_mujoco` (kh=1e8) | 0.050 mm | −0.085 mm (rising) | **+0.039 mm/s** | 108 |
+| `hydro_mujoco` (kh=1e8) | 0.130 mm | +0.093 mm | **+0.062 mm/s** | 140 |
 
-**Key finding (updated 2026-04-20):** CSLC has the **lowest absolute creep
-rate** of the three: 6× better than point, 2.7× better than hydroelastic.
-The earlier "CSLC and hydro tie on creep" reading was wrong — it came from
-comparing `FullDrop`, which is dominated by a squeeze-phase transient in
-hydroelastic: the asymmetric pressure field at 15 mm penetration generates
-a persistent upward force that ejects the sphere during SQUEEZE and
-continues to push it up throughout HOLD (`HoldCreep = −0.221 mm/s`).
-Hydroelastic isn't "holding better"; it's floating the sphere upward.
-
-This fixes the apparent contradiction with the lift test (where CSLC clearly
-beats hydro): both tests now agree that CSLC is the best of the three
-distributed contact models under MuJoCo.
+**Key finding:** Both distributed contact models beat point contact by a
+large margin on HOLD creep — CSLC is 6.0× better than point, hydro 8.0×
+better. Between the two, hydro has marginally lower creep in this
+15 mm deep-penetration squeeze regime (0.062 vs 0.082 mm/s, ratio 1.32×).
+The lift test (§2) shows the opposite ranking — CSLC clearly beats hydro
+on slip under the fair calibration at 1 mm face penetration — so the two
+tests are probing different regimes; see the §5.2 TODO on squeeze-at-low-
+penetration to bring them into alignment.
 
 ### Metric interpretation — why `FullDrop` is confounded
 
-`FullDrop = z[0] − min(z)` assumes the sphere monotonically falls; it
-equals the total distance fallen when that's true. For models with
-**asymmetric normal-force distributions** during SQUEEZE (hydroelastic with
-its volumetric pressure gradient), the sphere rises *first*, so `min(z)`
-is close to `z[0]` and the metric under-reports the true compliance of the
-contact model.
+`FullDrop = z[0] − min(z)` commingles the SQUEEZE transient (pads closing,
+sphere accelerating through ~15 mm of penetration) with the HOLD-phase
+compliance drift we actually care about, so the number depends on the
+ramp profile as well as the contact model.
 
 Both `HoldDrop` and `HoldCreep` isolate the HOLD phase and so strip out the
 squeeze transient. For the paper, report `HoldCreep` (rate) as the primary
@@ -123,10 +117,8 @@ MuJoCo's CG solver.
 
 ### Creep mitigation knobs tested
 
-Numbers below use legacy `FullDrop` — the ratios are still informative for
-point vs CSLC (both monotonically fall), but hydro is not listed here
-because `FullDrop` is not meaningful for a model that rises (see
-*Metric interpretation* above).
+Numbers below use legacy `FullDrop`. Only point and CSLC are listed;
+hydro was not part of this mitigation sweep.
 
 | Change | Point FullDrop | CSLC FullDrop (cf=0.46) | Ratio |
 |---|---|---|---|
@@ -392,15 +384,25 @@ irreducible per-step constraint compliance for this pad geometry.
 
 ### `kh` stability sweep (hydro)
 
-Earlier exploration on the squeeze scene; informs the lift default.
+Re-measured 2026-04-20 on the current squeeze scene (default params,
+hydro_mujoco). `Squeeze z-drop` is the legacy `FullDrop = z[0] - min(z)`.
+`HoldCreep` is the second-half-of-HOLD mean velocity (positive = falling).
+All five runs reproduced via `cslc_v1/_validation_logs/sweep_kh_stability.py`.
 
-| kh [Pa] | Squeeze z-drop | Peak contacts | Notes |
-|---|---|---|---|
-| 1e6 | 0.94 mm | 106 | sphere rose 2.3 mm during squeeze |
-| 1e7 | 0.078 mm | 103 | rose 3.7 mm |
-| 3e7 | 0.029 mm | 103 | rose 1.1 mm |
-| **1e8** | **0.033 mm** | **111** | basically static (production default) |
-| 1e10 | DIVERGED | n/a | sphere ejected at HOLD start |
+| kh [Pa] | FullDrop | HoldDrop | HoldCreep | Peak contacts | Notes |
+|---|---|---|---|---|---|
+| 1e6 | 1.355 mm | +1.075 mm | +0.722 mm/s | 133 | monotonic fall; no rise observed |
+| 1e7 | 0.453 mm | +0.345 mm | +0.229 mm/s | 133 | monotonic fall; no rise observed |
+| 3e7 | 0.264 mm | +0.198 mm | +0.132 mm/s | 134 | monotonic fall; no rise observed |
+| **1e8** | **0.130 mm** | **+0.093 mm** | **+0.062 mm/s** | **140** | production default; monotonic fall |
+| 1e10 | DIVERGED | n/a | n/a | 126→0 | sphere ejected during SQUEEZE (final z ≈ −9.7 m) |
+
+HoldCreep reduces monotonically with `kh` up to the stability boundary —
+roughly `HoldCreep ∝ 1/kh` in the 1e6–1e8 regime. At 1e10 the contact
+impedance saturates MuJoCo's CG solver and the sphere is ejected through
+the pad within the first few SQUEEZE steps. **None of the five runs showed
+the upward-rise behavior previously documented at low kh**; see the earlier
+commentary (pre-merge) for context on that regime.
 
 ---
 
@@ -647,12 +649,12 @@ parameters, and lift results). What's left:
   face, or are corner/edge polygons producing off-axis forces?). Plot
   contact points in world frame for one HOLD step per model.
 - **Squeeze-scene fair calibration** at low penetration. The squeeze
-  test (§1) uses 15 mm penetration, at which hydro's pressure-field
-  asymmetry ejects the sphere upward (`HoldCreep = −0.22 mm/s`) —
-  aggregate stiffness matching alone won't fix this. Either (a) drop
-  squeeze penetration to ~1 mm to match the lift regime, or (b) report
-  squeeze results at 15 mm pen explicitly as a deep-deformation regime
-  where the three models differ physically, not just in calibration.
+  test (§1) uses 15 mm penetration — a deep-deformation regime where
+  hydro beats CSLC on HOLD creep (opposite of the lift test at 1 mm
+  face_pen). Either (a) drop squeeze penetration to ~1 mm to match the
+  lift regime, or (b) report squeeze results at 15 mm pen explicitly
+  as a deep-deformation regime where the three models differ physically,
+  not just in calibration.
 - **Match patch area as a secondary criterion**. Once force-PD lands
   (§5.5), additionally constrain `A_patch` to be shared across models so
   both grip force AND contact area are fixed, isolating the purely
