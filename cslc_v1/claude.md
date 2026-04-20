@@ -1,8 +1,7 @@
 # CLAUDE.md
 
-Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
 
-**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+**Tradeoff:** These guidelines bias toward caution over speed.
 
 ## 1. Think Before Coding
 
@@ -61,15 +60,10 @@ For multi-step tasks, state a brief plan:
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
 
-
-## 5. Write Good Code
+## 5. Write Good Scientifically Rigorous Code
 **Write clear, documented, easy-to-read, and if possible, modular, code.**
-- This code must fit the paradigm of whatever library you are working with
 - If debug output is warranted, add it, so it is easy to debug on output
-- Make sure mathematical formulations or anything complex is documented
-- Write as if somebody reading it will be able to follow
-- Prefer to verify and debug rather than fixing something that you are not sure you are fixing
-
+- Make sure mathematical/scientific formulations are documented in comments and their source if available
 
 ---
 

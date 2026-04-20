@@ -21,14 +21,34 @@ Phases
 Modes
 ─────
   viewer     Interactive OpenGL visualization (default).
-  headless   Point vs CSLC comparison with summary output.
+  headless   Headless point vs CSLC comparison with printed summary.
 
-Examples
-────────
-  python gripper_lift_test.py --mode viewer --contact-model cslc
-  python gripper_lift_test.py --mode viewer --contact-model point
-  python gripper_lift_test.py --mode headless
-  python gripper_lift_test.py --mode headless --solver semi
+Flags
+─────
+  --contact-model {point,cslc}   Which contact model to visualise (viewer mode).
+  --solver {mujoco,semi}         Physics solver backend (default: mujoco).
+  --start-gripped                Skip APPROACH+SQUEEZE; spawn sphere already
+                                 gripped at lift height. Useful for isolating
+                                 the LIFT phase without ground-contact transients.
+  --warm-start-sphere-vz         In --start-gripped mode, give the sphere an
+                                 initial vz matching the lift speed so there is
+                                 no velocity mismatch at t=0.
+  --no-ground                    Remove the ground plane (reduces contact noise
+                                 during the approach phase).
+
+Usage
+─────
+  # Live viewer — full cycle (approach → squeeze → lift → hold):
+  uv run cslc_v1/lift_test.py --viewer gl --contact-model cslc
+  uv run cslc_v1/lift_test.py --viewer gl --contact-model point
+
+  # Skip to lift phase immediately (no approach/squeeze transient):
+  uv run cslc_v1/lift_test.py --viewer gl --contact-model cslc --start-gripped
+  uv run cslc_v1/lift_test.py --viewer gl --contact-model cslc --start-gripped --no-ground
+
+  # Headless batch comparison (both models, prints summary):
+  uv run cslc_v1/lift_test.py --mode headless
+  uv run cslc_v1/lift_test.py --mode headless --solver semi
 """
 
 from __future__ import annotations
@@ -50,15 +70,18 @@ try:
     HAS_MUJOCO = True
 except ImportError:
     HAS_MUJOCO = False
-    warnings.warn("SolverMuJoCo not available — falling back to semi-implicit.")
+    warnings.warn(
+        "SolverMuJoCo not available — falling back to semi-implicit.")
 
 
 # ── Formatting ────────────────────────────────────────────────────────────
 
 _SEP = "─" * 60
 
+
 def _log(msg, indent=0):
     print(f"  {'  ' * indent}│ {msg}")
+
 
 def _section(title):
     print(f"\n{'═' * 60}\n  {title}\n{'═' * 60}")
@@ -119,24 +142,21 @@ class SceneParams:
 
     hold_duration: float = 1.0
 
-    # Material (shared by point + CSLC).
+    # Material (shared by point + CSLC) — matched to squeeze_test.py.
     #
-    # The face-lattice CSLC pad places ALL surface spheres on the contact
-    # face (no edges, corners, or wasted non-contact-face spheres).  For a
-    # 40×100 mm inner face at 10 mm spacing that's 5×11 = 55 spheres — and
-    # when the grasped sphere is pressed in, ~30 of those are simultaneously
-    # in contact (vs ~9 with the old volumetric lattice, where most surface
-    # spheres were on non-contact faces and rejected).
+    # With spacing=5mm, the contact face (40×100 mm) has 9×21=189 surface
+    # spheres per pad.  calibrate_kc targets contact_fraction=0.15 (≈28 per
+    # pad), giving kc=1087 N/m and keff=892.9 N/m per sphere.
     #
-    # Result: an order-of-magnitude MORE force per unit ke.  Grip-force
-    # budget at face-pen = 1 mm:
-    #   ke= 1000 → μ·Fn_total ≈ 13 N   (≈ 2.6× weight — target)
-    #   ke= 5000 → μ·Fn_total ≈ 64 N   (13× weight — WILL launch sphere)
-    #   ke=25000 → μ·Fn_total ≈ 320 N  (explodes)
+    # Friction budget at face-pen ≈ 2 mm with ~10 active spheres per side:
+    #   Fn_total = 2 × 10 × 892.9 × 0.002 = 35.7 N
+    #   F_friction = μ × Fn = 0.5 × 35.7 = 17.9 N  vs  weight = 4.91 N  (3.6×)
     #
-    # So `ke` needs to drop by ~5–10× versus the volumetric-lattice scene.
-    ke: float = 1.0e3     # tuned for face-lattice; was 1e4 for volumetric
-    kd: float = 5.0e1
+    # NOTE: pre-2026-04-19 comment said "ke=5000 WILL launch sphere" — that
+    # was written before out_damping=0 fix (friction timeconst was 1.0s then,
+    # now ≈0.030s). With stiff friction the sphere follows the pads smoothly.
+    ke: float = 5.0e4     # matched to squeeze_test
+    kd: float = 5.0e2     # matched to squeeze_test
     kf: float = 100.0
     mu: float = 0.5
 
@@ -144,13 +164,28 @@ class SceneParams:
     drive_ke: float = 5.0e4
     drive_kd: float = 1.0e3
 
-    # CSLC tuning
-    cslc_spacing: float = 0.01
-    cslc_ka: float = 2000.0
-    cslc_kl: float = 100.0
+    # CSLC tuning — matched to squeeze_test.py
+    cslc_spacing: float = 0.005
+    cslc_ka: float = 5000.0
+    cslc_kl: float = 500.0
     cslc_dc: float = 2.0
-    cslc_n_iter: int = 40
+    cslc_n_iter: int = 20
     cslc_alpha: float = 0.6
+    # Per-pad contact fraction for kc recalibration after handler build.
+    # The lift scene uses face_pen ≈ 1 mm vs squeeze_test's 15 mm, so the
+    # active patch contains only ~5 spheres per pad (vs 87 in squeeze).
+    # The handler's default cf=0.3 over-estimates the active count by ~11×,
+    # leaving CSLC's per-pad aggregate stiffness an order of magnitude below
+    # ke_bulk.  Setting cf to the empirical fraction restores the calibration
+    # invariant: per-pad aggregate stiffness = ke_bulk.
+    # Set None to keep the handler's default kc.
+    cslc_contact_fraction: float | None = 0.025
+
+    # Hydroelastic modulus [Pa] for the hydro contact model.  See section 9
+    # in cslc_v1/convo_april_19.md for the kh stability sweep — 1e8 is
+    # silicone-rubber-stiff and stable; 1e10 ejects the sphere.
+    kh: float = 1.0e8
+    sdf_resolution: int = 64
 
     # Integration
     dt: float = 1.0 / 500.0
@@ -227,7 +262,8 @@ class SceneParams:
     def dump(self):
         _section("SCENE PARAMETERS")
         m = self.sphere_mass
-        _log(f"Sphere: r={self.sphere_radius*1e3:.1f}mm  mass={m*1e3:.1f}g  weight={m*9.81:.3f}N")
+        _log(
+            f"Sphere: r={self.sphere_radius*1e3:.1f}mm  mass={m*1e3:.1f}g  weight={m*9.81:.3f}N")
         _log(f"Pads:   hx={self.pad_hx*1e3:.0f}mm  hy={self.pad_hy*1e3:.0f}mm  "
              f"hz={self.pad_hz*1e3:.0f}mm  density={self.pad_density:.0f}")
         _log(f"Phases: approach={self.approach_duration}s  squeeze={self.squeeze_duration}s  "
@@ -255,11 +291,18 @@ class Metrics:
 
     @property
     def lifted(self):
-        return self.max_z > self.sphere_z[0] + 0.005 if len(self.sphere_z) > 1 else False
+        # True if sphere rose more than 5 mm above its resting position.
+        # Uses min(sphere_z) as reference (settled ground height ≈ sphere_radius),
+        # not sphere_z[0] which is the spawn height before the sphere drops.
+        if len(self.sphere_z) < 2:
+            return False
+        return self.max_z > min(self.sphere_z) + 0.005
 
     @property
     def held(self):
-        return self.final_z > 0.01 if self.sphere_z else False
+        # True if sphere bottom is off the ground at end of simulation.
+        # sphere bottom = final_z - sphere_radius; > 2 mm → clearly airborne.
+        return self.final_z > 0.032 if self.sphere_z else False
 
 
 # ── Scene builders ────────────────────────────────────────────────────────
@@ -280,7 +323,7 @@ def _sphere_cfg(p: SceneParams):
         ke=p.ke, kd=p.kd, kf=p.kf, mu=p.mu, gap=0.002, density=p.sphere_density)
 
 
-def _build_scene(p: SceneParams, pad_cfg):
+def _build_scene(p: SceneParams, pad_cfg, sphere_cfg=None):
     """Build (optional) ground + 2 articulated pads + 1 free sphere.
 
     In start_gripped mode the sphere and pads both spawn at gripped_spawn_z,
@@ -382,7 +425,8 @@ def _build_scene(p: SceneParams, pad_cfg):
     sphere = b.add_link(
         xform=wp.transform((0, 0, z0), wp.quat_identity()),
         label="sphere")
-    b.add_shape_sphere(sphere, radius=p.sphere_radius, cfg=_sphere_cfg(p))
+    s_cfg = sphere_cfg if sphere_cfg is not None else _sphere_cfg(p)
+    b.add_shape_sphere(sphere, radius=p.sphere_radius, cfg=s_cfg)
     j_free = b.add_joint_free(sphere, label="sphere_free")
     b.add_articulation([j_free], label="sphere")
 
@@ -404,7 +448,7 @@ def _build_scene(p: SceneParams, pad_cfg):
         )
         # joint_q is indexed by DOF.  left_x → +dx_gripped (pad moves +x,
         # i.e. inward from lx0); right_x → -dx_gripped (inward from rx0).
-        b.joint_q[dof_map["left_x"]]  = +dx_gripped
+        b.joint_q[dof_map["left_x"]] = +dx_gripped
         b.joint_q[dof_map["right_x"]] = -dx_gripped
 
         # ── Warm-start sphere velocity to match LIFT speed ──
@@ -456,7 +500,27 @@ def build_cslc_scene(p: SceneParams):
     return _build_scene(p, cfg)
 
 
-BUILDERS = {"point": build_point_scene, "cslc": build_cslc_scene}
+def build_hydro_scene(p: SceneParams):
+    """Build the same articulated-pad scene with hydroelastic contact.
+
+    Both pads AND the sphere need is_hydroelastic=True (PFC requires both
+    bodies to carry pressure fields).  kh is the hydroelastic modulus [Pa];
+    see SceneParams.kh docstring and section 9 of convo_april_19.md.
+    """
+    pad_cfg = newton.ModelBuilder.ShapeConfig(
+        ke=p.ke, kd=p.kd, kf=p.kf, mu=p.mu, gap=0.002, density=p.pad_density,
+        kh=p.kh, is_hydroelastic=True, sdf_max_resolution=p.sdf_resolution)
+    sphere_cfg = newton.ModelBuilder.ShapeConfig(
+        ke=p.ke, kd=p.kd, kf=p.kf, mu=p.mu, gap=0.002, density=p.sphere_density,
+        kh=p.kh, is_hydroelastic=True, sdf_max_resolution=p.sdf_resolution)
+    return _build_scene(p, pad_cfg, sphere_cfg=sphere_cfg)
+
+
+BUILDERS = {
+    "point": build_point_scene,
+    "cslc": build_cslc_scene,
+    "hydro": build_hydro_scene,
+}
 
 SPHERE_BODY = 4
 LEFT_PAD = 1
@@ -498,11 +562,46 @@ def _pad_state(step, p: SceneParams):
     dx_total = dx_app + p.squeeze_speed * p.squeeze_duration
 
     def _lift_dz(t_lift: float) -> float:
+        """C¹-smooth velocity profile with ramps at BOTH endpoints.
+
+        Symmetric end-ramp eliminates the inertial overshoot at LIFT→HOLD:
+        if the pad's commanded velocity drops 0 → lift_speed → 0 with smooth
+        transitions, the sphere never accelerates abruptly and so does not
+        carry momentum past the pad's stop position.
+
+        Velocity: smoothstep up over [0, ramp], constant over
+        [ramp, lift_duration-ramp], smoothstep down over the last ramp.
+        Position: integrate.  Total integral over [0, lift_duration] equals
+        lift_speed * (lift_duration - ramp), i.e. the original no-ramp distance
+        minus one full ramp.  We renormalise lift_speed to keep the same total
+        travel as a single-end-ramp profile would give.
+        """
         ramp = p.lift_ramp_duration
-        if ramp <= 0.0 or t_lift >= ramp:
-            return p.lift_speed * (t_lift - 0.5 * ramp)
-        sn = t_lift / ramp
-        return p.lift_speed * ramp * (sn ** 3 - 0.5 * sn ** 4)
+        T = p.lift_duration
+        if ramp <= 0.0:
+            return p.lift_speed * t_lift
+        # Renormalise so total travel matches the single-end-ramp design:
+        #   travel_single_end = lift_speed * (T - 0.5*ramp)
+        #   travel_two_end    = lift_speed * (T - ramp)        (one less ramp)
+        # Multiply by (T - 0.5*ramp) / (T - ramp) so the two-ramp profile
+        # delivers the same lift distance as the original.
+        v_eff = p.lift_speed * (T - 0.5 * ramp) / max(T - ramp, 1e-9)
+        # Phase 1: smoothstep up over [0, ramp].
+        if t_lift < ramp:
+            sn = t_lift / ramp
+            return v_eff * ramp * (sn ** 3 - 0.5 * sn ** 4)
+        # Phase 2: constant velocity over [ramp, T-ramp].
+        if t_lift < T - ramp:
+            return v_eff * ramp * (1.0 - 0.5) + v_eff * (t_lift - ramp)
+        # Phase 3: smoothstep down over [T-ramp, T].
+        s_back = (T - t_lift) / ramp  # goes 1 → 0
+        s_back = max(s_back, 0.0)
+        # Travelled at constant velocity through end of phase 2:
+        z_phase2_end = v_eff * (ramp * 0.5) + v_eff * (T - 2 * ramp)
+        # Phase 3 contribution: integrate v_eff * smoothstep(1 - s_back²·...).
+        # Using mirror of phase 1's integral:
+        z_phase3 = v_eff * ramp * (0.5 - (s_back ** 3 - 0.5 * s_back ** 4))
+        return z_phase2_end + z_phase3
 
     if phase == "LIFT":
         return dx_total, _lift_dz(t)
@@ -516,8 +615,8 @@ def set_pad_targets(control, step, p: SceneParams, dof_map, debug=False):
     dx, dz = _pad_state(step, p)
 
     target = control.joint_target_pos.numpy()
-    target[dof_map["left_x"]]  = +dx
-    target[dof_map["left_z"]]  = +dz
+    target[dof_map["left_x"]] = +dx
+    target[dof_map["left_z"]] = +dz
     target[dof_map["right_x"]] = -dx
     target[dof_map["right_z"]] = +dz
     control.joint_target_pos.assign(
@@ -538,6 +637,51 @@ def set_pad_targets(control, step, p: SceneParams, dof_map, debug=False):
 def count_active_contacts(contacts):
     n = int(contacts.rigid_contact_count.numpy()[0])
     return int(np.sum(contacts.rigid_contact_shape0.numpy()[:n] >= 0)) if n else 0
+
+
+def recalibrate_cslc_kc_per_pad(model, contact_fraction):
+    """Override per-sphere kc on a per-pad basis (mirror of the squeeze_test
+    helper).  Sets each pad's aggregate stiffness at uniform contact equal to
+    `ke_bulk`, using the empirical contact fraction for this scene."""
+    pipeline = getattr(model, "_collision_pipeline", None)
+    handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
+    if handler is None:
+        return None
+
+    d = handler.cslc_data
+    # Read ke from the FIRST CSLC-flagged shape, not shape 0 (which may be a
+    # ground plane in lift_test).  Squeeze_test happens to have shape 0 == a
+    # CSLC pad, so its helper got away with `shape_material_ke[0]` directly.
+    shape_flags = model.shape_flags.numpy()
+    cslc_shape_idx = next(
+        (i for i in range(model.shape_count) if (shape_flags[i] & CSLC_FLAG)),
+        0,
+    )
+    ke_bulk = float(model.shape_material_ke.numpy()[cslc_shape_idx])
+    shape_ids = d.sphere_shape.numpy()
+    is_surface = d.is_surface.numpy()
+    n_pads = int(len(np.unique(shape_ids)))
+    n_surface_per_pad = int(is_surface.sum()) // max(n_pads, 1)
+    n_contact_per_pad = max(int(n_surface_per_pad * contact_fraction), 1)
+
+    ka = float(d.ka)
+    denom = n_contact_per_pad * ka - ke_bulk
+    if denom <= 0.0:
+        new_kc = ke_bulk / max(n_contact_per_pad, 1)
+        derivation = "fallback (denom<=0): kc = ke/N"
+    else:
+        new_kc = ke_bulk * ka / denom
+        derivation = "exact: kc = ke*ka/(N*ka - ke)"
+
+    old_kc = float(d.kc)
+    d.kc = new_kc
+    keff = new_kc * ka / (ka + new_kc)
+    aggregate_per_pad = n_contact_per_pad * keff
+    _log(f"CSLC RECAL: pads={n_pads}  N_contact_per_pad={n_contact_per_pad}  "
+         f"({derivation})")
+    _log(f"            kc: {old_kc:.1f}  →  {new_kc:.1f} N/m  "
+         f"keff={keff:.1f}  agg/pad={aggregate_per_pad:.0f} (target={ke_bulk:.0f})")
+    return new_kc
 
 
 def read_cslc_state(model):
@@ -561,10 +705,11 @@ def inspect_model(model, label=""):
     GEO = {0: "PLANE", 1: "MESH", 3: "SPHERE", 4: "CAPSULE", 7: "BOX"}
     _log(f"Model '{label}': {model.body_count} bodies, {model.shape_count} shapes, "
          f"{model.joint_count} joints, {model.joint_dof_count} DOFs")
-    st, sf, sb = model.shape_type.numpy(), model.shape_flags.numpy(), model.shape_body.numpy()
+    st, sf, sb = model.shape_type.numpy(
+    ), model.shape_flags.numpy(), model.shape_body.numpy()
     for i in range(model.shape_count):
         cslc = " [CSLC]" if sf[i] & CSLC_FLAG else ""
-        _log(f"  shape {i}: {GEO.get(int(st[i]),'?')}  body={sb[i]}{cslc}", 1)
+        _log(f"  shape {i}: {GEO.get(int(st[i]), '?')}  body={sb[i]}{cslc}", 1)
 
 
 # ── Solver creation ───────────────────────────────────────────────────────
@@ -585,8 +730,9 @@ def make_solver(model, solver_name, p: SceneParams):
                 if sp <= 0:
                     continue
                 hx, hy, hz = (float(scale[i][j]) for j in range(3))
-                nx, ny, nz = (max(int(round(2*h/sp))+1, 2) for h in [hx, hy, hz])
-                interior = max(nx-2,0)*max(ny-2,0)*max(nz-2,0)
+                nx, ny, nz = (max(int(round(2*h/sp))+1, 2)
+                              for h in [hx, hy, hz])
+                interior = max(nx-2, 0)*max(ny-2, 0)*max(nz-2, 0)
                 ncon += nx*ny*nz - interior
         return SolverMuJoCo(model, use_mujoco_contacts=False,
                             solver="newton", integrator="implicitfast",
@@ -634,15 +780,19 @@ def run_headless(name, model, solver, p, dof_map, verbose=True):
     return met
 
 
-def test_headless(p, solver_name):
+def test_headless(p, solver_name, contact_models=None):
+    if contact_models is None:
+        contact_models = ["point", "cslc"]
     p.dump()
     results = []
-    for cm in ["point", "cslc"]:
+    for cm in contact_models:
         label = f"{cm}_{solver_name}"
         _section(label.upper())
         model, dof_map = BUILDERS[cm](p)
         _ = model.contacts()
         inspect_model(model, label)
+        if cm == "cslc" and p.cslc_contact_fraction is not None:
+            recalibrate_cslc_kc_per_pad(model, p.cslc_contact_fraction)
         solver = make_solver(model, solver_name, p)
         met = run_headless(label, model, solver, p, dof_map)
         results.append(met)
@@ -653,8 +803,9 @@ def test_headless(p, solver_name):
     print(f"  {'Config':<24} {'Max Z':>8} {'Final Z':>8} {'Lifted':>8} {'Held':>8}")
     print(f"  {_SEP}")
     for m in results:
-        print(f"  {m.name:<24} {m.max_z:8.4f} {m.final_z:8.4f} "
-              f"{'YES':>8 if m.lifted else 'NO':>8} {'YES':>8 if m.held else 'NO':>8}")
+        lifted_s = 'YES' if m.lifted else 'NO'
+        held_s   = 'YES' if m.held   else 'NO'
+        print(f"  {m.name:<24} {m.max_z:8.4f} {m.final_z:8.4f} {lifted_s:>8} {held_s:>8}")
 
 
 # ── Viewer mode ───────────────────────────────────────────────────────────
@@ -690,26 +841,18 @@ class Example:
         self.control = self.model.control()
         self.contacts = self.model.contacts()
 
-        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        newton.eval_fk(self.model, self.model.joint_q,
+                       self.model.joint_qd, self.state_0)
 
         self.current_z = self.p.sphere_start_z
         self.current_contacts = 0
         self.current_phase = "APPROACH"
 
-        # ── Telemetry state ──
-        # To compute acceleration via double finite difference we need TWO
-        # pieces of history:
-        #   _prev_sphere_z   — sphere_z at the previous telemetry tick
-        #   _prev_vz_sphere  — vz_fd computed at the previous telemetry tick
-        # Then a_z = (vz_fd_now - vz_fd_prev) / dt_print.
-        # Same for the pad so we can sanity-check that the pad is tracking
-        # its kinematic target.
-        # body_qd[SPHERE, 5] was observed to stay at 0 under MuJoCo; FD is
-        # the only trustworthy signal.
+        # FD telemetry state (body_qd stale under MuJoCo GPU — use position FD).
         self._prev_sphere_z = None
-        self._prev_pad_z    = None
+        self._prev_pad_z = None
         self._prev_vz_sphere = None
-        self._prev_vz_pad    = None
+        self._prev_vz_pad = None
 
         self.viewer.set_model(self.model)
         self.viewer.set_camera(
@@ -722,8 +865,10 @@ class Example:
         q = self.state_0.body_q.numpy()
         _log(f"INITIAL STATE ({self.model.body_count} bodies):")
         for bi in range(self.model.body_count):
-            _log(f"  body {bi}: pos=({q[bi,0]:.4f},{q[bi,1]:.4f},{q[bi,2]:.4f})", 1)
-        _log(f"sim_substeps={self.sim_substeps}  sim_dt={self.sim_dt*1e3:.3f}ms")
+            _log(
+                f"  body {bi}: pos=({q[bi, 0]:.4f},{q[bi, 1]:.4f},{q[bi, 2]:.4f})", 1)
+        _log(
+            f"sim_substeps={self.sim_substeps}  sim_dt={self.sim_dt*1e3:.3f}ms")
 
     def simulate(self):
         for _ in range(self.sim_substeps):
@@ -741,53 +886,39 @@ class Example:
         self.sim_time += self.frame_dt
 
         q = self.state_0.body_q.numpy()
-        qd = self.state_0.body_qd.numpy()
         self.current_z = float(q[SPHERE_BODY, 2])
         self.current_contacts = count_active_contacts(self.contacts)
         self.current_phase, _ = self.p.phase_of(self.sim_step)
 
-        # Print every ~100 ms.  The old `* 60` cadence was once per second,
-        # which is too coarse to see the SQUEEZE→LIFT transition (where
-        # the sphere either tracks the pad or launches past it).
-        # `sim_substeps * 6` with 60 fps / 8 substeps ≈ 100 ms between prints.
+        # Print every ~100 ms.
         if self.sim_step % (self.sim_substeps * 6) < self.sim_substeps:
             phase, _ = self.p.phase_of(self.sim_step)
-            cslc = read_cslc_state(self.model) if self.contact_model == "cslc" else None
+            cslc = read_cslc_state(
+                self.model) if self.contact_model == "cslc" else None
             cslc_str = f"  cslc={cslc['n_active']}/{cslc['n_surface']}" if cslc else ""
             sphere_z = float(q[SPHERE_BODY, 2])
-            pad_z    = float(q[LEFT_PAD, 2])
-            delta_z  = sphere_z - pad_z
+            pad_z = float(q[LEFT_PAD, 2])
+            delta_z = sphere_z - pad_z
 
-            # ── FD velocity and acceleration ──
-            # dt between consecutive telemetry prints (not per sim-step):
-            #   sim_substeps substeps/frame × 6 frames between prints × sim_dt
-            # Equivalently: 6 * frame_dt.  This is the denominator for ALL
-            # finite-difference derivatives below.
+            # FD velocity/acceleration from position history.
+            # body_qd is stale under MuJoCo GPU solver (always reads ≈0).
             dt_print = 6.0 * self.frame_dt
-
-            # Single FD: vz = Δz/Δt.  Reported as vz_fd; compared against
-            # the stored body_qd[5] (vz_qd) which we suspect is always 0.
-            vz_qd = float(qd[SPHERE_BODY, 5])
             if self._prev_sphere_z is None:
                 vz_sphere = 0.0
-                vz_pad    = 0.0
+                vz_pad = 0.0
             else:
                 vz_sphere = (sphere_z - self._prev_sphere_z) / dt_print
-                vz_pad    = (pad_z    - self._prev_pad_z)    / dt_print
+                vz_pad = (pad_z - self._prev_pad_z) / dt_print
 
-            # Double FD: a = Δv/Δt.  Needs two previous vz samples to
-            # converge; first two prints will show a_z = 0 (no data yet).
             if self._prev_vz_sphere is None:
                 az_sphere = 0.0
-                az_pad    = 0.0
             else:
                 az_sphere = (vz_sphere - self._prev_vz_sphere) / dt_print
-                az_pad    = (vz_pad    - self._prev_vz_pad)    / dt_print
 
-            self._prev_sphere_z  = sphere_z
-            self._prev_pad_z     = pad_z
+            self._prev_sphere_z = sphere_z
+            self._prev_pad_z = pad_z
             self._prev_vz_sphere = vz_sphere
-            self._prev_vz_pad    = vz_pad
+            self._prev_vz_pad = vz_pad
 
             # ── Inferred vertical contact force on the sphere ──
             # Newton's second law:  m*a_z = Σ F_z = F_contact_z + F_gravity_z
@@ -798,72 +929,15 @@ class Example:
             # sphere is being launched upward, F_contact_z >> weight.
             g_mag = abs(self.p.gravity[2])
             m_sphere = self.p.sphere_mass
-            F_contact_z_sphere = m_sphere * (az_sphere + g_mag)
-            # For context, print the theoretical static balance force:
+            F_contact_z = m_sphere * (az_sphere + g_mag)
             weight_N = m_sphere * g_mag
-
-            # ── CSLC-specific: aggregate kc and pen_scale distribution ──
-            # If our calibrated kc ended up scaled by MuJoCo's impedance
-            # model, we can see it here: mean(out_stiffness) should equal
-            # data.kc * mean(pen_scale).  Any discrepancy means MuJoCo is
-            # ignoring / transforming our value.
-            #
-            # Buffer layout (n_pair_blocks × n_surface_contacts):
-            #   pair 0 writes real contacts at its own block's valid slots,
-            #   pair 1 at its own block's valid slots.  The diag arrays were
-            #   resized this iteration to match the contacts-buffer layout
-            #   so they no longer race.  Total length = handler.contact_count.
-            cslc_diag_str = ""
-            if self.contact_model == "cslc":
-                handler = self.model._collision_pipeline.cslc_handler
-                if handler is not None:
-                    pen_scale_np  = handler.dbg_pen_scale.numpy()
-                    solver_pen_np = handler.dbg_solver_pen.numpy()
-                    radial_np     = handler.dbg_radial.numpy()
-                    # Active slots have pen_scale > 0 (sentinel is -1.0 from
-                    # kernel cull paths).  Now that per-pair blocks are used,
-                    # this mask picks up BOTH pads' real contacts.
-                    active = pen_scale_np > 0.0
-                    if active.any():
-                        off = self.model._collision_pipeline.cslc_contact_offset
-                        # Read the FULL CSLC slot range (all pair blocks),
-                        # not just the first pair's block.  handler.contact_count
-                        # = n_surface_contacts × n_pair_blocks = total slots.
-                        N_total = handler.contact_count
-                        kstiff = self.contacts.rigid_contact_stiffness.numpy()[off:off+N_total]
-                        # Sanity: sizes must match before masking.
-                        if len(kstiff) == len(pen_scale_np):
-                            k_active = kstiff[active]
-                            # Count active contacts on each pad separately
-                            # (first block = pair 0, second block = pair 1).
-                            N_per = handler.n_surface_contacts
-                            n_active_p0 = int(active[:N_per].sum())
-                            n_active_p1 = int(active[N_per:].sum())
-                            ps_active = pen_scale_np[active]
-                            sp_active = solver_pen_np[active]
-                            r_active  = radial_np[active]
-                            cslc_diag_str = (
-                                f"  [n_active={n_active_p0}+{n_active_p1} "
-                                f"k_mean={k_active.mean():7.1f} "
-                                f"k_min={k_active.min():6.1f} "
-                                f"k_max={k_active.max():6.1f} "
-                                f"ps_mean={ps_active.mean():.3f} "
-                                f"solver_pen_mean={sp_active.mean()*1e3:.2f}mm "
-                                f"radial_max={r_active.max()*1e3:.2f}mm]"
-                            )
-                        else:
-                            cslc_diag_str = (
-                                f"  [DIAG SIZE MISMATCH "
-                                f"kstiff={len(kstiff)} pen_scale={len(pen_scale_np)}]"
-                            )
 
             _log(f"[{phase:8s}] step={self.sim_step:5d}  "
                  f"sz={sphere_z:+.4f} pz={pad_z:+.4f} Δz={delta_z*1e3:+6.2f}mm  "
                  f"vz_s={vz_sphere:+.4f} vz_p={vz_pad:+.4f} "
                  f"az_s={az_sphere:+6.2f}m/s²  "
-                 f"F_c={F_contact_z_sphere:+6.2f}N "
-                 f"(W={weight_N:.2f}N)  "
-                 f"n={self.current_contacts}{cslc_str}{cslc_diag_str}")
+                 f"F_c={F_contact_z:+6.2f}N (W={weight_N:.2f}N)  "
+                 f"n={self.current_contacts}{cslc_str}")
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
@@ -886,28 +960,20 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument("--contact-model", type=str, default="cslc",
-                            choices=["point", "cslc"])
+                            choices=["point", "cslc", "hydro"])
+        parser.add_argument("--contact-models", type=str, default=None,
+                            help="Comma-separated list for headless mode "
+                                 "(e.g. 'point,cslc,hydro').")
         parser.add_argument("--solver", type=str, default="mujoco",
                             choices=["mujoco", "semi"])
         parser.add_argument("--mode", type=str, default="viewer",
                             choices=["viewer", "headless"])
-        # Decoupling flags for diagnosing the LIFT launch.
-        #   --no-ground      : drop the ground plane entirely.  Eliminates
-        #                      the elastic-rebound hypothesis (ground stores
-        #                      PE during squeeze, releases it at liftoff).
-        #   --start-gripped  : skip APPROACH and SQUEEZE; start at the
-        #                      squeeze-end config with pads already in grip
-        #                      and sphere suspended in air.  Together with
-        #                      --no-ground this isolates pure LIFT dynamics
-        #                      from any ground-contact transient.
         parser.add_argument("--no-ground", action="store_true",
-                            help="Skip add_ground_plane(); remove ground confounder.")
+                            help="Skip ground plane.")
         parser.add_argument("--start-gripped", action="store_true",
-                            help="Pads start at squeeze-end dx, skip APPROACH+SQUEEZE.")
+                            help="Skip APPROACH+SQUEEZE; start at squeeze-end position.")
         parser.add_argument("--warm-start-sphere-vz", action="store_true",
-                            help="Initialize sphere vz = lift_speed at t=0 (eliminates "
-                                 "v_rel → tests whether friction overshoot is the "
-                                 "overshoot mechanism).")
+                            help="Init sphere vz = lift_speed at t=0.")
         return parser
 
 
@@ -926,13 +992,17 @@ def main():
     else:
         args = parser.parse_args()
         sn = args.solver if HAS_MUJOCO or args.solver != "mujoco" else "semi"
+        cm_arg = getattr(args, "contact_models", None)
+        cm_list = [c.strip() for c in cm_arg.split(",") if c.strip()] if cm_arg else None
         test_headless(
             SceneParams(
                 no_ground=getattr(args, "no_ground", False),
                 start_gripped=getattr(args, "start_gripped", False),
-                warm_start_sphere_vz=getattr(args, "warm_start_sphere_vz", False),
+                warm_start_sphere_vz=getattr(
+                    args, "warm_start_sphere_vz", False),
             ),
             sn,
+            contact_models=cm_list,
         )
 
 

@@ -195,6 +195,14 @@ def write_cslc_contacts(
     out_margin0: wp.array(dtype=wp.float32),
     out_margin1: wp.array(dtype=wp.float32),
     out_tids: wp.array(dtype=wp.int32),
+    # shape_material_mu: no longer read inside this kernel (2026-04-19).
+    # Previously used as out_friction = mu (the pad shape's friction coefficient),
+    # which caused a double-count: the MuJoCo conversion kernel multiplies
+    # rigid_contact_friction onto the geom pair base friction (already = mu),
+    # giving effective_mu = mu * mu = mu^2 instead of mu.
+    # The fix writes out_friction = 1.0 (no scale), so geom friction is used as-is.
+    # This parameter is kept in the signature to avoid breaking the handler call;
+    # remove it from both here and cslc_handler.py in a future cleanup.
     shape_material_mu: wp.array(dtype=wp.float32),
     cslc_kc: float,
     cslc_dc: float,
@@ -357,7 +365,23 @@ def write_cslc_contacts(
     out_tids[buf_idx]      = 0
 
     out_stiffness[buf_idx] = cslc_kc * pen_scale
-    out_damping[buf_idx]   = cslc_dc * pen_scale
-    out_friction[buf_idx]  = shape_material_mu[s_idx]
+    # DAMPING BUG (2026-04-19):
+    # cslc_dc=2.0 N·s/m is calibrated for Newton's semi-implicit solver.
+    # In the MuJoCo conversion kernel, kd>0 triggers timeconst = 2/kd = 1.0s,
+    # making both normal AND friction constraints 250× softer than standard
+    # contacts (timeconst=0.004s for ke=50000, kd=500). This soft friction
+    # timeconst causes excessive Coulomb creep in the HOLD phase.
+    # FIX: write 0.0 → uses kd=0 branch → timeconst = sqrt(imp/ke) ≈ 0.030s.
+    # Normal force is unchanged by design of the stiffness fix; only friction
+    # stiffness improves (33× stiffer timeconst). cslc_dc retained in signature.
+    out_damping[buf_idx]   = 0.0
+    # FRICTION BUG FIX (2026-04-19):
+    # The MuJoCo conversion kernel (kernels.py) treats rigid_contact_friction as a
+    # SCALE FACTOR multiplied onto the geom pair's base friction:
+    #   effective_mu = geom_friction_max × rigid_contact_friction
+    # The geom pair base friction is max(mu_pad, mu_sphere) = mu (from shape materials).
+    # ORIGINAL: out_friction = shape_material_mu → effective_mu = mu × mu = mu² (WRONG!)
+    # FIX:      out_friction = 1.0              → effective_mu = mu × 1.0 = mu (CORRECT)
+    out_friction[buf_idx]  = 1.0
 
     debug_reason[slot] = 0

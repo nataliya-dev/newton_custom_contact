@@ -271,18 +271,39 @@ def create_pad_for_box_face(
 
 
 def calibrate_kc(
-    ke_bulk: float, pads: list[CSLCPad], *, ka: float, contact_fraction: float = 0.3,
+    ke_bulk: float,
+    pads: list[CSLCPad],
+    *,
+    ka: float,
+    contact_fraction: float = 0.3,
+    per_pad: bool = True,
 ) -> float:
     """Derive per-sphere contact stiffness kc from bulk ke.
 
     At quasistatic equilibrium for uniform flat contact, the Laplacian
     vanishes (all delta equal), so per-sphere: kc*(pen-delta) = ka*delta,
     giving effective stiffness per sphere = kc*ka/(ka+kc).
-    Solving N_contact * kc*ka/(ka+kc) = ke_bulk:
+
+    With per_pad=True (default), each pad's aggregate stiffness at uniform
+    contact equals ke_bulk:
+        N_contact_per_pad * kc*ka/(ka+kc) = ke_bulk
+    This is the fair multi-pad analogue of a single point contact at
+    ke_bulk per pad. With per_pad=False, the calibration sums N across
+    all pads and matches one ke_bulk to that total — appropriate only
+    when ke_bulk is a global "system" stiffness rather than a per-pad
+    material property.
+
+    Solving for kc:
         kc = ke_bulk * ka / (N_contact * ka - ke_bulk)
     """
-    n_surface_total = sum(p.n_surface for p in pads)
-    n_contact = max(int(n_surface_total * contact_fraction), 1)
+    if per_pad:
+        # Average n_surface across pads — assumes pads are roughly uniform
+        # in size. For mixed pad sizes, promote to per-shape kc storage
+        # in CSLCData (see TODOs in cslc_v1/convo_april_19.md).
+        n_surface = int(np.mean([p.n_surface for p in pads]))
+    else:
+        n_surface = sum(p.n_surface for p in pads)
+    n_contact = max(int(n_surface * contact_fraction), 1)
     denom = n_contact * ka - ke_bulk
     if denom <= 0.0:
         return ke_bulk / max(n_contact, 1)

@@ -369,21 +369,44 @@ def convert_newton_contacts_to_mjwarp_kernel(
         )
 
         # Convert Newton per-contact stiffness/damping to MuJoCo solref
-        # (timeconst, dampratio).  solimp is set to approximate a linear
-        # force-displacement relationship at rest, compensating for impedance
-        # scaling.  See https://mujoco.readthedocs.io/en/latest/modeling.html#solver-parameters
+        # (timeconst, dampratio).
+        #
+        # ORIGINAL FORMULA (2026-04-18, WRONG — preserved here as trail):
+        #   imp = solimp[1]                          # max impedance (~0.95)
+        #   contact_ke *= (1.0 - imp)                # scale DOWN by ~0.05
+        #   timeconst = sqrt(1.0 / contact_ke)       # ke_ref = ke*(1-imp)
+        #   dampratio = sqrt(1.0 / (tc² * contact_ke))
+        #   → F = imp × ke_ref × pen = imp*(1-imp)*ke*pen ≈ 0.047*ke*pen  (21× too low)
+        #
+        # WHY IT WAS WRONG:
+        #   MuJoCo force law: F = imp × ke_ref × pen, ke_ref = 1/(tc²·damp²).
+        #   The original intent was "compensate for impedance scaling" but
+        #   multiplying ke by (1-imp) before computing tc gives:
+        #     ke_ref = ke*(1-imp), F = imp*(1-imp)*ke*pen  ← not ke*pen.
+        #   For imp=0.95: F ≈ 0.047*ke*pen instead of ke*pen.
+        #   This caused the sphere to fall in CSLC lift/squeeze tests because
+        #   CSLC contact forces were 21× weaker than the calibrated values.
+        #
+        # FIXED FORMULA (2026-04-19):
+        #   To get F = contact_ke × pen exactly, we need ke_ref = ke/imp.
+        #   Since ke_ref = 1/(tc²·damp²):
+        #     kd=0: tc = sqrt(imp/ke)  → ke_ref = ke/imp, F = imp*(ke/imp) = ke ✓
+        #     kd>0: tc = 2/kd (unchanged), damp = sqrt(imp/(tc²*ke)) ✓
+        #   solimp is flattened to constant imp so the impedance does not vary
+        #   with penetration depth, giving the linear force law the calibration
+        #   assumes.
+        # See https://mujoco.readthedocs.io/en/latest/modeling.html#solver-parameters
         if rigid_contact_stiffness:
             contact_ke = rigid_contact_stiffness[tid]
             if contact_ke > 0.0:
                 imp = solimp[1]
                 solimp = vec5(imp, imp, 0.001, 1.0, 0.5)
-                contact_ke = contact_ke * (1.0 - imp)
                 kd = rigid_contact_damping[tid]
                 if kd > 0.0:
                     timeconst = 2.0 / kd
-                    dampratio = wp.sqrt(1.0 / (timeconst * timeconst * contact_ke))
+                    dampratio = wp.sqrt(imp / (timeconst * timeconst * contact_ke))
                 else:
-                    timeconst = wp.sqrt(1.0 / contact_ke)
+                    timeconst = wp.sqrt(imp / contact_ke)
                     dampratio = 1.0
                 solref = wp.vec2(timeconst, dampratio)
 
