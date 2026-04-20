@@ -211,7 +211,10 @@ where $[\cdot]_+ = \max(\cdot,0)$. Contact is active when
 $\phi_{ij} > 0$. Writing the effective penetration in this form makes
 explicit that the compliant skin acts in series with the contact
 penalty: as $\delta_i$ grows, $\phi_{ij}$ decays toward zero, giving a
-stable series response between the anchor and contact springs.
+stable series response between the anchor and contact springs. To
+preserve end-to-end differentiability of the contact force, every
+positive-part clamp in this section is realised through a $C^\infty$
+smooth surrogate formally introduced in~\cref{sec:smoothing}.
 
 The normal force follows the Hunt--Crossley model
 \cite{hunt1975coefficient}, which ensures the force smoothly goes to zero
@@ -330,6 +333,102 @@ are computed independently, and damped Jacobi updates all compressions
 simultaneously rather than sequentially, mapping naturally to GPU
 hardware so that the solver can meet the strict timing requirements of
 real-time control.
+
+\subsection{Differentiable Smoothing}
+\label{sec:smoothing}
+
+Several gates introduced in \cref{sec:solver} are intrinsically
+non-differentiable: the effective-penetration clamp
+$[\phi_{ij}^{\text{rest}} - \delta_i]_+$ in~\cref{eq:pen}, the
+non-negativity constraint $\delta_i \geq 0$ of~\cref{eq:sphere_pos},
+and the active-contact gate implicit in the right-hand side
+of~\cref{eq:qstatic}. A naive implementation of these operators would
+preclude end-to-end gradient propagation through the contact dynamics, a
+property our model requires for trajectory optimisation, differentiable
+MPC, and gradient-based policy learning.
+
+We therefore replace each non-differentiable operator with a $C^\infty$
+surrogate parameterised by a single scalar smoothing width
+$\varepsilon > 0$. Define
+\begin{align}
+  \sigma_\varepsilon(x)
+      &= \tfrac{1}{2}\bigl(x + \sqrt{x^{2} + \varepsilon^{2}}\bigr),
+      \label{eq:smooth_relu} \\
+  \Sigma_\varepsilon(x)
+      &= \tfrac{1}{2}\!\left(1 + \frac{x}{\sqrt{x^{2}+\varepsilon^{2}}}\right),
+      \label{eq:smooth_step}
+\end{align}
+where $\sigma_\varepsilon$ approximates the positive-part clamp and
+$\Sigma_\varepsilon$ the Heaviside step. Both are infinitely
+differentiable for $\varepsilon > 0$ and recover their hard-thresholded
+counterparts uniformly as $\varepsilon \to 0$, with the pointwise bound
+$|\sigma_\varepsilon(x) - [x]_+| \leq \varepsilon/2$ for all $x$. The
+surrogates preserve the sign invariants critical to the model,
+$\sigma_\varepsilon(x) \geq 0$ and $\Sigma_\varepsilon(x) \in [0,1]$,
+and satisfy the identity
+$\mathrm{d}\sigma_\varepsilon/\mathrm{d}x = \Sigma_\varepsilon$, so a
+single pair of surrogates suffices to smooth both the clamp and its
+derivative.
+
+With these surrogates in place, the effective-penetration
+equation~\cref{eq:pen} becomes
+\begin{equation}
+  \phi_{ij}
+    = \sigma_\varepsilon\!\bigl(\phi_{ij}^{\text{rest}} - \delta_i\bigr)
+      \cdot \Sigma_\varepsilon\!\bigl(d_{ij}^{\text{proj}}\bigr),
+  \label{eq:pen_smooth}
+\end{equation}
+where $d_{ij}^{\text{proj}} = (\mathbf{p}_j^{\text{obj}} - \mathbf{p}_i)
+\cdot \hat{\mathbf{n}}_i$ is the signed projection of the pair offset
+onto the surface normal. The $\Sigma_\varepsilon$ factor smoothly
+deactivates contacts lying behind the face, completing the contact-active
+gate in a single expression. The non-negativity projection of
+$\delta_i$ is enforced by $\delta_i \leftarrow \sigma_\varepsilon(\delta_i)$, and the active-contact indicator in~\cref{eq:qstatic} is
+replaced by $\Sigma_\varepsilon(\phi_i^{\text{rest}} - \delta_i)$:
+\begin{equation}
+  \bigl[\mathbf{K} + k_c\,\mathrm{diag}\!\bigl(\Sigma_\varepsilon(\boldsymbol{\phi}^{\text{rest}} - \boldsymbol{\delta})\bigr)\bigr]\,
+    \boldsymbol{\delta}
+  = k_c\,\mathrm{diag}\!\bigl(\Sigma_\varepsilon(\boldsymbol{\phi}^{\text{rest}} - \boldsymbol{\delta})\bigr)\,\boldsymbol{\phi}^{\text{rest}}.
+  \label{eq:qstatic_smooth}
+\end{equation}
+The augmented system matrix remains symmetric positive definite for
+$k_a > 0$ because $\Sigma_\varepsilon \geq 0$, so the convergence
+properties of the damped Jacobi solver established
+in~\cref{sec:solver} are preserved. The regularised Coulomb
+friction~\cref{eq:friction} is already $C^\infty$ for
+$\varepsilon > 0$.
+
+The contact force $f_{n,ij}$ returned
+to~\cref{eq:wrench} inherits this regularity: the normal force
+\begin{equation}
+  f_{n,ij} = k_c\,\sigma_\varepsilon(\phi_{ij}^{\text{rest}} - \delta_i)
+             \,\Sigma_\varepsilon(d_{ij}^{\text{proj}})
+  \label{eq:normal_smooth}
+\end{equation}
+is the composition of $C^\infty$ operators of the rigid-body pose, so
+the aggregate wrench is $C^\infty$ in pose as well. The sign of the
+contact-active indicator is preserved across the
+$\mathrm{dist} = d_{ij}^{\text{proj}}$ surface by the sign-preserving
+smooth reciprocal $x/y \approx x\cdot y\,/\,(y^2 + \varepsilon^2)$ used
+wherever the forward pass requires the ratio of two simultaneously-zero
+quantities along the surface normal; this is the standard
+$C^\infty$ treatment of a $0/0$ limit that preserves
+sign rather than magnitude.
+
+We adopt $\varepsilon = 10^{-5}\,\text{m}$ as a default. At this setting
+the gate is effectively binary for penetrations above
+$0.1\,\text{mm}$ ($|\Sigma_\varepsilon - 1| < 10^{-9}$) while preserving
+$C^\infty$ behaviour through the threshold; reducing $\varepsilon$ by a
+further order of magnitude shifts the steady-state equilibrium by less
+than $\varepsilon/2$, which is below the precision of the rigid-body
+solver step. Because every operation in~\crefrange{eq:pen_smooth}{eq:normal_smooth}---including the closed-form
+equilibrium
+$\boldsymbol{\delta} = k_c\,\bigl(\mathbf{K} + k_c\,\mathbf{I}\bigr)^{-1}\,\boldsymbol{\phi}^{\text{rest}}$
+obtained in the saturated-active-contact limit---is
+$C^\infty$, gradients of the contact state with respect to rigid-body
+pose propagate through a single forward pass and are recovered by
+reverse-mode automatic differentiation at cost comparable to the
+forward solve.
 
 \subsection{Rigid Body Dynamics}
 

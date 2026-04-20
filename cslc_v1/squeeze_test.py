@@ -241,10 +241,42 @@ class Metrics:
     cslc_max_delta: list[float] = field(default_factory=list)
     cslc_active_surface: list[int] = field(default_factory=list)
     cslc_max_pen: list[float] = field(default_factory=list)
+    n_squeeze_steps: int = 0
+    dt: float = 0.0
 
     @property
     def z_drop_mm(self):
         return (self.sphere_z[0] - min(self.sphere_z)) * 1e3 if len(self.sphere_z) >= 2 else 0.0
+
+    @property
+    def hold_drop_mm(self):
+        """z position at HOLD start minus z at end. Positive = sphere fell during HOLD.
+
+        This metric isolates the compliance creep from the squeeze transient.
+        Hydroelastic pushes the sphere UP during SQUEEZE (asymmetric 15 mm pressure
+        field), so `z_drop_mm` based on global min is confounded — `hold_drop_mm`
+        strips out the transient and measures only what matters for grip quality.
+        """
+        if self.n_squeeze_steps >= len(self.sphere_z):
+            return 0.0
+        return (self.sphere_z[self.n_squeeze_steps] - self.sphere_z[-1]) * 1e3
+
+    @property
+    def hold_creep_rate_mm_per_s(self):
+        """Mean downward velocity during the last half of HOLD (steady state).
+
+        Uses the second half of the HOLD phase to avoid the squeeze→hold
+        transient. Positive = falling.
+        """
+        if self.dt <= 0 or len(self.sphere_z) <= self.n_squeeze_steps + 2:
+            return 0.0
+        hold = self.sphere_z[self.n_squeeze_steps:]
+        mid = len(hold) // 2
+        if len(hold) - mid < 2:
+            return 0.0
+        delta_z = hold[mid] - hold[-1]
+        delta_t = (len(hold) - 1 - mid) * self.dt
+        return (delta_z / delta_t) * 1e3 if delta_t > 0 else 0.0
 
     @property
     def peak_contacts(self):
@@ -805,7 +837,7 @@ def run_squeeze(name, model, solver, p, verbose=1):
     NOTE: body_qd is stale under MuJoCo GPU solver. Velocity and force are
     derived from position history (met.sphere_z) using finite differences.
     """
-    met = Metrics(name=name)
+    met = Metrics(name=name, n_squeeze_steps=p.n_squeeze_steps, dt=p.dt)
     s0 = model.state()
     s1 = model.state()
     ctrl = model.control()
@@ -919,7 +951,10 @@ def test_squeeze(p, solver_name="mujoco", contact_models=None):
         m = run_squeeze(label, model, solver, p, verbose=1)
         results.append(m)
         _log(
-            f"RESULT: z-drop={m.z_drop_mm:.3f}mm  peak_contacts={m.peak_contacts}")
+            f"RESULT: z-drop(full)={m.z_drop_mm:.3f}mm  "
+            f"hold-drop={m.hold_drop_mm:+.3f}mm  "
+            f"creep-rate={m.hold_creep_rate_mm_per_s:+.3f}mm/s  "
+            f"peak_contacts={m.peak_contacts}")
     return results
 
 
@@ -1247,11 +1282,13 @@ def main():
         all_res.extend(test_squeeze(p, sn, contact_models=cm_list))
 
     if all_res:
-        save_results(all_res, "cslc_results.csv")
         _section("SUMMARY")
-        print(f"  {'Config':<30} {'Z-drop':>8} {'Contacts':>10}")
+        print(f"  {'Config':<30} {'FullDrop':>10} {'HoldDrop':>10} {'Creep':>10} {'Contacts':>10}")
+        print(f"  {'':<30} {'[mm]':>10} {'[mm]':>10} {'[mm/s]':>10}")
         for m in all_res:
-            print(f"  {m.name:<30} {m.z_drop_mm:8.2f} {m.peak_contacts:10d}")
+            print(f"  {m.name:<30} {m.z_drop_mm:10.3f} "
+                  f"{m.hold_drop_mm:+10.3f} {m.hold_creep_rate_mm_per_s:+10.3f} "
+                  f"{m.peak_contacts:10d}")
         print(f"{_DSEP}")
 
 

@@ -735,8 +735,9 @@ def make_solver(model, solver_name, p: SceneParams):
                 interior = max(nx-2, 0)*max(ny-2, 0)*max(nz-2, 0)
                 ncon += nx*ny*nz - interior
         return SolverMuJoCo(model, use_mujoco_contacts=False,
-                            solver="newton", integrator="implicitfast",
-                            iterations=100, ls_iterations=50,
+                            solver="cg", integrator="implicitfast",
+                            cone="elliptic",
+                            iterations=100, ls_iterations=10,
                             njmax=ncon, nconmax=ncon)
     elif solver_name == "semi":
         return SolverSemiImplicit(model)
@@ -746,18 +747,37 @@ def make_solver(model, solver_name, p: SceneParams):
 # ── Headless runner ───────────────────────────────────────────────────────
 
 def run_headless(name, model, solver, p, dof_map, verbose=True):
+    import time as _time
     met = Metrics(name=name)
     s0, s1 = model.state(), model.state()
     ctrl, con = model.control(), model.contacts()
     newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
     is_cslc = "cslc" in name.lower()
 
+    # Warm-up pass: compile kernels + prime the CG solver so the timed
+    # loop measures steady-state compute cost, not one-off JIT overhead.
+    set_pad_targets(ctrl, 0, p, dof_map)
+    s0.clear_forces()
+    model.collide(s0, con)
+    solver.step(s0, s1, ctrl, con, p.dt)
+    wp.synchronize()
+
+    _time_start = _time.perf_counter()
+    _time_collide = 0.0
+    _time_step = 0.0
+
     for step in range(p.total_steps):
         set_pad_targets(ctrl, step, p, dof_map)
         s0.clear_forces()
+        _t0 = _time.perf_counter()
         model.collide(s0, con)
+        wp.synchronize()
+        _t1 = _time.perf_counter()
         solver.step(s0, s1, ctrl, con, p.dt)
         wp.synchronize()
+        _t2 = _time.perf_counter()
+        _time_collide += _t1 - _t0
+        _time_step += _t2 - _t1
 
         q = s1.body_q.numpy()
         sz = float(q[SPHERE_BODY, 2])
@@ -776,6 +796,18 @@ def run_headless(name, model, solver, p, dof_map, verbose=True):
                 if ci:
                     line += f"  cslc={ci['n_active']}/{ci['n_surface']}"
             print(line)
+
+    _wall = _time.perf_counter() - _time_start
+    per_step_ms = 1000.0 * _wall / p.total_steps
+    collide_ms = 1000.0 * _time_collide / p.total_steps
+    step_ms = 1000.0 * _time_step / p.total_steps
+    rtx = p.total_steps * p.dt / _wall
+    print(
+        f"  TIMING {name:16s}  wall={_wall:.3f}s  "
+        f"per-step={per_step_ms:.3f}ms  "
+        f"(collide={collide_ms:.3f}ms + step={step_ms:.3f}ms)  "
+        f"realtime×={rtx:.2f}"
+    )
 
     return met
 
@@ -974,6 +1006,12 @@ class Example:
                             help="Skip APPROACH+SQUEEZE; start at squeeze-end position.")
         parser.add_argument("--warm-start-sphere-vz", action="store_true",
                             help="Init sphere vz = lift_speed at t=0.")
+        parser.add_argument("--cslc-ka", type=float, default=None,
+                            help="Override CSLC anchor stiffness ka [N/m].")
+        parser.add_argument("--cslc-contact-fraction", type=float, default=None,
+                            help="Override CSLC contact fraction for kc recalibration.")
+        parser.add_argument("--kh", type=float, default=None,
+                            help="Override hydroelastic modulus [Pa].")
         return parser
 
 
@@ -994,16 +1032,18 @@ def main():
         sn = args.solver if HAS_MUJOCO or args.solver != "mujoco" else "semi"
         cm_arg = getattr(args, "contact_models", None)
         cm_list = [c.strip() for c in cm_arg.split(",") if c.strip()] if cm_arg else None
-        test_headless(
-            SceneParams(
-                no_ground=getattr(args, "no_ground", False),
-                start_gripped=getattr(args, "start_gripped", False),
-                warm_start_sphere_vz=getattr(
-                    args, "warm_start_sphere_vz", False),
-            ),
-            sn,
-            contact_models=cm_list,
+        scene_kwargs = dict(
+            no_ground=getattr(args, "no_ground", False),
+            start_gripped=getattr(args, "start_gripped", False),
+            warm_start_sphere_vz=getattr(args, "warm_start_sphere_vz", False),
         )
+        if getattr(args, "cslc_ka", None) is not None:
+            scene_kwargs["cslc_ka"] = float(args.cslc_ka)
+        if getattr(args, "cslc_contact_fraction", None) is not None:
+            scene_kwargs["cslc_contact_fraction"] = float(args.cslc_contact_fraction)
+        if getattr(args, "kh", None) is not None:
+            scene_kwargs["kh"] = float(args.kh)
+        test_headless(SceneParams(**scene_kwargs), sn, contact_models=cm_list)
 
 
 if __name__ == "__main__":

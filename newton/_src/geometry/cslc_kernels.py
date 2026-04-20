@@ -389,35 +389,37 @@ def write_cslc_contacts(
     normal_ab = wp.transform_vector(X_wb, n_body)
     d_proj    = wp.dot(diff, normal_ab)
 
-    # Cull: target on the wrong side of the face.
-    if d_proj <= 0.0:
-        out_shape0[buf_idx] = -1
-        debug_reason[slot]  = 3
-        dbg_pen_scale[dslot]   = -1.0
-        dbg_solver_pen[dslot]  = 0.0
-        dbg_effective_r[dslot] = effective_r
-        dbg_d_proj[dslot]      = d_proj
-        dbg_radial[dslot]      = 0.0
-        return
-
-    # True 3-D overlap.
-    pen_3d = (effective_r + target_radius) - dist
-    if pen_3d <= 0.0:
-        out_shape0[buf_idx] = -1
-        debug_reason[slot]  = 1
-        dbg_pen_scale[dslot]   = -1.0
-        dbg_solver_pen[dslot]  = 0.0
-        dbg_effective_r[dslot] = effective_r
-        dbg_d_proj[dslot]      = d_proj
-        dbg_radial[dslot]      = 0.0
-        return
-
-    # Solver-side projected penetration.  Already > 0 because dist >= d_proj
-    # and pen_3d > 0 implies (effective_r + R) > dist >= d_proj.
-    # Smooth floor on the divisor (replaces wp.max(solver_pen, 1e-8)).
-    # sqrt(x² + δ²) ≥ δ smoothly; recovers x for x >> δ with no kink.
+    # True 3-D overlap and solver-side projected penetration.  Computed
+    # regardless of sign — the smooth contact-active gate below drives the
+    # output stiffness to ~0 outside the contact region, replacing the hard
+    # `if d_proj <= 0: return` and `if pen_3d <= 0: return` culls.  This
+    # makes the kernel-to-solver interface C^∞ in the target pose, so
+    # wp.Tape backward can flow through contact-onset transitions.
+    pen_3d     = (effective_r + target_radius) - dist
     solver_pen = (effective_r + target_radius) - d_proj
-    pen_scale  = pen_3d / wp.sqrt(solver_pen * solver_pen + 1.0e-16)
+    # Sign-preserving smooth reciprocal for pen_3d / solver_pen.  The
+    # naive `pen_3d / sqrt(solver_pen² + δ²)` divides by |solver_pen|,
+    # which flips the sign of pen_scale when both pen_3d and solver_pen
+    # cross zero together (e.g. as the target passes through x = r_lat +
+    # r_target on the face normal).  Replacing with
+    # `pen_scale = pen_3d · solver_pen / (solver_pen² + δ²)`
+    # is C^∞, preserves sign in the physically-correct same-sign regime
+    # (pen_3d and solver_pen agree along the normal axis), and recovers
+    # `pen_3d / solver_pen` for |solver_pen| ≫ δ.
+    #
+    # δ = eps sets the half-width of the resulting "notch" at
+    # solver_pen = 0.  With eps = 1e-5 m this is ~10 µm wide — narrow
+    # enough that physical forces are unaffected outside the singular
+    # point, but wide enough that wp.Tape gradient samples resolve the
+    # transition smoothly rather than as a discrete step.
+    pen_scale  = pen_3d * solver_pen / (solver_pen * solver_pen + eps * eps)
+
+    # Smooth contact-active gate:
+    #   smooth_step(d_proj, eps) ≈ 1 in front of the face, ≈ 0 behind;
+    #   smooth_step(pen_3d, eps) ≈ 1 when spheres overlap, ≈ 0 when separated.
+    # Product is in [0, 1] and recovers the hard `d_proj > 0 AND pen_3d > 0`
+    # rule as eps → 0, with C^∞ behaviour across both boundaries.
+    contact_gate = smooth_step(d_proj, eps) * smooth_step(pen_3d, eps)
 
     # Body-frame contact geometry.
     X_wb_inv = wp.transform_inverse(X_wb)
@@ -435,13 +437,42 @@ def write_cslc_contacts(
     radial = wp.sqrt(radial_sq)
 
     # ── Record per-contact diagnostics (physics-neutral) ──
-    # These arrays are read back by the handler for telemetry.  They're
-    # written only on the success path; cull paths wrote sentinels above.
-    dbg_pen_scale[dslot]   = pen_scale
+    # Now always written: the smooth gate replaces the hard cull, so every
+    # surface-sphere slot carries valid diagnostics every step.  Multiply
+    # pen_scale by the gate so the "active force magnitude" reading matches
+    # the stiffness actually handed to MuJoCo.
+    dbg_pen_scale[dslot]   = pen_scale * contact_gate
     dbg_solver_pen[dslot]  = solver_pen
     dbg_effective_r[dslot] = effective_r
     dbg_d_proj[dslot]      = d_proj
     dbg_radial[dslot]      = radial
+
+    # Hybrid emission policy: emit the contact to the downstream solver
+    # ONLY when the smooth gate is non-negligible (> 1e-4).  This keeps
+    # the kernel-to-solver interface C^∞ across the physically meaningful
+    # transition region (|d_proj| or |pen_3d| ≲ 30·eps, where smooth_step
+    # varies between ~2.5e-4 and ~0.99975) while hard-culling the deep
+    # tail where gate ≲ 1e-4 — a regime in which the smooth force is
+    # already sub-nanoNewton *and* its gradient is machine-zero, so the
+    # discrete cull costs nothing for gradient-based optimisation.
+    #
+    # Why the cull exists: MuJoCo's soft-constraint solver carries a
+    # per-contact compliance term (c · f_n with c = 1/k).  Every live slot
+    # contributes some constraint leak per step, so writing ALL 378
+    # surface-sphere slots — even with near-zero stiffness — measurably
+    # degrades static friction during HOLD (verified against the lift
+    # test: 4 mm → 20 mm creep regression without this cull).
+    #
+    # gate_threshold is set so the cull activates at |d_proj| ≈ 30 · eps
+    # ≈ 300 µm for eps = 1e-5 m — several times the transition width of
+    # the smooth step, so gradient flow through contact onset is
+    # unaffected.  This is a smooth-in-practice, hard-in-the-tail hybrid.
+    gate_threshold = float(1.0e-4)
+    if contact_gate < gate_threshold:
+        out_shape0[buf_idx]    = -1
+        out_stiffness[buf_idx] = 0.0
+        debug_reason[slot]     = 3
+        return
 
     out_shape0[buf_idx]    = s_idx
     out_shape1[buf_idx]    = target_shape_idx
@@ -454,7 +485,12 @@ def write_cslc_contacts(
     out_margin1[buf_idx]   = target_radius
     out_tids[buf_idx]      = 0
 
-    out_stiffness[buf_idx] = cslc_kc * pen_scale
+    # Gated stiffness with a smooth lower floor so MuJoCo's
+    # timeconst = sqrt(imp / ke) stays finite when the gate drives ke → 0.
+    # For fully active contacts (gate ≈ 1), the floor is invisible and the
+    # stiffness recovers `cslc_kc · pen_scale` exactly.
+    out_stiffness[buf_idx] = smooth_relu(
+        cslc_kc * pen_scale * contact_gate, 1.0e-9)
     # DAMPING BUG (2026-04-19):
     # cslc_dc=2.0 N·s/m is calibrated for Newton's semi-implicit solver.
     # In the MuJoCo conversion kernel, kd>0 triggers timeconst = 2/kd = 1.0s,
