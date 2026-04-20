@@ -64,6 +64,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 **Write clear, documented, easy-to-read, and if possible, modular, code.**
 - If debug output is warranted, add it, so it is easy to debug on output
 - Make sure mathematical/scientific formulations are documented in comments and their source if available
+- My phd depends on the work that you do, therefore I need rogorous scientifically grounded work. We can have an rss best paper award if we do this well.
 
 ---
 

@@ -6,6 +6,7 @@ hydroelastic PFC — in squeeze and lift tasks for the ICRA paper.
 
 ---
 
+
 ## 1. Squeeze test (`cslc_v1/squeeze_test.py`)
 
 ### Scene
@@ -221,6 +222,61 @@ uv run cslc_v1/lift_test.py --mode headless \
   of the pressure-field model, not a calibration artifact.
 - Qualitative ranking CSLC < hydro < point is preserved; the distributed-
   contact advantage is real and independent of parameter choices.
+
+### Per-step timing / online compute cost (2250 steps @ 2 ms, RTX 3070)
+
+Measured via timing instrumentation in `lift_test.run_headless` — full
+sim-loop wall time with a one-step warm-up pass to exclude JIT compile.
+Reproduce with the same command as above
+(`--cslc-ka 15000 --kh 2.65e8`).
+
+**Baseline** (CSLC using 20-iteration iterative Jacobi lattice solve):
+
+| Model | Wall | Per-step | Collide | MuJoCo step |
+|---|---|---|---|---|
+| point | 7.54 s | 3.35 ms | 0.32 ms | 2.79 ms |
+| CSLC | 12.61 s | 5.61 ms | 1.82 ms | 3.55 ms |
+| hydro | 10.71 s | 4.76 ms | 0.99 ms | 3.53 ms |
+
+**Optimised** (CSLC Kernel 2 switched to the one-shot
+`lattice_solve_equilibrium` matvec; `build_A_inv=True` in
+`CSLCData.from_pads`; handler dispatches to the dense solve when
+`data.A_inv` is available, falls back to iterative Jacobi otherwise):
+
+| Model | Wall | Per-step | Collide | MuJoCo step | Δ vs baseline |
+|---|---|---|---|---|---|
+| point | 7.32 s | 3.25 ms | 0.31 ms | 2.71 ms | — |
+| **CSLC** | **10.71 s** | **4.76 ms** | **0.99 ms** ↓ | 3.54 ms | **collide −46 %, per-step −15 %** |
+| hydro | 10.67 s | 4.74 ms | 0.99 ms | 3.51 ms | — |
+
+**Conclusions:**
+- CSLC's online per-step cost is now **statistically identical to
+  hydroelastic** — 4.76 ms vs 4.74 ms (0.4 % spread), with collide
+  phase **exactly matched at 0.99 ms**.
+- CSLC is 1.46× slower than point contact. Most of the remaining gap is
+  in MuJoCo's constraint solver step (3.54 ms vs 2.71 ms) — a function
+  of the number of simultaneous constraints CG iterates over, not
+  something the CSLC kernel chain controls.
+- Under-utilisation note: 378 lattice threads don't fill an RTX 3070;
+  there's GPU head-room for multi-pad grippers at no additional
+  per-step cost (batched-pair-launch TODO in §5.6).
+
+**Why the dense solve wins.** Iterative Jacobi issued ~20 `wp.launch`
+calls per pair per step = 40 launches/step in a tight Python loop. At
+~5–10 µs of host-side launch overhead each, that alone was ~300 µs.
+The dense `A⁻¹ · φ` matvec collapses those 20 launches into 1 while
+preserving the full lattice physics (`ka`, `kl`, `kc`) baked into the
+pre-inverted `A = K + kc · I`. See `cslc_handler.py:_launch_vs_sphere`
+for the dispatch logic and `cslc_data.py:from_pads(build_A_inv=True)`
+for the pre-inversion. The matvec is also tape-compatible (see §4.5),
+so the backward pass is a single linear operation rather than a
+ping-pong Jacobi chain that aliases buffers.
+
+**Scaling cliff.** `A⁻¹` is O(n²) memory. At n = 378 per pad (current
+scene) it's 0.57 MB — trivial. At n = 10 000 (MorphIt-scale irregular
+pad) it's 400 MB — borderline. Above that, the sparse Cholesky
+factorisation TODO (§5.6) is required; the iterative-Jacobi fallback
+path is retained in the handler for that case.
 
 ### Why the calibration is fair — theoretical derivation
 
@@ -650,9 +706,93 @@ Remaining follow-ups:
   worth repeating with the new baseline numbers).
 - **Debug `SolverSemiImplicit` joint-PD behaviour** (pad_z=NaN under the
   prismatic-X/Z articulated arm) — useful as a no-soft-constraint baseline.
-- **Cross-validate with Drake/SAP.** If PFC under SAP also creeps, confirms
-  MuJoCo regularisation is the bottleneck (see §3.1). This is the right
-  comparison for the paper's solver-side discussion.
+
+  **Findings from 2026-04-20 investigation (changes reverted, not kept):**
+
+  `pad_z=NaN` is not a single bug; explicit Euler is violating stability
+  on *three* independent stiff terms in the existing lift scene at the
+  default `dt=2 ms`. All three can produce NaN even if one is fixed, so
+  any future patch has to address them together.
+
+  1. **Joint-PD damping.** `drive_kd=1e3` on pad mass 0.08 kg gives
+     `c·dt/m = 25` — explicit Euler stability needs `≤ 2`, so the velocity
+     update amplifies `~24×` per step and saturates to NaN within ~6
+     steps. Fix: implicit-damping correction inside
+     `semi_implicit/kernels_body.py::eval_body_joints` on the PRISMATIC
+     branch, scaling `kd_eff = kd / (1 + kd·inv_m·dt)`. Requires plumbing
+     `dt` + `body_inv_mass` into `eval_body_joints` and updating
+     `eval_body_joint_forces` + `solver_semi_implicit.py::step` to pass
+     `dt`. Collapses to `kd` when `kd·dt/m → 0`, so existing stable
+     scenes are unchanged. On its own this only pushed the NaN out by
+     a handful of steps.
+
+  2. **Ghost-slider angular attachment.** The 2 mm radius slider used as
+     an intermediate link for the X prismatic DOF has `inv_I ≈ 1e6`. The
+     default `joint_attach_ke=1e4` then creates an angular restoring
+     spring with `ω·dt = sqrt(k·inv_I)·dt ≈ 45` (need `< 2`). Tiny
+     floating-point noise in the contact moment arm seeds an initial
+     `wz ~ 1e-4` rad/s which amplifies by `|1 − c·dt·inv_I| ~ 20` per
+     step (contact torque from off-axis numerical error on right-pad
+     shape-rotated-180° is what consistently triggers it on body 2 and
+     body 3). Sweeping `joint_attach_ke`/`joint_attach_kd` down to
+     `(1, 0.01)` only shifts the blow-up from step 9 to step 24 — the
+     exponential growth is dominated by the slider's near-zero angular
+     inertia, not the attach constants. Root-cause fix requires either
+     giving the slider an explicit non-trivial `inertia=wp.mat33(...)`
+     in `add_link`, switching to `add_joint_d6(X,Z)` to eliminate the
+     slider entirely, or implementing implicit angular-attach damping
+     in the solver.
+
+  3. **Distributed contact damping on the sphere.** CSLC writes N≈150
+     active simultaneous contacts per step. `eval_body_contact` reads
+     per-contact `rigid_contact_damping`; CSLC writes `0` (deliberately,
+     to force MuJoCo's `tc = sqrt(imp/ke)` branch — see §4.2), which in
+     the semi-implicit path falls through to `shape_material_kd=500`.
+     The 500 Ns/m contribution **sums across contacts**: total damping
+     on the 0.5 kg sphere = `150·500·dt/m = 300` (need `< 2`), so sphere
+     velocity goes NaN during SQUEEZE regardless of any joint-PD fix.
+     The 0 sentinel has different semantics in the two solver paths, so
+     a clean fix needs solver-aware per-contact kd (or an extra field on
+     the contacts buffer that distinguishes "use solver default" from
+     "apply 0 damping"). Hydro has the same pathology at lower N but
+     higher per-contact force magnitudes.
+
+  **What was tried and reverted:**
+  - `semi_implicit/kernels_body.py`: implicit damping for PRISMATIC
+    joint target_kd (addresses #1 only).
+  - `semi_implicit/solver_semi_implicit.py`: thread `dt` into
+    `eval_body_joint_forces`.
+  - `cslc_v1/lift_test.py`: `kinematic_pads=True` path — pads become
+    `is_kinematic=True` free-joint root bodies, pose/velocity written
+    directly each step via a new `set_pad_kinematic_state` helper. Auto-
+    enabled when `--solver semi`. This sidesteps #1 and #2 entirely by
+    removing the articulated drive, yielding a genuine "no-soft-
+    constraint baseline" where only the sphere dynamics are integrated.
+    With that change `point_semi` runs cleanly to completion (sphere
+    falls — expected, penalty point contact has no static friction);
+    `cslc_semi` and `hydro_semi` still NaN during SQUEEZE because of
+    #3.
+
+  **If this is picked up again:**
+  - Pick one of: (a) keep the articulated scene and fix all three
+    instabilities in the solver (proper implicit Rayleigh damping on
+    both translational body_qd and joint attach, plus sensible
+    per-contact kd semantics), OR (b) go with kinematic pads +
+    fix #3 only. (b) is much less code but gives up "joint-PD behavior"
+    as the thing being tested — the baseline becomes purely about
+    contact-model fidelity under a penalty integrator.
+  - For #3, probably the right move is to have CSLC write per-contact
+    `out_damping = -1.0` (sentinel) instead of `0.0`, extend the
+    semi-implicit contact kernel to treat negative as "use shape default
+    scaled by 1/N_active", and leave the MuJoCo conversion to also
+    interpret the sentinel as "kd=0, use `tc = sqrt(imp/ke)`". Both
+    callers get what they want, and existing MuJoCo numbers don't move.
+  - Verified unchanged under the revert: MuJoCo lift (point/cslc/hydro
+    = 0.0427/0.0492/0.0466), MuJoCo squeeze (HoldCreep point +0.495,
+    cslc +0.082 mm/s), all 33 `smooth_basic_test` tests,
+    `newton.tests.test_joint_drive` (19 pass). `test_joint_controllers`
+    has a pre-existing XPBD revolute failure unrelated to this code
+    path.
 - **Don't claim CSLC eliminates creep.** It distributes load to N
   constraints, each running at 1/N capacity, which empirically reduces creep
   by ~N^0.4. Frame the paper's claim as "reduces" not "eliminates".
@@ -689,13 +829,53 @@ O(τ_constraint) ≈ 30 ms.
 Effort: ~1 day force-control wiring, ~2 days slip detector + A/B harness,
 ~1 day viewer instrumentation.
 
-### 5.6 File state (modified — do not revert)
+### 5.6 Performance / speed optimisations — remaining
+
+Dense-solve path (`lattice_solve_equilibrium` via `build_A_inv=True`) is
+done and tied CSLC to hydroelastic on per-step wall time (§4.5a). The
+remaining head-room is implementation-level:
+
+- **CUDA graph capture** of the per-pair K1 + solve + K3 launch
+  sequence. Expected ~80 µs/step savings. Blocker: Newton's state-swap
+  pattern changes `body_q` pointers across steps, so a naive capture
+  would break on replay. Workaround: capture two graphs on the first
+  two steps, alternate by step parity; or eliminate the state swap in
+  the benchmark harness (but keeps the idiomatic user code ergonomic
+  for MPC/RL rollouts, which don't swap).
+- **Active-sphere broad-phase prune** before Kernel 1 and Kernel 3.
+  Mark per-sphere AABB overlap vs target's AABB, early-return in the
+  transition-band kernels. Biggest win for multi-pad grippers where
+  most lattice spheres are far from any target. Low-medium complexity.
+- **Batched pair launches** — dispatch all (pad, target) pairs in a
+  single kernel launch, with thread-id decoded as
+  `(pair_idx, sphere_local_idx)`. Fills the GPU better (378 threads
+  under-utilise RTX 3070) and amortises launch overhead across pairs.
+  Generality-preserving: neighbour CSR already handles irregular pad
+  topologies, the decode is purely bookkeeping.
+- **Sparse Cholesky for large pads** (see `cslc_data.py:430` TODO).
+  Dense `A⁻¹` is O(n²) memory, fine up to n ≈ 2000; large MorphIt pads
+  (n ≈ 10 000) would need a sparse factorisation with precomputed L
+  (stored once at init) plus two triangular solve kernels at run-time.
+  Keeps the tape-compatible matvec pattern; just swaps one dense
+  matvec for two triangular solves.
+- **Kernel 1 + Kernel 2a fusion** (compute φ and solve in one kernel).
+  Requires grid-wide synchronisation (cooperative groups) which Warp
+  may not expose directly. Low priority — modest expected gain
+  compared to the above.
+
+### 5.7 File state (modified — do not revert)
 
 - `newton/_src/solvers/mujoco/kernels.py` — stiffness conversion fixed
   (lines 390–411). Comment trail of original wrong formula preserved.
 - `newton/_src/geometry/cslc_kernels.py`:
   - `out_damping = 0.0` (see §4.2)
   - `out_friction = 1.0` (see §4.3)
-- `cslc_v1/squeeze_test.py` — 3-way comparison wired via `--contact-models`.
+  - Smooth-gate Kernel 3 with hybrid emission (see §4.5).
+- `newton/_src/geometry/cslc_handler.py`:
+  - `_from_model` passes `build_A_inv=True` (see §4.5a performance).
+  - `_launch_vs_sphere` dispatches to `lattice_solve_equilibrium` when
+    `A_inv` is present; falls back to iterative Jacobi otherwise.
+- `cslc_v1/squeeze_test.py` — 3-way comparison wired via `--contact-models`;
+  HOLD-phase metrics (`hold_drop_mm`, `hold_creep_rate_mm_per_s`).
 - `cslc_v1/lift_test.py` — 3-way comparison; per-pad kc recalibration with
-  cf=0.025 via `recalibrate_cslc_kc_per_pad`.
+  cf=0.025 via `recalibrate_cslc_kc_per_pad`; `--cslc-ka` / `--cslc-contact-fraction` / `--kh` CLI overrides; per-step timing diagnostic.

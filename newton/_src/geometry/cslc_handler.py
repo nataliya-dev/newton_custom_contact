@@ -23,6 +23,7 @@ from .cslc_data import CSLCData, CSLCPad, calibrate_kc, create_pad_for_box, crea
 from .cslc_kernels import (
     compute_cslc_penetration_sphere,
     jacobi_step,
+    lattice_solve_equilibrium,
     write_cslc_contacts,
 )
 
@@ -272,7 +273,17 @@ class CSLCHandler:
 
 
 
-        cslc_data = CSLCData.from_pads(pads, ka=ka, kl=kl, kc=kc, dc=dc, device=model.device)
+        # build_A_inv=True: precompute the dense inverse of the lattice
+        # system matrix A = K + kc·I so the per-step solve is one matvec
+        # (kernel `lattice_solve_equilibrium`) instead of ~20 iterative
+        # Jacobi launches.  See the SPEED note in `_launch_vs_sphere`.
+        # For pads with n > ~2000 surface spheres this should be replaced
+        # with a sparse Cholesky factorisation (see `cslc_data.py:430`).
+        cslc_data = CSLCData.from_pads(
+            pads, ka=ka, kl=kl, kc=kc, dc=dc,
+            build_A_inv=True,
+            device=model.device,
+        )
 
 
         # ── Filter CSLC pairs from narrow phase (Bug 2) ──
@@ -435,23 +446,42 @@ class CSLCHandler:
                 device=self.device,
             )
 
-            # ── Kernel 2: Jacobi solve ──
-            wp.copy(self._jacobi_a, data.sphere_delta)
-            src, dst = self._jacobi_a, self._jacobi_b
-
-            for _ in range(self.n_iter):
+            # ── Kernel 2: Lattice equilibrium solve ──
+            # SPEED: when data.A_inv is precomputed (build_A_inv=True in
+            # CSLCData.from_pads — the default from _from_model), replace
+            # the iterative Jacobi (n_iter ≈ 20 launches) with a single
+            # `lattice_solve_equilibrium` matvec.  That matvec is the
+            # closed-form δ = kc · A⁻¹ · φ and is tape-compatible, so
+            # wp.Tape backward also becomes a single graph linear
+            # operation rather than a ping-pong buffer chain.
+            # Iterative Jacobi is retained only as a fallback for pads
+            # large enough that the dense A⁻¹ doesn't fit in memory
+            # (the TODO in cslc_data.py for sparse Cholesky).
+            if data.A_inv is not None:
                 wp.launch(
-                    kernel=jacobi_step,
+                    kernel=lattice_solve_equilibrium,
                     dim=data.n_spheres,
-                    inputs=[
-                        src, dst, pen_buf, data.is_surface,
-                        data.neighbor_start, data.neighbor_count, data.neighbor_list,
-                        data.ka, data.kl, data.kc, self.alpha, data.sphere_shape, pair.cslc_shape,
-                        eps,
-                    ],
+                    inputs=[data.A_inv, pen_buf, data.kc],
+                    outputs=[self._jacobi_a],
                     device=self.device,
                 )
-                src, dst = dst, src
+                src = self._jacobi_a
+            else:
+                wp.copy(self._jacobi_a, data.sphere_delta)
+                src, dst = self._jacobi_a, self._jacobi_b
+                for _ in range(self.n_iter):
+                    wp.launch(
+                        kernel=jacobi_step,
+                        dim=data.n_spheres,
+                        inputs=[
+                            src, dst, pen_buf, data.is_surface,
+                            data.neighbor_start, data.neighbor_count, data.neighbor_list,
+                            data.ka, data.kl, data.kc, self.alpha,
+                            data.sphere_shape, pair.cslc_shape, eps,
+                        ],
+                        device=self.device,
+                    )
+                    src, dst = dst, src
 
             # Warm-start: write converged delta back
             wp.copy(data.sphere_delta, src)
