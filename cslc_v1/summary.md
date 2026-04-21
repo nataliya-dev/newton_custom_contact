@@ -865,7 +865,63 @@ remaining head-room is implementation-level:
   may not expose directly. Low priority — modest expected gain
   compared to the above.
 
-### 5.7 File state (modified — do not revert)
+### 5.7 Tried and rejected (2026-04-21)
+
+Two kernel-level extensions were implemented, tested, and reverted.
+Record here so future-us doesn't re-run the same experiment.
+
+**#1 — Nonlinear contact law `F = kc · pen_3d · (max(pen_3d, pen_ref)/pen_ref)^(p-1)`.**
+Global power-law stiffening applied post-hoc to the MuJoCo constraint
+stiffness. With `p = 1.5`, `pen_ref = 1 mm`: squeeze HoldCreep improved
+from 0.082 → 0.052 mm/s (−37 %, beats hydro's 0.062), lift was bit-exact
+unchanged (as designed — dormant when `pen_3d ≤ pen_ref`), timing was
+within run-to-run jitter. **Rejected because `p` is a
+scene-geometry-dependent global:** Hertz `p = 1.5` is appropriate for
+sphere-on-flat but wrong for flat-on-flat (which should stay linear),
+so shipping a global `p` would force every new scene to re-tune and
+would weaken the paper's claim that distributed contact captures
+geometry from per-sphere state, not from a hand-tuned global knob.
+A per-sphere geometry-adaptive compliance (local-curvature-dependent
+`kc_i`, or a non-Winkler pressure profile that recovers Hertz for
+sphere-on-flat *and* stays linear for flat-on-flat automatically) is
+the principled fix and is real research, not a kernel tweak.
+
+**#2 — Pressure-weighted friction `μ_eff(i) = μ · tanh(δ_i / δ_ref)`.**
+Reduce per-sphere friction scale on low-δ edge spheres to trim their
+compliance leak. Null result: lift regressed at aggressive `δ_ref`
+(center-sphere μ haircut cost more grip than edge-leak trimming
+saved), was a no-op at small `δ_ref`; squeeze creep was insensitive
+in either direction. **Rejected — edge-sphere friction contribution
+is worth more than the tangential leak it adds in MuJoCo.**
+
+### 5.8 Why the per-sphere pressure gradient should already be emergent
+
+For sphere-on-flat contact, the per-sphere rest overlap is parabolic
+in lateral distance from the contact axis:
+`φ_rest,i ≈ pen_center − (x_i² + y_i²) / (2R)`.
+Central lattice spheres therefore see the largest `φ_rest`, largest
+`pen_3d`, largest `δ`, and largest `F_i = kc · pen_3d` — exactly the
+center-high / edge-low pressure gradient expected from compliant
+contact. The Laplacian coupling (`k_ℓ`) smooths the profile but does
+not wipe out the spatial variation. **This is already what the
+current linear CSLC implementation produces per-sphere** — no kernel
+change is required to get the right qualitative pressure distribution.
+
+What the current implementation does NOT capture is the full
+aggregate Hertz scaling `F_total ∝ pen_center^1.5`. A Winkler-style
+integration over the parabolic profile gives `F ∝ pen²`, which is
+too stiff at deep pen compared to Hertz's sqrt-pressure profile.
+Getting the aggregate right needs either (a) per-sphere compliance
+that depends on local-curvature / radial position in the contact
+patch, or (b) a fundamentally different force law that produces the
+elliptical pressure profile Hertz gives. Both are research items,
+not kernel tweaks; the global-`p` bandaid from #1 above conflates
+"distributed contact captures pressure gradients" (which CSLC does)
+with "distributed contact captures aggregate Hertz scaling" (which
+CSLC does not, and which a single global exponent cannot fix
+without re-tuning per scene).
+
+### 5.9 File state (modified — do not revert)
 
 - `newton/_src/solvers/mujoco/kernels.py` — stiffness conversion fixed
   (lines 390–411). Comment trail of original wrong formula preserved.
