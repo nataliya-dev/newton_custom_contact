@@ -91,14 +91,22 @@ def create_articulation(builder: ModelBuilder, robot_base_pos: tuple):
         collapse_fixed_joints=True,
         force_show_colliders=False,
     )
-    builder.joint_q[7:] = [
-        # 0.0,
-        # -0.785398,
-        # -1.0,
-        # -2.356194,
-        # 0.0,
-        # 1.570796,
-        # 0.785398,
+    
+    # 0.00
+    #                                        , -0.25 * pi
+    #                                        ,  0.00
+    #                                        , -0.75 * pi
+    #                                        ,  0.00
+    #                                        ,  0.50 * pi
+    #                                        ,  0.25 * pi
+    builder.joint_q[:9] = [
+        0.0,
+        -1/4 * np.pi,
+        0.0,
+        -3/4 * np.pi,
+        0.0,
+        1/2 * np.pi,
+        1/4 * np.pi,
         0.04,  # finger 1 (fully open)
         0.04,  # finger 2 (fully open)
     ]
@@ -309,14 +317,6 @@ def _build_scene(scene_parameters: SceneParams, pad_cfg, sphere_cfg=None):
 
     m = scene.finalize()
     m.set_gravity(scene_parameters.gravity)
-
-    _log(f"DOF map: {dof_map}")
-    _log(f"bodies={m.body_count}  shapes={m.shape_count}  "
-         f"joints={m.joint_count}  DOFs={m.joint_dof_count}")
-    if scene_parameters.start_gripped:
-        _log(f"start_gripped=True  dx_initial={dx_gripped*1e3:.2f}mm  "
-             f"spawn_z={sphere_z:.3f}m  no_ground={scene_parameters.no_ground}")
-
     return m, dof_map
 
 
@@ -371,15 +371,15 @@ class SceneParams:
 
     # Table geometry and world position
     table_center_x: float = 0.0
-    table_center_y: float = 2.0
-    table_surface_z: float = 0.1   # z of the top surface [m]
-    table_hx: float = 0.1
-    table_hy: float = 0.1
-    table_hz: float = 0.05
+    table_center_y: float = 0.0
+    table_surface_z: float = 0.3   # z of the top surface [m]
+    table_hx: float = 0.2
+    table_hy: float = 0.2
+    table_hz: float = 0.15
 
     # Robot mount (position derived from table)
-    robot_standoff: float = 0.1    # gap from robot base to table front edge [m]
-    robot_mount_z: float = -0.1    # floor-mount height offset [m]
+    robot_standoff: float = 0.2    # gap from robot base to table front edge [m]
+    robot_mount_z: float = 0.0    # floor-mount height offset [m]
 
     # Pads (box half-extents and local finger-frame z-offset along finger axis)
     pad_hx: float = 0.01
@@ -426,19 +426,6 @@ class SceneParams:
 
     hold_duration: float = 1.0
 
-    # Material (shared by point + CSLC) — matched to squeeze_test.py.
-    #
-    # With spacing=5mm, the contact face (40×100 mm) has 9×21=189 surface
-    # spheres per pad.  calibrate_kc targets contact_fraction=0.15 (≈28 per
-    # pad), giving kc=1087 N/m and keff=892.9 N/m per sphere.
-    #
-    # Friction budget at face-pen ≈ 2 mm with ~10 active spheres per side:
-    #   Fn_total = 2 × 10 × 892.9 × 0.002 = 35.7 N
-    #   F_friction = μ × Fn = 0.5 × 35.7 = 17.9 N  vs  weight = 4.91 N  (3.6×)
-    #
-    # NOTE: pre-2026-04-19 comment said "ke=5000 WILL launch sphere" — that
-    # was written before out_damping=0 fix (friction timeconst was 1.0s then,
-    # now ≈0.030s). With stiff friction the sphere follows the pads smoothly.
     ke: float = 5.0e4     # matched to squeeze_test
     kd: float = 5.0e2     # matched to squeeze_test
     kf: float = 100.0
@@ -505,8 +492,8 @@ class SceneParams:
     def robot_base_pos(self) -> tuple[float, float, float]:
         """Robot base world position — directly in front of the table."""
         return (
-            self.table_center_x,
-            self.table_center_y - self.table_hy - self.robot_standoff,
+            self.table_center_x - self.table_hx - self.robot_standoff,
+            self.table_center_y,
             self.robot_mount_z,
         )
 
@@ -633,9 +620,9 @@ class Example:
         self._prev_vz_pad = None
 
         self.viewer.set_model(self.model)
-        self.viewer.set_camera(
-            pos=wp.vec3(0.3, -0.3, self.p.sphere_start_z + 0.15),
-            pitch=-15.0, yaw=135.0)
+        # self.viewer.set_camera(
+        #     pos=wp.vec3(0.3, -0.3, self.p.sphere_start_z + 0.15),
+        #     pitch=-15.0, yaw=135.0)
 
         if hasattr(self.viewer, "register_ui_callback"):
             self.viewer.register_ui_callback(self._render_ui, position="side")
@@ -733,33 +720,32 @@ class Example:
                                       self.p.lift_duration,
                                       self.p.hold_duration])
 
-        self.motion_plan = MotionPlan(waypoints, segment_times)
+        waypoints = np.array([q_initial, wp_reach])
+        segment_times = np.array([1.0])
 
-        _log(f"Motion plan: {len(waypoints)} waypoints, T={self.motion_plan.traj_time:.2f}s")
-        _log(f"  ee0={np.round(ee0, 3)} → grasp={np.round(ee_sphere, 3)}  "
-             f"Δq_reach={np.round(dq_reach, 3)}")
-        _log(f"  lift Δz={lift_distance:.3f}m  Δq_lift={np.round(dq_lift, 3)}")
+        self.motion_plan = MotionPlan(waypoints, segment_times)
+        _log(f"Motion plan: {waypoints[0]} {waypoints[-1]}")
+        # _log(f"Motion plan: {len(waypoints)} waypoints, T={self.motion_plan.traj_time:.2f}s")
 
     # ------------------------------------------------------------------
+    
+
 
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
             self.state_1.clear_forces()
 
-            # Kinematic trajectory playback: override arm + finger joint state
-            # (DOFs 0:9) from the motion plan at the current substep time.
-            # Sphere DOFs (9:) are left untouched so free dynamics apply.
+            # -------- Set joint positions/velocities from planned trajectory --------            
             t = self.sim_step * self.sim_dt
             q_des, qd_des = self.motion_plan.state_at(t)
-
             jq = self.state_0.joint_q.numpy()
             jq[:9] = q_des
             self.state_0.joint_q.assign(jq)
-
             jqd = self.state_0.joint_qd.numpy()
             jqd[:9] = qd_des
             self.state_0.joint_qd.assign(jqd)
+            # ---------------------------------------------------------------------
 
             self.model.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control,
@@ -819,12 +805,12 @@ class Example:
             F_contact_z = m_sphere * (az_sphere + g_mag)
             weight_N = m_sphere * g_mag
 
-            _log(f"[{phase:8s}] step={self.sim_step:5d}  "
-                 f"sz={sphere_z:+.4f} pz={pad_z:+.4f} Δz={delta_z*1e3:+6.2f}mm  "
-                 f"vz_s={vz_sphere:+.4f} vz_p={vz_pad:+.4f} "
-                 f"az_s={az_sphere:+6.2f}m/s²  "
-                 f"F_c={F_contact_z:+6.2f}N (W={weight_N:.2f}N)  "
-                 f"n={self.current_contacts}{cslc_str}")
+            # _log(f"[{phase:8s}] step={self.sim_step:5d}  "
+            #      f"sz={sphere_z:+.4f} pz={pad_z:+.4f} Δz={delta_z*1e3:+6.2f}mm  "
+            #      f"vz_s={vz_sphere:+.4f} vz_p={vz_pad:+.4f} "
+            #      f"az_s={az_sphere:+6.2f}m/s²  "
+            #      f"F_c={F_contact_z:+6.2f}N (W={weight_N:.2f}N)  "
+            #      f"n={self.current_contacts}{cslc_str}")
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
