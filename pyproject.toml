@@ -28,6 +28,13 @@ description = "A GPU-accelerated physics engine for robotics simulation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "gitpython>=3.1.46",
+    "mujoco>=3.7.0",
+    "mujoco-warp>=3.7.0.1",
+    "pycollada>=0.9.3",
+    "pyglet>=2.1.13",
+    "scipy>=1.15.3",
+    "trimesh>=4.11.4",
     "warp-lang>=1.12.0",
 ]
 
