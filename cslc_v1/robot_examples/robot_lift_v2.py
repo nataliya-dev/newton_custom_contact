@@ -18,7 +18,7 @@ import time
 import numpy as np
 import warp as wp
 
-from cslc_v1.robot_examples.utils import SceneParams, find_body_in_builder
+from cslc_v1.robot_examples.utils import SceneParams, find_body_in_builder, get_sphere_cfg, cslc_pad_cfg, hydro_pad_cfg, point_pad_cfg
 import newton
 import newton.examples
 import newton.ik as ik
@@ -42,10 +42,7 @@ def set_target_pose_kernel(
     task_dt: float,
     task_offset_approach: wp.vec3,
     task_offset_lift: wp.vec3,
-    task_offset_retract: wp.vec3,
-    task_drop_off_pos: wp.vec3,
-    cube_size: float,
-    home_pos: wp.vec3,
+    sphere_radius: float,
     task_init_body_q: wp.array[wp.transform],
     body_q: wp.array[wp.transform],
     ee_index: int,
@@ -81,7 +78,6 @@ def set_target_pose_kernel(
     obj_body_id = tid * num_bodies_per_world + cube_body_index
     obj_pos_current = wp.transform_get_translation(body_q[obj_body_id])
     obj_quat_current = wp.transform_get_rotation(body_q[obj_body_id])
-    cube_offset = wp.float(cube_index) * cube_size * wp.vec3(0.0, 0.0, 1.0)
 
     t_gripper = 0.0
 
@@ -182,35 +178,29 @@ class Example:
         self.verbose = args.verbose
 
         self.viewer = viewer
-
-        self.cube_count = 1
-        self.cube_size = 0.05
-
-        self.table_height = 0.2
-        self.table_pos = wp.vec3(0.0, -0.5, 0.5 * self.table_height)
-        self.table_top_center = self.table_pos + wp.vec3(0.0, 0.0, 0.5 * self.table_height)
-
-        self.robot_base_pos = wp.vec3(0.0, -0.5, 0.0) + wp.vec3(-0.7, 0.0, 0.0)
-
-        self.task_offset_approach = wp.vec3(0.0, 0.0, 1.0 * self.cube_size)
-        self.task_offset_lift = wp.vec3(0.0, 0.0, 4.0 * self.cube_size)
-        self.task_offset_retract = wp.vec3(0.0, 0.0, 2.0 * self.cube_size)
-        self.task_drop_off_increment = wp.vec3(0.0, 0.0, self.cube_size)
-        self.task_drop_off_pos = self.table_top_center + wp.vec3(0.0, -0.15, 0.5 * self.cube_size)
         
-        # Build scene
-        self.use_mujoco_contacts = getattr(args, "use_mujoco_contacts", False)
         
-        self.scene_parameters = SceneParams(
+        self.scene_params = SceneParams(
             dt=self.sim_dt,
             no_ground=getattr(args, "no_ground", False),
             start_gripped=getattr(args, "start_gripped", False),
             warm_start_sphere_vz=getattr(args, "warm_start_sphere_vz", False),
         )
-
         
-        franka_with_table = self.build_franka_with_table(self.scene_parameters)
-        scene = self.build_scene(franka_with_table)
+
+        self.table_height = 0.2
+        self.table_pos = wp.vec3(0.0, -0.5, 1/2 * self.table_height)
+        self.table_top_center = self.table_pos + wp.vec3(0.0, 0.0, 0.5 * self.table_height)
+        self.robot_base_pos = wp.vec3(self.table_pos[0], self.table_pos[1], 0.0) + wp.vec3(-0.7, 0.0, 0.0)
+
+        self.task_offset_approach = wp.vec3(0.0, 0.0, 1.0 * self.scene_params.sphere_radius)
+        self.task_offset_lift = wp.vec3(0.0, 0.0, 4.0 * self.scene_params.sphere_radius)
+        
+        # Build scene
+        self.use_mujoco_contacts = getattr(args, "use_mujoco_contacts", False)
+        
+        franka_with_table = self.build_franka_with_table(self.scene_params)
+        scene = self.build_scene(franka_with_table, self.scene_params)
         self.robot_body_count = franka_with_table.body_count
 
         self.model_single = franka_with_table.finalize()
@@ -236,12 +226,8 @@ class Example:
         self.joint_target_shape = self.control.joint_target_pos.reshape((self.world_count, -1)).shape
         wp.copy(self.control.joint_target_pos[:9], self.model.joint_q[:9])
 
-        # Evaluate forward kinematics for collision detection
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
-
         self.contacts = self.model.contacts()
-
-        # Setup ik and tasks
         self.state = self.model.state()
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state)
         self.setup_ik()
@@ -255,29 +241,8 @@ class Example:
 
         if hasattr(self.viewer, "renderer"):
             self.viewer.set_world_offsets(wp.vec3(1.5, 1.5, 0.0))
-
-        self.capture()
-
         self.episode_steps = 0
 
-    def capture(self):
-        self.capture_sim()
-        self.capture_ik()
-
-    def capture_sim(self):
-        self.graph = None
-        if wp.get_device().is_cuda:
-            with wp.ScopedCapture() as capture:
-                self.simulate()
-            self.graph = capture.graph
-
-    def capture_ik(self):
-        self.graph_ik = None
-
-        if wp.get_device().is_cuda:
-            with wp.ScopedCapture() as capture:
-                self.ik_solver.step(self.joint_q_ik, self.joint_q_ik, iterations=self.ik_iters)
-            self.graph_ik = capture.graph
 
     def simulate(self):
         if not self.collide_substeps:
@@ -299,10 +264,8 @@ class Example:
             self.start_time = time.perf_counter()
 
         self.set_joint_targets()
-        if self.graph:
-            wp.capture_launch(self.graph)
-        else:
-            self.simulate()
+
+        self.simulate()
 
         if self.episode_steps > 1:
             self.sim_time += self.frame_dt
@@ -321,7 +284,7 @@ class Example:
         self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
 
-    def build_franka_with_table(self, scene_parameters: SceneParams):
+    def build_franka_with_table(self, scene_params: SceneParams):
         builder = newton.ModelBuilder()
         newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
 
@@ -336,6 +299,9 @@ class Example:
             parse_visuals_as_colliders=False,
         )
 
+        # Finger joints are prismatic with URDF limits [0, 0.04] m. Starting
+        # them at 1.0 sent the fingers (and their attached pads) flying back
+        # into the limit at sim start — use the upper limit (fully open).
         builder.joint_q[:9] = [
             -3.6802115e-03,
             2.3901723e-02,
@@ -344,8 +310,8 @@ class Example:
             -1.2918962e-04,
             2.3922248e00,
             7.8549200e-01,
-            0.05,
-            0.05,
+            0.04,
+            0.04,
         ]
 
         builder.joint_target_pos[:9] = [
@@ -356,8 +322,8 @@ class Example:
             -1.2918962e-04,
             2.3922248e00,
             7.8549200e-01,
-            1.0,
-            1.0,
+            0.04,
+            0.04,
         ]
 
         builder.joint_target_ke[:9] = [4500, 4500, 3500, 3500, 2000, 2000, 2000, 100, 100]
@@ -383,41 +349,32 @@ class Example:
             gravcomp_body.values = {}
         for body_idx in range(2, 14):
             gravcomp_body.values[body_idx] = 1.0
-            
-        
-            
         
         left_finger_idx = find_body_in_builder(builder, "fr3_leftfinger")
         right_finger_idx = find_body_in_builder(builder, "fr3_rightfinger")
-        pad_xform = wp.transform((0.0, -scene_parameters.pad_hy, scene_parameters.pad_local_z))
-        
-        pad_cfg = newton.ModelBuilder.ShapeConfig(ke=scene_parameters.ke, kd=scene_parameters.kd,
-                                                  kf=scene_parameters.kf, mu=scene_parameters.mu,
-                                                  gap=0.002, density=scene_parameters.pad_density)
+        pad_xform = wp.transform((0.0, -scene_params.pad_hy, scene_params.pad_local_z))
+        pad_cfg = point_pad_cfg(scene_params)
         
         builder.add_shape_box(body=left_finger_idx,
                               xform=pad_xform,
-                              hx=scene_parameters.pad_hx,
-                            hy=scene_parameters.pad_hy,
-                            hz=scene_parameters.pad_hz,
-                            cfg=pad_cfg)
+                              hx=scene_params.pad_hx,
+                              hy=scene_params.pad_hy,
+                              hz=scene_params.pad_hz,
+                              cfg=pad_cfg)
 
         builder.add_shape_box(body=right_finger_idx,
-                            xform=pad_xform,
-                            hx=scene_parameters.pad_hx,
-                            hy=scene_parameters.pad_hy,
-                            hz=scene_parameters.pad_hz,
-                            cfg=pad_cfg)   
+                                xform=pad_xform,
+                                hx=scene_params.pad_hx,
+                                hy=scene_params.pad_hy,
+                                hz=scene_params.pad_hz,
+                                cfg=pad_cfg)   
                 
             
-            
-
-        shape_cfg = newton.ModelBuilder.ShapeConfig(margin=0.0, density=1000.0)
-        shape_cfg.ke = 5.0e4
-        shape_cfg.kd = 5.0e2
-        shape_cfg.kf = 1.0e3
-        shape_cfg.mu = 0.75
-
+        table_cfg = newton.ModelBuilder.ShapeConfig(margin=0.0, density=1000.0)
+        table_cfg.ke = 5.0e4
+        table_cfg.kd = 5.0e2
+        table_cfg.kf = 1.0e3
+        table_cfg.mu = 0.75
         # TABLE
         builder.add_shape_box(
             body=-1,
@@ -425,7 +382,7 @@ class Example:
             hy=0.4,
             hz=0.5 * self.table_height,
             xform=wp.transform(self.table_pos, wp.quat_identity()),
-            cfg=shape_cfg,
+            cfg=table_cfg,
         )
 
         if self.use_mujoco_contacts:
@@ -439,129 +396,43 @@ class Example:
 
         return builder
 
-    def build_scene(self, franka_with_table: newton.ModelBuilder):
-        rng = np.random.default_rng(42)
-
-        # Range of values for the cube properties
-        density_range = [300.0, 500.0]
-        x_range = [-0.1, 0.1]
-        y_range = [-0.1, 0.1]
-        theta_range = [-0.9 * np.pi, 0.9 * np.pi]
-
-        default_cube_offset = wp.transform(wp.vec3(0.0, 0.15, 0.5 * self.cube_size))
-        sampling_region_origin = wp.transform(self.table_top_center) * default_cube_offset
-
-        # Minimum distance between cubes
-        min_distance = np.sqrt(2) * self.cube_size + 0.04
-
+    def build_scene(self, franka_with_table: newton.ModelBuilder, scene_params: SceneParams):
         scene = newton.ModelBuilder()
         for world_id in range(self.world_count):
             scene.begin_world()
             scene.add_builder(franka_with_table)
             self.add_sphere(
-                scene, world_id, density_range, x_range, y_range, theta_range, sampling_region_origin, min_distance, rng
+                scene, world_id, scene_params
             )
             scene.end_world()
 
         scene.add_ground_plane()
-
         return scene
+    
 
     def add_sphere(
         self,
         scene: newton.ModelBuilder,
         world_id: int,
-        density_range: list[float],
-        x_range: list[float],
-        y_range: list[float],
-        theta_range: list[float],
-        sampling_region_origin: wp.transform,
-        min_distance: float,
-        rng: np.random.Generator,
+        scene_params: SceneParams,
     ):
-        density = rng.uniform(density_range[0], density_range[1])
-        shape_cfg = newton.ModelBuilder.ShapeConfig(density=density, margin=0.0)
 
-        def get_random_pos():
-            random_x = rng.uniform(x_range[0], x_range[1])
-            random_y = rng.uniform(y_range[0], y_range[1])
-            # return wp.vec3(random_x, random_y, 0.0)
-            
-            return self.table_top_center
-            # return wp.vec3(self.table_pos)
-        
+        key = f"world_{world_id}/sphere_0"
+        sphere_pos = self.table_top_center + wp.vec3(0, 0, scene_params.sphere_radius)
+        body_xform = wp.transform(sphere_pos)
+        mesh_body = scene.add_body(xform=body_xform)
+        sphere_shape_idx = scene.shape_count
+        sphere_color = [0.8, 0.2, 0.2]
+        sphere_cfg = get_sphere_cfg(scene_params)    
+        scene.add_shape_sphere(body=mesh_body, radius=scene_params.sphere_radius, cfg=sphere_cfg, color=sphere_color, label=key)
             
 
-        cube_pos = []
-        for i in range(self.cube_count):
-            key = f"world_{world_id}/cube_{i}"
-
-            # Generate a random position for the cube that is not too close to the existing cubes.
-            new_pos = get_random_pos()
-            # if len(cube_pos) > 0:
-            #     # Check if the new cube is too close to the existing cubes.
-            #     l2_dists_too_close = [wp.norm_l2(new_pos - pos) < min_distance for pos in cube_pos]
-            #     max_attempts = 1000
-            #     attempts = 0
-            #     while any(l2_dists_too_close):
-            #         new_pos = get_random_pos()
-            #         l2_dists_too_close = [wp.norm_l2(new_pos - pos) < min_distance for pos in cube_pos]
-            #         attempts += 1
-            #         if attempts >= max_attempts:
-            #             raise RuntimeError(f"Failed to place cube {i} after {max_attempts} attempts")
-
-            cube_pos.append(new_pos)
-
-            random_theta = rng.uniform(theta_range[0], theta_range[1])
-            # random_rot = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), random_theta)
-
-            body_xform = wp.transform(cube_pos[-1])
-            mesh_body = scene.add_body(xform=body_xform)
-
-            # half_size = 0.5 * self.cube_size
-            cube_shape_idx = scene.shape_count
-            # if i == 0:
-            cube_color = [0.8, 0.2, 0.2]
-            # elif i == 1:
-            #     cube_color = [0.2, 0.8, 0.2]
-            # elif i == 2:
-            #     cube_color = [0.2, 0.2, 0.8]
-            # else:
-            #     cube_color = [0.2, 0.2, 0.2]
-            # scene.add_shape_box(
-            #     body=mesh_body,
-            #     hx=half_size,
-            #     hy=half_size,
-            #     hz=half_size,
-            #     cfg=shape_cfg,
-            #     label=key,
-            #     color=cube_color,
-            # )
-            
-                    
-            ke: float = 5.0e4     # matched to squeeze_test
-            kd: float = 5.0e2     # matched to squeeze_test
-            kf: float = 100.0
-            mu: float = 0.5
-            sphere_density: float = 4421.0
-            
-            cfg = newton.ModelBuilder.ShapeConfig(ke=ke, kd=kd, 
-                                                  kf=kf, mu=mu,
-                                                  gap=0.002, density=sphere_density,
-                                                  )
-            
-            scene.add_shape_sphere(body=mesh_body, radius=0.03, cfg=cfg,
-                                   color=cube_color, label=key
-                                   )
-            
-
-            if self.use_mujoco_contacts:
-                # Set condim=4 (torsional friction) on cube shapes
-                condim_attr = scene.custom_attributes["mujoco:condim"]
-                if condim_attr.values is None:
-                    condim_attr.values = {}
-                condim_attr.values[cube_shape_idx] = 4
-
+        if self.use_mujoco_contacts:
+            # Set condim=4 (torsional friction) on cube shapes
+            condim_attr = scene.custom_attributes["mujoco:condim"]
+            if condim_attr.values is None:
+                condim_attr.values = {}
+            condim_attr.values[sphere_shape_idx] = 4
 
 
     def setup_ik(self):
@@ -610,7 +481,6 @@ class Example:
         )
 
     def setup_tasks(self):
-        task_per_object = 5
         task_schedule = [
             TaskType.APPROACH,
             TaskType.REFINE_APPROACH,
@@ -620,9 +490,8 @@ class Example:
         ]
         self.task_counter = len(task_schedule)
         self.task_schedule = wp.array(task_schedule, shape=(self.task_counter), dtype=wp.int32)
-        self.task_time_soft_limits = wp.array([1.0] * self.task_counter, dtype=float)
+        self.task_time_soft_limits = wp.array([2.0] * self.task_counter, dtype=float)
 
-        # Single cube at index robot_body_count
         task_object = [self.robot_body_count] * self.task_counter
         self.task_object = wp.array(task_object, shape=(self.task_counter), dtype=wp.int32)
 
@@ -654,10 +523,7 @@ class Example:
                 self.task_dt,
                 self.task_offset_approach,
                 self.task_offset_lift,
-                self.task_offset_retract,
-                self.task_drop_off_pos,
-                self.cube_size,
-                self.home_pos,
+                self.scene_params.sphere_radius,
                 self.task_init_body_q,
                 self.state_0.body_q,
                 self.ee_index,
@@ -679,10 +545,7 @@ class Example:
         self.rot_obj.set_target_rotations(self.ee_rot_target_interpolated)
 
         # Step the IK solver
-        if self.graph_ik is not None:
-            wp.capture_launch(self.graph_ik)
-        else:
-            self.ik_solver.step(self.joint_q_ik, self.joint_q_ik, iterations=self.ik_iters)
+        self.ik_solver.step(self.joint_q_ik, self.joint_q_ik, iterations=self.ik_iters)
 
         # Set the joint target positions
         joint_target_pos_view = self.control.joint_target_pos.reshape((self.world_count, -1))
@@ -707,32 +570,6 @@ class Example:
             ],
         )
 
-    def test_final(self):
-        body_q = self.state_0.body_q.numpy()
-
-        world_success = [True] * self.world_count
-        target_rot_inv = wp.quat_inverse(wp.quat_identity())
-
-        # Check if the cube was lifted and is being held
-        for world_id in range(self.world_count):
-            cube_body_id = world_id * self.num_bodies_per_world + self.robot_body_count
-            cube_pos = body_q[cube_body_id][:3]
-            
-            # Check if cube is at a lifted height (should be at least table_top + 4*cube_size)
-            expected_z = np.array(self.table_top_center)[2] + 4.0 * self.cube_size
-            actual_z = cube_pos[2]
-            
-            if np.isnan(actual_z) or actual_z < expected_z - 0.02:
-                world_success[world_id] = False
-                print(f"World {world_id}: Cube not lifted properly. Expected z >= {expected_z:.3f}, got {actual_z:.3f}")
-
-        success_rate = np.mean(world_success)
-
-        if success_rate < 0.7:
-            raise ValueError(f"World success rate is {success_rate}, expected 0.7 or higher")
-        else:
-            print(f"World success rate: {success_rate}")
-
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
@@ -745,9 +582,6 @@ class Example:
 
 if __name__ == "__main__":
     parser = Example.create_parser()
-
     viewer, args = newton.examples.init(parser)
-
     example = Example(viewer, args)
-
     newton.examples.run(example, args)
