@@ -1,35 +1,18 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
-# SPDX-License-Identifier: Apache-2.0
-
-###########################################################################
-# Example Cube Stacking
-#
-# Shows how to set up a simulation of a cube stacking task for multiple
-# worlds using inverse kinematics to set joint target position references
-# for the Franka Emika Franka Panda robot arm.
-#
-# Command: python -m newton.examples ik_cube_stacking --world-count 16
-#
-###########################################################################
-
-import enum
 import time
 
 import numpy as np
 import warp as wp
 
-from cslc_v1.robot_examples.utils import SceneParams, find_body_in_builder, get_sphere_cfg, cslc_pad_cfg, hydro_pad_cfg, point_pad_cfg, get_sphere_cfg_hydro
+from cslc_v1.robot_example.utils import  \
+                    find_body_in_builder, get_sphere_cfg_not_hyrdo, get_cslc_pad_cfg, get_hydro_pad_cfg, \
+                    point_pad_cfg, get_sphere_cfg_hydro, make_solver
+                    
+from cslc_v1.robot_example.config import SceneParams, TaskType
+        
+        
 import newton
 import newton.examples
 import newton.ik as ik
-
-
-class TaskType(enum.IntEnum):
-    APPROACH = 0
-    REFINE_APPROACH = 1
-    GRASP = 2
-    LIFT = 3
-    HOLD = 4
 
 
 @wp.kernel(enable_backward=False)
@@ -179,27 +162,22 @@ class Example:
         self.collide_substeps = False
         self.world_count = args.world_count
         self.headless = args.headless
-        self.verbose = args.verbose
 
         self.viewer = viewer
+        self.verbose = args.verbose
         self.contact_model = args.contact_model
         
         self.scene_params = SceneParams(
             dt=self.sim_dt,
-            no_ground=getattr(args, "no_ground", False),
             start_gripped=getattr(args, "start_gripped", False),
             warm_start_sphere_vz=getattr(args, "warm_start_sphere_vz", False),
         )
         
-        # self.table_height = 0.2
         self.table_pos = wp.vec3(self.scene_params.table_pos)
         self.table_top_center = wp.vec3(self.scene_params.table_top_center)
         self.robot_base_pos = wp.vec3(self.scene_params.robot_base_pos)
         self.task_offset_approach = wp.vec3(self.scene_params.task_offset_approach)
         self.task_offset_lift = wp.vec3(self.scene_params.task_offset_lift)
-        
-        # Build scene
-        self.use_mujoco_contacts = getattr(args, "use_mujoco_contacts", False)
         
         franka_with_table = self.build_franka_with_table()
         scene = self.build_scene(franka_with_table)
@@ -208,19 +186,11 @@ class Example:
         self.model_single = franka_with_table.finalize()
         self.model = scene.finalize()
         self.num_bodies_per_world = self.model.body_count // self.world_count
-
-        self.solver = newton.solvers.SolverMuJoCo(
-            self.model,
-            solver="newton",
-            integrator="implicitfast",
-            iterations=20,
-            ls_iterations=100,
-            nconmax=1000,
-            njmax=2000,
-            cone="elliptic",
-            impratio=1000.0,
-            use_mujoco_contacts=self.use_mujoco_contacts,
-        )
+        
+        self.solver = make_solver(model=self.model,
+                                  solver_name=args.solver,
+                                  scene_params=self.scene_params,
+                                  )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -335,10 +305,9 @@ class Example:
         builder.joint_target_ke[:9] = [4500, 4500, 3500, 3500, 2000, 2000, 2000, 500, 500]
         builder.joint_target_kd[:9] = [450, 450, 350, 350, 200, 200, 200, 50, 50]
 
-        # TODO: pad vs gripper ke kd undrestanding        
+        # TODO: pad vs gripper ke kd vs driver_ke driver_kd undrestanding
         # builder.joint_target_ke[7:9] = [self.scene_params.ke, self.scene_params.ke]
         # builder.joint_target_kd[7:9] = [self.scene_params.kd, self.scene_params.kd]
-
             
         builder.joint_effort_limit[:9] = [87, 87, 87, 87, 12, 12, 12, 100, 100]
         builder.joint_armature[:9] = [0.3] * 4 + [0.11] * 3 + [0.15] * 2
@@ -369,9 +338,9 @@ class Example:
         if self.contact_model == "point":
             pad_cfg = point_pad_cfg(self.scene_params)
         elif self.contact_model == "cslc":
-            pad_cfg = cslc_pad_cfg(self.scene_params)
+            pad_cfg = get_cslc_pad_cfg(self.scene_params)
         elif self.contact_model == "hydro":
-            pad_cfg = hydro_pad_cfg(self.scene_params)
+            pad_cfg = get_hydro_pad_cfg(self.scene_params)
         
         builder.add_shape_box(body=left_finger_idx,
                               xform=pad_xform,
@@ -394,16 +363,6 @@ class Example:
             hz=1/2 * self.scene_params.table_height,
             xform=wp.transform(self.table_pos, wp.quat_identity()),
         )
-
-        if self.use_mujoco_contacts:
-            # Set condim=4 (torsional friction) on finger shapes
-            condim_attr = builder.custom_attributes["mujoco:condim"]
-            if condim_attr.values is None:
-                condim_attr.values = {}
-            for shape_idx in range(builder.shape_count):
-                if builder.shape_body[shape_idx] in (12, 13):  # left/right finger bodies
-                    condim_attr.values[shape_idx] = 4
-
         return builder
 
     def build_scene(self, franka_with_table: newton.ModelBuilder):
@@ -433,18 +392,11 @@ class Example:
         sphere_color = [0.8, 0.2, 0.2]
         
         if self.contact_model in ['cslc', 'point']:
-            sphere_cfg = get_sphere_cfg(self.scene_params)
+            sphere_cfg = get_sphere_cfg_not_hyrdo(self.scene_params)
         elif self.contact_model in ['hydro']:
             sphere_cfg = get_sphere_cfg_hydro(self.scene_params)
             
         scene.add_shape_sphere(body=mesh_body, radius=self.scene_params.sphere_radius, cfg=sphere_cfg, color=sphere_color, label=key)
-
-        if self.use_mujoco_contacts:
-            # Set condim=4 (torsional friction) on cube shapes
-            condim_attr = scene.custom_attributes["mujoco:condim"]
-            if condim_attr.values is None:
-                condim_attr.values = {}
-            condim_attr.values[sphere_shape_idx] = 4
 
 
     def setup_ik(self):
@@ -493,16 +445,15 @@ class Example:
         )
 
     def setup_tasks(self):
-        task_schedule = [
-            TaskType.APPROACH,
-            TaskType.REFINE_APPROACH,
-            TaskType.GRASP,
-            TaskType.LIFT,
-            TaskType.HOLD,
-        ]
-        self.task_counter = len(task_schedule)
-        self.task_schedule = wp.array(task_schedule, shape=(self.task_counter), dtype=wp.int32)
-        self.task_time_soft_limits = wp.array([2.0] * self.task_counter, dtype=float)
+        self.task_counter = len(self.scene_params.task_schedule_time)
+
+        self.task_schedule = wp.array(
+            [task for task, _ in self.scene_params.task_schedule_time],
+            shape=(self.task_counter,), dtype=wp.int32)
+
+        self.task_time_soft_limits = wp.array(
+            [time_limit for _, time_limit in self.scene_params.task_schedule_time],
+            shape=(self.task_counter,), dtype=float)
 
         task_object = [self.robot_body_count] * self.task_counter
         self.task_object = wp.array(task_object, shape=(self.task_counter), dtype=wp.int32)
@@ -587,15 +538,31 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         newton.examples.add_world_count_arg(parser)
-        newton.examples.add_mujoco_contacts_arg(parser)
         parser.set_defaults(world_count=1)
         parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
+        parser.add_argument("--contact-model", type=str, default="cslc",
+                            choices=["point", "cslc", "hydro"])
+        parser.add_argument("--contact-models", type=str, nargs="+", default=[],
+                            help="Space-separated list for headless mode (e.g. point cslc hydro).")
+        parser.add_argument("--solver", type=str, default="mujoco",
+                            choices=["mujoco", "semi"])
+
+
+        parser.add_argument("--start-gripped", action="store_true",
+                            help="Skip APPROACH+SQUEEZE; start at squeeze-end position.")        
+        parser.add_argument("--warm-start-sphere-vz", action="store_true",
+                            help="Init sphere vz = lift_speed at t=0.")
+        parser.add_argument("--cslc-ka", type=float, default=None,
+                            help="Override CSLC anchor stiffness ka [N/m].")
+        parser.add_argument("--cslc-contact-fraction", type=float, default=None,
+                            help="Override CSLC contact fraction for kc recalibration.")
+        parser.add_argument("--kh", type=float, default=None,
+                            help="Override hydroelastic modulus [Pa].")
         return parser
 
 
 if __name__ == "__main__":
     parser = Example.create_parser()
-    parser.add_argument("--contact-model", type=str, default="point", choices=["point", "cslc", "hydro"])
     viewer, args = newton.examples.init(parser)
     example = Example(viewer, args)
     newton.examples.run(example, args)
