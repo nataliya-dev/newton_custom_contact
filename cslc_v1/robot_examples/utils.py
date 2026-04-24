@@ -107,7 +107,7 @@ class SceneParams:
     sphere_density: float = 4421.0
     
     
-    penetration_depth = 0.002
+    penetration_depth = 0.02
 
     # # Table geometry and world position
     # table_center_x: float = 0.0

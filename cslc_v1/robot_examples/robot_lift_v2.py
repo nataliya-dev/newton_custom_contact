@@ -328,8 +328,12 @@ class Example:
             0.04,
         ]
 
-        builder.joint_target_ke[:9] = [4500, 4500, 3500, 3500, 2000, 2000, 2000, 100, 100]
-        builder.joint_target_kd[:9] = [450, 450, 350, 350, 200, 200, 200, 10, 10]
+        # Finger PD gains bumped 5× vs the cube example (which uses 100/10):
+        # our sphere is ~500 g (4421 kg/m³ × (4/3)π·r³) vs the cube example's
+        # ~50 g cubes, so the tighter grip is needed to produce enough contact
+        # normal force for friction to carry the weight during LIFT.
+        builder.joint_target_ke[:9] = [4500, 4500, 3500, 3500, 2000, 2000, 2000, 500, 500]
+        builder.joint_target_kd[:9] = [450, 450, 350, 350, 200, 200, 200, 50, 50]
         builder.joint_effort_limit[:9] = [87, 87, 87, 87, 12, 12, 12, 100, 100]
         builder.joint_armature[:9] = [0.3] * 4 + [0.11] * 3 + [0.15] * 2
 
