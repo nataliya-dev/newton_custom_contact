@@ -43,6 +43,7 @@ def set_target_pose_kernel(
     task_offset_approach: wp.vec3,
     task_offset_lift: wp.vec3,
     sphere_radius: float,
+    penetration_depth: float,
     task_init_body_q: wp.array[wp.transform],
     body_q: wp.array[wp.transform],
     ee_index: int,
@@ -60,8 +61,7 @@ def set_target_pose_kernel(
     idx = task_idx[tid]
     task = task_schedule[idx]
     task_time_soft_limit = task_time_soft_limits[idx]
-    cube_body_index = task_object[idx]
-    cube_index = cube_body_index - robot_body_count
+    sphere_body_index = task_object[idx]
 
     task_time_elapsed[tid] += task_dt
 
@@ -75,7 +75,7 @@ def set_target_pose_kernel(
     ee_quat_target = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), wp.pi)
 
     # Get the current position of the object
-    obj_body_id = tid * num_bodies_per_world + cube_body_index
+    obj_body_id = tid * num_bodies_per_world + sphere_body_index
     obj_pos_current = wp.transform_get_translation(body_q[obj_body_id])
     obj_quat_current = wp.transform_get_rotation(body_q[obj_body_id])
 
@@ -107,8 +107,12 @@ def set_target_pose_kernel(
     ee_rot_target[tid] = ee_quat_target[:4]
     ee_rot_target_interpolated[tid] = ee_quat_interpolated[:4]
 
-    # Set the gripper target position
-    gripper_pos = 0.06 * (1.0 - t_gripper)
+    # Set the gripper target position. Closing past (sphere_radius -
+    # penetration_depth) commands the pads into the sphere by
+    # `penetration_depth`, producing a controlled grasp force.
+    open_pos = 0.06
+    closed_pos = sphere_radius - penetration_depth
+    gripper_pos = open_pos * (1.0 - t_gripper) + closed_pos * t_gripper
     gripper_target[tid, 0] = gripper_pos
     gripper_target[tid, 1] = gripper_pos
 
@@ -187,12 +191,10 @@ class Example:
             warm_start_sphere_vz=getattr(args, "warm_start_sphere_vz", False),
         )
         
-
         self.table_height = 0.2
         self.table_pos = wp.vec3(0.0, -0.5, 1/2 * self.table_height)
         self.table_top_center = self.table_pos + wp.vec3(0.0, 0.0, 0.5 * self.table_height)
         self.robot_base_pos = wp.vec3(self.table_pos[0], self.table_pos[1], 0.0) + wp.vec3(-0.7, 0.0, 0.0)
-
         self.task_offset_approach = wp.vec3(0.0, 0.0, 1.0 * self.scene_params.sphere_radius)
         self.task_offset_lift = wp.vec3(0.0, 0.0, 4.0 * self.scene_params.sphere_radius)
         
@@ -303,25 +305,25 @@ class Example:
         # them at 1.0 sent the fingers (and their attached pads) flying back
         # into the limit at sim start — use the upper limit (fully open).
         builder.joint_q[:9] = [
-            -3.6802115e-03,
-            2.3901723e-02,
-            3.6804110e-03,
-            -2.3683236e00,
-            -1.2918962e-04,
-            2.3922248e00,
-            7.8549200e-01,
+            0.0,
+            -1/4 * np.pi,
+            0.0,
+            -3/4 * np.pi,
+            0.0,
+            1/2 * np.pi,
+            1/4 * np.pi,
             0.04,
             0.04,
         ]
 
         builder.joint_target_pos[:9] = [
-            -3.6802115e-03,
-            2.3901723e-02,
-            3.6804110e-03,
-            -2.3683236e00,
-            -1.2918962e-04,
-            2.3922248e00,
-            7.8549200e-01,
+            0.0,
+            -1/4 * np.pi,
+            0.0,
+            -3/4 * np.pi,
+            0.0,
+            1/2 * np.pi,
+            1/4 * np.pi,
             0.04,
             0.04,
         ]
@@ -367,14 +369,7 @@ class Example:
                                 hx=scene_params.pad_hx,
                                 hy=scene_params.pad_hy,
                                 hz=scene_params.pad_hz,
-                                cfg=pad_cfg)   
-                
-            
-        table_cfg = newton.ModelBuilder.ShapeConfig(margin=0.0, density=1000.0)
-        table_cfg.ke = 5.0e4
-        table_cfg.kd = 5.0e2
-        table_cfg.kf = 1.0e3
-        table_cfg.mu = 0.75
+                                cfg=pad_cfg)
         # TABLE
         builder.add_shape_box(
             body=-1,
@@ -382,7 +377,7 @@ class Example:
             hy=0.4,
             hz=0.5 * self.table_height,
             xform=wp.transform(self.table_pos, wp.quat_identity()),
-            cfg=table_cfg,
+            # cfg=table_cfg,
         )
 
         if self.use_mujoco_contacts:
@@ -416,7 +411,6 @@ class Example:
         world_id: int,
         scene_params: SceneParams,
     ):
-
         key = f"world_{world_id}/sphere_0"
         sphere_pos = self.table_top_center + wp.vec3(0, 0, scene_params.sphere_radius)
         body_xform = wp.transform(sphere_pos)
@@ -425,7 +419,6 @@ class Example:
         sphere_color = [0.8, 0.2, 0.2]
         sphere_cfg = get_sphere_cfg(scene_params)    
         scene.add_shape_sphere(body=mesh_body, radius=scene_params.sphere_radius, cfg=sphere_cfg, color=sphere_color, label=key)
-            
 
         if self.use_mujoco_contacts:
             # Set condim=4 (torsional friction) on cube shapes
@@ -524,6 +517,7 @@ class Example:
                 self.task_offset_approach,
                 self.task_offset_lift,
                 self.scene_params.sphere_radius,
+                self.scene_params.penetration_depth,
                 self.task_init_body_q,
                 self.state_0.body_q,
                 self.ee_index,
