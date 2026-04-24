@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import numpy as np
 
 import newton
+import warp as wp
 
 _SEP = "─" * 60
 
@@ -105,21 +106,17 @@ class SceneParams:
     # Sphere
     sphere_radius: float = 0.03
     sphere_density: float = 4421.0
+
+    table_height: float = 0.2
+    table_length: float = 0.8
+    table_width: float = 0.8
+    table_pos: tuple = (0.0, -0.5, 1/2 * table_height)
+    table_top_center: tuple = (table_pos[0], table_pos[1], table_pos[2] + 1/2 * table_height)
+    robot_base_pos: tuple = (table_pos[0] - 0.7, table_pos[1], 0.0)
+    task_offset_approach: tuple = (0.0, 0.0, sphere_radius)
+    task_offset_lift: tuple = (0.0, 0.0, 4.0 * sphere_radius)
     
     
-    penetration_depth = 0.02
-
-    # # Table geometry and world position
-    # table_center_x: float = 0.0
-    # table_center_y: float = 0.0
-    # table_surface_z: float = 0.3   # z of the top surface [m]
-    # table_hx: float = 0.2
-    # table_hy: float = 0.2
-    # table_hz: float = 0.15
-
-    # # Robot mount (position derived from table)
-    # robot_standoff: float = 0.2    # gap from robot base to table front edge [m]
-    # robot_mount_z: float = 0.0    # floor-mount height offset [m]
 
     # Pads (box half-extents and local finger-frame z-offset along finger axis)
     pad_hx: float = 0.01
@@ -127,17 +124,16 @@ class SceneParams:
     pad_hz: float = 0.01
     pad_local_z: float = 0.04525   # local z along finger axis — rubber-tip centre [m]
     pad_density: float = 1000.0
+    
+    penetration_depth = 0.02
 
 
     reach_duration: float = 3.0
-
     approach_gap: float = 0.10
     approach_speed: float = 20e-3 / 1.5   # 13.33 mm/s → travels 20 mm over 1.5 s
     approach_duration: float = 1.5
-
     squeeze_speed: float = 1e-3 / 0.5     # 2 mm/s → travels 1 mm over 0.5 s
     squeeze_duration: float = 0.5
-
     lift_speed: float = 0.015
     lift_duration: float = 1.5
 
@@ -216,17 +212,8 @@ class SceneParams:
         return self.table_surface_z + self.sphere_radius
 
     @property
-    def robot_base_pos(self) -> tuple[float, float, float]:
-        """Robot base world position — directly in front of the table."""
-        return (
-            self.table_center_x - self.table_hx - self.robot_standoff,
-            self.table_center_y,
-            self.robot_mount_z,
-        )
-
-    @property
     def sphere_mass(self):
-        return self.sphere_density * (4 / 3) * math.pi * self.sphere_radius ** 3
+        return self.sphere_density * (4 / 3) * np.pi * self.sphere_radius ** 3
 
     @property
     def reach_steps(self):
@@ -259,7 +246,13 @@ class SceneParams:
 def get_sphere_cfg(p: SceneParams):
     return newton.ModelBuilder.ShapeConfig(
         ke=p.ke, kd=p.kd, kf=p.kf, mu=p.mu, gap=0.002, density=p.sphere_density)
-    
+ 
+
+def get_sphere_cfg_hydro(p: SceneParams):
+    return newton.ModelBuilder.ShapeConfig(
+        ke=p.ke, kd=p.kd, kf=p.kf, mu=p.mu, gap=0.002, density=p.sphere_density,
+        kh=p.kh, is_hydroelastic=True, sdf_max_resolution=p.sdf_resolution)
+       
 
 def point_pad_cfg(p: SceneParams):
     cfg = newton.ModelBuilder.ShapeConfig(
@@ -287,4 +280,3 @@ def hydro_pad_cfg(p: SceneParams):
         ke=p.ke, kd=p.kd, kf=p.kf, mu=p.mu, gap=0.002, density=p.pad_density,
         kh=p.kh, is_hydroelastic=True, sdf_max_resolution=p.sdf_resolution)
     return pad_cfg
-    # return _build_scene(p, pad_cfg, sphere_cfg=sphere_cfg)
