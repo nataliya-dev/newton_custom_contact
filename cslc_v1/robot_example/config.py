@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import enum
 import numpy as np
+from dataclasses import dataclass, field
 
 class TaskType(enum.IntEnum):
     APPROACH = 0
@@ -91,14 +92,83 @@ class SceneParams:
         return self.sphere_density * (4 / 3) * np.pi * self.sphere_radius ** 3
 
     def dump(self):
+        """Print the active scene knobs (mirror of lift_test.SceneParams.dump)."""
+        # Local import avoids a top-level cycle (utils imports SceneParams).
+        from cslc_v1.robot_example.utils import _log, _section
+
         _section("SCENE PARAMETERS")
         m = self.sphere_mass
         _log(
-            f"Sphere: r={self.sphere_radius*1e3:.1f}mm  mass={m*1e3:.1f}g  weight={m*9.81:.3f}N")
-        _log(f"Pads:   hx={self.pad_hx*1e3:.0f}mm  hy={self.pad_hy*1e3:.0f}mm  "
-             f"hz={self.pad_hz*1e3:.0f}mm  density={self.pad_density:.0f}")
-        _log(f"Phases: approach={self.approach_duration}s  squeeze={self.squeeze_duration}s  "
-             f"lift={self.lift_duration}s  hold={self.hold_duration}s")
-        _log(f"Material: ke={self.ke:.0f}  kd={self.kd:.0f}  μ={self.mu:.2f}")
-        _log(f"Drive: ke={self.drive_ke:.0f}  kd={self.drive_kd:.0f}")
-        _log(f"Steps: {self.total_steps} total  dt={self.dt*1e3:.2f}ms")
+            f"Sphere: r={self.sphere_radius * 1e3:.1f}mm  "
+            f"mass={m * 1e3:.1f}g  weight={m * 9.81:.3f}N"
+        )
+        _log(
+            f"Table:  pos={self.table_pos}  height={self.table_height:.2f}m  "
+            f"length={self.table_length:.2f}m  width={self.table_width:.2f}m"
+        )
+        _log(f"Robot:  base={self.robot_base_pos}")
+        _log(
+            f"Pads:   hx={self.pad_hx * 1e3:.0f}mm  hy={self.pad_hy * 1e3:.0f}mm  "
+            f"hz={self.pad_hz * 1e3:.0f}mm  density={self.pad_density:.0f}"
+        )
+        _log(
+            f"Material:  ke={self.ke:.0f}  kd={self.kd:.0f}  "
+            f"kf={self.kf:.0f}  μ={self.mu:.2f}"
+        )
+        _log(f"Drive:     ke={self.drive_ke:.0f}  kd={self.drive_kd:.0f}")
+        _log(
+            f"CSLC:      spacing={self.cslc_spacing * 1e3:.0f}mm  "
+            f"ka={self.cslc_ka:.0f}  kl={self.cslc_kl:.0f}  "
+            f"dc={self.cslc_dc:.1f}  α={self.cslc_alpha:.2f}  "
+            f"contact_fraction={self.cslc_contact_fraction}"
+        )
+        _log(f"Hydro:     kh={self.kh:.0e}Pa  sdf_res={self.sdf_resolution}")
+        _log("Schedule:")
+        for task, dt in self.task_schedule_time:
+            _log(f"  {task.name:16s} {dt:.1f}s", 1)
+        _log(
+            f"Integration: dt={self.dt * 1e3:.2f}ms  gravity={self.gravity}  "
+            f"start_gripped={self.start_gripped}"
+        )
+
+
+@dataclass
+class LiftMetrics:
+    """Per-run sphere height trace + derived success flags.
+
+    Mirrors lift_test.Metrics so the headless summary reads the same way.
+    """
+    name: str = ""
+    sphere_z: list[float] = field(default_factory=list)
+    contacts: list[int] = field(default_factory=list)
+
+    @property
+    def max_z(self) -> float:
+        return max(self.sphere_z) if self.sphere_z else 0.0
+
+    @property
+    def final_z(self) -> float:
+        return self.sphere_z[-1] if self.sphere_z else 0.0
+
+    @property
+    def lifted(self) -> bool:
+        """True if the sphere rose more than 5 mm above its lowest point.
+
+        Using min(sphere_z) as reference matches lift_test.py — it's robust
+        to the spawn drop-onto-table transient before the grasp actually
+        begins.
+        """
+        if len(self.sphere_z) < 2:
+            return False
+        return self.max_z > min(self.sphere_z) + 0.005
+
+    @property
+    def held(self) -> bool:
+        """True if the sphere is clearly off the table at the end of the run.
+
+        Table top is at 0.20 m and sphere_radius = 0.03 m, so a settled
+        sphere sits at z ≈ 0.23. A successful LIFT + HOLD parks it above
+        that by ``task_offset_lift[2]``; 0.26 is the minimum clearance we'd
+        accept as "still held".
+        """
+        return self.final_z > 0.26 if self.sphere_z else False

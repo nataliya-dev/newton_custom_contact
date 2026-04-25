@@ -1,18 +1,134 @@
-import time
+'''
+uv run cslc_v1/robot_example/robot_lift.py --contact-model cslc
+uv run cslc_v1/robot_example/robot_lift.py --contact-model hydro --start-gripped
+uv run cslc_v1/robot_example/robot_lift.py --headless --contact-models hydro point cslc
+'''
 
+import time
 import numpy as np
 import warp as wp
 
 from cslc_v1.robot_example.utils import  \
                     find_body_in_builder, get_sphere_cfg_not_hyrdo, get_cslc_pad_cfg, get_hydro_pad_cfg, \
-                    point_pad_cfg, get_sphere_cfg_hydro, make_solver
-                    
-from cslc_v1.robot_example.config import SceneParams, TaskType
-        
-        
+                    point_pad_cfg, get_sphere_cfg_hydro, make_solver, \
+                    SimDiagnostics, count_active_contacts, read_cslc_state, \
+                    inspect_model, recalibrate_cslc_kc_per_pad, \
+                    _log, _section
+
+from cslc_v1.robot_example.config import SceneParams, TaskType, LiftMetrics
+
+
 import newton
 import newton.examples
 import newton.ik as ik
+
+def run_headless(name: str, example, verbose: bool = True) -> LiftMetrics:
+    """Run an already-built :class:`Example` headless for one full task
+    schedule, collecting per-frame sphere z and active contact count.
+
+    The frame budget comes from ``task_time_soft_limits`` summed over the
+    (possibly filtered by ``--start-gripped``) schedule, plus a small
+    margin so the last task gets a chance to fully reach its target.
+    """
+    met = LiftMetrics(name=name)
+    total_seconds = float(sum(example.task_time_soft_limits.numpy()))
+    total_frames = int(total_seconds * example.fps) + 60
+
+    sphere_body_idx = example.sim_diag.sphere_body_idx
+    pad_body_idx = example.sim_diag.pad_body_idx
+
+    t_start = time.perf_counter()
+    for frame in range(total_frames):
+        example.step()
+
+        q = example.state_0.body_q.numpy()
+        sz = float(q[sphere_body_idx, 2])
+        nc = count_active_contacts(example.contacts)
+        met.sphere_z.append(sz)
+        met.contacts.append(nc)
+
+        if verbose and ((frame + 1) % 60 == 0 or frame == total_frames - 1):
+            pad_z = float(q[pad_body_idx, 2])
+            task_idx = int(example.task_idx.numpy()[0])
+            if 0 <= task_idx < len(example._schedule_task_types):
+                phase = example._schedule_task_types[task_idx].name
+            else:
+                phase = f"TASK_{task_idx}"
+            line = (f"  {name:16s} {frame+1:5d}/{total_frames}  [{phase:8s}]  "
+                    f"sphere_z={sz:.5f}  pad_z={pad_z:.4f}  contacts={nc}")
+            if example.contact_model == "cslc":
+                ci = read_cslc_state(example.model)
+                if ci:
+                    line += f"  cslc={ci['n_active']}/{ci['n_surface']}"
+            print(line)
+
+    wall = time.perf_counter() - t_start
+    per_step_ms = 1000.0 * wall / max(total_frames, 1)
+    sim_time_s = total_frames * example.frame_dt
+    rtx = sim_time_s / wall if wall > 0 else 0.0
+    print(
+        f"  TIMING {name:16s}  wall={wall:.3f}s  "
+        f"per-step={per_step_ms:.3f}ms  realtime×={rtx:.2f}"
+    )
+    return met
+
+
+def test_headless(args, contact_models: list[str] | None = None) -> list[LiftMetrics]:
+    """Build & run the robot lift scene headlessly for each contact model,
+    then print a side-by-side summary.
+
+    Mirrors ``lift_test.test_headless`` end-to-end:
+      1. ``SceneParams.dump()`` once before the loop.
+      2. ``inspect_model(model, label)`` per iteration.
+      3. ``recalibrate_cslc_kc_per_pad(...)`` for the cslc run when
+         ``cslc_contact_fraction`` is set.
+    """
+    # Build a representative SceneParams and dump it once. Uses the same dt
+    # the Example will use (frame_dt / sim_substeps = 1/600 s).
+    representative_sp = SceneParams(
+        dt=(1.0 / 60) / 10,
+        start_gripped=getattr(args, "start_gripped", False),
+    )
+    representative_sp.dump()
+
+    results: list[LiftMetrics] = []
+    for cm in contact_models:
+        label = f"{cm}_{args.solver}"
+        _section(label.upper())
+        args.contact_model = cm
+        args.headless = True
+        viewer = newton.viewer.ViewerNull()
+        example = Example(viewer, args)
+
+        # Body / shape / joint summary, with [CSLC]-flagged shapes annotated.
+        inspect_model(example.model, label)
+
+        # CSLC stiffness recalibration (matches lift_test.py): rescale per-
+        # sphere kc so each pad's aggregate stiffness equals ke_bulk for the
+        # actual active-patch size in this scene.
+        if cm == "cslc" and example.scene_params.cslc_contact_fraction is not None:
+            recalibrate_cslc_kc_per_pad(
+                example.model, example.scene_params.cslc_contact_fraction
+            )
+
+        met = run_headless(label, example)
+        results.append(met)
+        _log(
+            f"RESULT: max_z={met.max_z:.4f}  final_z={met.final_z:.4f}  "
+            f"lifted={'YES' if met.lifted else 'NO'}  "
+            f"held={'YES' if met.held else 'NO'}"
+        )
+    _section("SUMMARY")
+    print(f"  {'Config':<24} {'Max Z':>8} {'Final Z':>8} {'Lifted':>8} {'Held':>8}")
+    print(f"  {'─' * 60}")
+    for m in results:
+        lifted_s = "YES" if m.lifted else "NO"
+        held_s = "YES" if m.held else "NO"
+        print(
+            f"  {m.name:<24} {m.max_z:8.4f} {m.final_z:8.4f} "
+            f"{lifted_s:>8} {held_s:>8}"
+        )
+    return results
 
 
 @wp.kernel(enable_backward=False)
@@ -164,15 +280,13 @@ class Example:
         self.headless = args.headless
 
         self.viewer = viewer
-        self.verbose = args.verbose
         self.contact_model = args.contact_model
         
         self.scene_params = SceneParams(
             dt=self.sim_dt,
             start_gripped=getattr(args, "start_gripped", False),
-            warm_start_sphere_vz=getattr(args, "warm_start_sphere_vz", False),
         )
-        
+
         self.table_pos = wp.vec3(self.scene_params.table_pos)
         self.table_top_center = wp.vec3(self.scene_params.table_top_center)
         self.robot_base_pos = wp.vec3(self.scene_params.robot_base_pos)
@@ -201,6 +315,7 @@ class Example:
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         self.contacts = self.model.contacts()
         self.state = self.model.state()
+
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state)
         self.setup_ik()
         self.setup_tasks()
@@ -214,6 +329,20 @@ class Example:
         if hasattr(self.viewer, "renderer"):
             self.viewer.set_world_offsets(wp.vec3(1.5, 1.5, 0.0))
         self.episode_steps = 0
+
+        # Sphere is the first body added after the robot bodies (world 0);
+        # the pad shape lives on fr3_leftfinger and tracks the contact surface.
+        self.sim_diag = SimDiagnostics(
+            sphere_body_idx=self.robot_body_count,
+            pad_shape_idx=self.left_pad_shape_idx,
+            model=self.model,
+            sphere_mass=self.scene_params.sphere_mass,
+            gravity_z=self.scene_params.gravity[2],
+            print_every_frames=6,
+        )
+
+        if hasattr(self.viewer, "register_ui_callback"):
+            self.viewer.register_ui_callback(self._render_ui, position="side")
 
 
     def simulate(self):
@@ -242,12 +371,17 @@ class Example:
         if self.episode_steps > 1:
             self.sim_time += self.frame_dt
 
-        tock = time.perf_counter()
-        if self.verbose and self.episode_steps > 0:
-            print(f"Step {self.episode_steps} time: {tock - self.start_time:.2f}, sim time: {self.sim_time:.2f}")
-            print(f"RT factor: {self.world_count * self.sim_time / (tock - self.start_time):.2f}")
-            print("_" * 100)
-
+        task_idx = int(self.task_idx.numpy()[0])
+        phase = self._schedule_task_types[task_idx].name
+        cslc_state = read_cslc_state(self.model) if self.contact_model == "cslc" else None
+        self.sim_diag.log(
+            frame_idx=self.episode_steps,
+            phase_name=phase,
+            body_q_np=self.state_0.body_q.numpy(),
+            active_contacts=count_active_contacts(self.contacts),
+            frame_dt=self.frame_dt,
+            cslc_state=cslc_state,
+        )
         self.episode_steps += 1
 
     def render(self):
@@ -255,6 +389,20 @@ class Example:
         self.viewer.log_state(self.state_0)
         self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
+
+    def _render_ui(self, imgui):
+        # Snapshot lives on self.sim_diag and is refreshed every step().
+        d = self.sim_diag
+        imgui.text(f"Contact:  {self.contact_model}")
+        imgui.text(f"Phase:    {d.phase_name}")
+        imgui.text(f"Step:     {d.frame_idx}")
+        imgui.text(f"Sphere Z: {d.sphere_z:+.4f}")
+        imgui.text(f"Pad Z:    {d.pad_z:+.4f}")
+        imgui.text(f"Delta Z:  {d.delta_z * 1e3:+.2f} mm")
+        imgui.text(f"Contacts: {d.contact_count}")
+        if d.cslc_state is not None:
+            imgui.text(f"CSLC:     {d.cslc_state['n_active']}/{d.cslc_state['n_surface']}")
+
 
     def build_franka_with_table(self):
         builder = newton.ModelBuilder()
@@ -271,32 +419,18 @@ class Example:
             parse_visuals_as_colliders=False,
         )
 
-        # Finger joints are prismatic with URDF limits [0, 0.04] m. Starting
-        # them at 1.0 sent the fingers (and their attached pads) flying back
-        # into the limit at sim start — use the upper limit (fully open).
-        builder.joint_q[:9] = [
-            0.0,
-            -1/4 * np.pi,
-            0.0,
-            -3/4 * np.pi,
-            0.0,
-            1/2 * np.pi,
-            1/4 * np.pi,
-            0.04,
-            0.04,
-        ]
+        if self.scene_params.start_gripped:
+            arm_q = self._compute_grasp_joint_q()
+        else:
+            # Franka canonical home pose.
+            arm_q = [
+                0.0, -1/4 * np.pi, 0.0, -3/4 * np.pi, 0.0,
+                1/2 * np.pi, 1/4 * np.pi,
+            ]
+        finger_q = [0.04, 0.04]
 
-        builder.joint_target_pos[:9] = [
-            0.0,
-            -1/4 * np.pi,
-            0.0,
-            -3/4 * np.pi,
-            0.0,
-            1/2 * np.pi,
-            1/4 * np.pi,
-            0.04,
-            0.04,
-        ]
+        builder.joint_q[:9] = arm_q + finger_q
+        builder.joint_target_pos[:9] = arm_q + finger_q
 
         # Finger PD gains bumped 5× vs the cube example (which uses 100/10):
         # our sphere is ~500 g (4421 kg/m³ × (4/3)π·r³) vs the cube example's
@@ -306,8 +440,8 @@ class Example:
         builder.joint_target_kd[:9] = [450, 450, 350, 350, 200, 200, 200, 50, 50]
 
         # TODO: pad vs gripper ke kd vs driver_ke driver_kd undrestanding
-        # builder.joint_target_ke[7:9] = [self.scene_params.ke, self.scene_params.ke]
-        # builder.joint_target_kd[7:9] = [self.scene_params.kd, self.scene_params.kd]
+        # builder.joint_target_ke[7:9] = [self.scene_params.drive_ke, self.scene_params.drive_ke]
+        # builder.joint_target_kd[7:9] = [self.scene_params.drive_kd, self.scene_params.drive_kd]
             
         builder.joint_effort_limit[:9] = [87, 87, 87, 87, 12, 12, 12, 100, 100]
         builder.joint_armature[:9] = [0.3] * 4 + [0.11] * 3 + [0.15] * 2
@@ -342,19 +476,19 @@ class Example:
         elif self.contact_model == "hydro":
             pad_cfg = get_hydro_pad_cfg(self.scene_params)
         
-        builder.add_shape_box(body=left_finger_idx,
-                              xform=pad_xform,
-                              hx=self.scene_params.pad_hx,
-                              hy=self.scene_params.pad_hy,
-                              hz=self.scene_params.pad_hz,
-                              cfg=pad_cfg)
+        self.left_pad_shape_idx = builder.add_shape_box(body=left_finger_idx,
+                                                        xform=pad_xform,
+                                                        hx=self.scene_params.pad_hx,
+                                                        hy=self.scene_params.pad_hy,
+                                                        hz=self.scene_params.pad_hz,
+                                                        cfg=pad_cfg)
 
-        builder.add_shape_box(body=right_finger_idx,
-                                xform=pad_xform,
-                                hx=self.scene_params.pad_hx,
-                                hy=self.scene_params.pad_hy,
-                                hz=self.scene_params.pad_hz,
-                                cfg=pad_cfg)
+        self.left_pad_shape_idx = builder.add_shape_box(body=right_finger_idx,
+                                                        xform=pad_xform,
+                                                        hx=self.scene_params.pad_hx,
+                                                        hy=self.scene_params.pad_hy,
+                                                        hz=self.scene_params.pad_hz,
+                                                        cfg=pad_cfg)
         # TABLE
         builder.add_shape_box(
             body=-1,
@@ -444,15 +578,79 @@ class Example:
             jacobian_mode=ik.IKJacobianType.ANALYTIC,
         )
 
+    def _compute_grasp_joint_q(self):
+        """
+        Used to calculate joint_q when start-gripped is passed.
+        Pre-compute arm joint angles that place the EE at the sphere
+        center with gripper-down orientation.
+        """
+        temp = newton.ModelBuilder()
+        temp.add_urdf(
+            newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
+            xform=wp.transform(self.robot_base_pos, wp.quat_identity()),
+            floating=False,
+            enable_self_collisions=False,
+            parse_visuals_as_colliders=False,
+        )
+        temp.joint_q[:9] = [
+            0.0, -np.pi / 4, 0.0, -3 * np.pi / 4, 0.0,
+            np.pi / 2, np.pi / 4, 0.04, 0.04,
+        ]
+        temp_model = temp.finalize()
+        # Sphere rest position (same formula add_sphere uses).
+        sphere_world_pos = wp.vec3(
+            self.table_top_center[0],
+            self.table_top_center[1],
+            self.table_top_center[2] + self.scene_params.sphere_radius,
+        )
+        # Gripper-down orientation: 180° around X, quat (x,y,z,w) = (1,0,0,0).
+        grip_rot_xyzw = wp.vec4(1.0, 0.0, 0.0, 0.0)
+        ee_index = 11  # fr3_hand_tcp
+        pos_obj = ik.IKObjectivePosition(
+            link_index=ee_index,
+            link_offset=wp.vec3(0.0, 0.0, 0.0),
+            target_positions=wp.array([sphere_world_pos], dtype=wp.vec3),
+        )
+        rot_obj = ik.IKObjectiveRotation(
+            link_index=ee_index,
+            link_offset_rotation=wp.quat_identity(),
+            target_rotations=wp.array([grip_rot_xyzw], dtype=wp.vec4),
+        )
+        ik_dofs = temp_model.joint_coord_count
+        joint_q_ik = wp.clone(temp_model.joint_q.reshape((1, -1))[:, :ik_dofs])
+        solver = ik.IKSolver(
+            model=temp_model,
+            n_problems=1,
+            objectives=[pos_obj, rot_obj],
+            lambda_initial=0.1,
+            jacobian_mode=ik.IKJacobianType.ANALYTIC,
+        )
+        solver.step(joint_q_ik, joint_q_ik, iterations=500)
+        return joint_q_ik.numpy()[0, :7].tolist()
+
     def setup_tasks(self):
-        self.task_counter = len(self.scene_params.task_schedule_time)
+        schedule = self.scene_params.task_schedule_time
+        if self.scene_params.start_gripped:
+            # The arm is already at the grasp pose — skip motion phases.
+            schedule = tuple(
+                (task, dt)
+                for task, dt in schedule
+                if task not in (TaskType.APPROACH, TaskType.REFINE_APPROACH)
+            )
+        self.task_counter = len(schedule)
+
+        # Python-side copy of the scheduled TaskTypes, so the log can map
+        # task_idx (an *index* into the schedule) back to the actual task
+        # name. Without this, start-gripped mode would print APPROACH for
+        # the first task because the raw index collides with TaskType(0).
+        self._schedule_task_types = [task for task, _ in schedule]
 
         self.task_schedule = wp.array(
-            [task for task, _ in self.scene_params.task_schedule_time],
+            [task for task, _ in schedule],
             shape=(self.task_counter,), dtype=wp.int32)
 
         self.task_time_soft_limits = wp.array(
-            [time_limit for _, time_limit in self.scene_params.task_schedule_time],
+            [time_limit for _, time_limit in schedule],
             shape=(self.task_counter,), dtype=float)
 
         task_object = [self.robot_body_count] * self.task_counter
@@ -539,19 +737,14 @@ class Example:
         parser = newton.examples.create_parser()
         newton.examples.add_world_count_arg(parser)
         parser.set_defaults(world_count=1)
-        parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
         parser.add_argument("--contact-model", type=str, default="cslc",
                             choices=["point", "cslc", "hydro"])
-        parser.add_argument("--contact-models", type=str, nargs="+", default=[],
+        parser.add_argument("--contact-models", type=str, nargs="+", default=["point", "cslc", "hydro"],
                             help="Space-separated list for headless mode (e.g. point cslc hydro).")
         parser.add_argument("--solver", type=str, default="mujoco",
                             choices=["mujoco", "semi"])
-
-
         parser.add_argument("--start-gripped", action="store_true",
-                            help="Skip APPROACH+SQUEEZE; start at squeeze-end position.")        
-        parser.add_argument("--warm-start-sphere-vz", action="store_true",
-                            help="Init sphere vz = lift_speed at t=0.")
+                            help="Start at GRASP phase")
         parser.add_argument("--cslc-ka", type=float, default=None,
                             help="Override CSLC anchor stiffness ka [N/m].")
         parser.add_argument("--cslc-contact-fraction", type=float, default=None,
@@ -563,6 +756,16 @@ class Example:
 
 if __name__ == "__main__":
     parser = Example.create_parser()
-    viewer, args = newton.examples.init(parser)
-    example = Example(viewer, args)
-    newton.examples.run(example, args)
+    args_peek, _ = parser.parse_known_args()
+    headless_mode = args_peek.headless and len(args_peek.contact_models) > 0
+    wp.init()
+    
+    if headless_mode:
+        args = parser.parse_args()
+        print(f"\n{'━' * 60}\n  ROBOT LIFT — headless\n{'━' * 60}")
+        cms = args.contact_models if args.contact_models else [args.contact_model]
+        test_headless(args, contact_models=cms)
+    else:
+        viewer, args = newton.examples.init(parser)
+        example = Example(viewer, args)
+        newton.examples.run(example, args)
