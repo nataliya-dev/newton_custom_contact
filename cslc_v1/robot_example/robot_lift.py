@@ -22,6 +22,14 @@ import newton
 import newton.examples
 import newton.ik as ik
 
+
+def make_scene_params(args, sim_dt: float) -> SceneParams:
+    return SceneParams(
+        dt=sim_dt,
+        start_gripped=getattr(args, "start_gripped", False),
+    )
+
+
 def run_headless(name: str, example, verbose: bool = True) -> LiftMetrics:
     """Run an already-built :class:`Example` headless for one full task
     schedule, collecting per-frame sphere z and active contact count.
@@ -83,13 +91,9 @@ def test_headless(args, contact_models: list[str] | None = None) -> list[LiftMet
       3. ``recalibrate_cslc_kc_per_pad(...)`` for the cslc run when
          ``cslc_contact_fraction`` is set.
     """
-    # Build a representative SceneParams and dump it once. Uses the same dt
-    # the Example will use (frame_dt / sim_substeps = 1/600 s).
-    representative_sp = SceneParams(
-        dt=(1.0 / 60) / 10,
-        start_gripped=getattr(args, "start_gripped", False),
-    )
-    representative_sp.dump()
+    # Dump scene params once at the top, using the *exact* same constructor
+    # Example will use, so the dump can never drift from the simulated params.
+    make_scene_params(args, sim_dt=(1.0 / 60) / 10).dump()
 
     results: list[LiftMetrics] = []
     for cm in contact_models:
@@ -281,11 +285,8 @@ class Example:
 
         self.viewer = viewer
         self.contact_model = args.contact_model
-        
-        self.scene_params = SceneParams(
-            dt=self.sim_dt,
-            start_gripped=getattr(args, "start_gripped", False),
-        )
+
+        self.scene_params = make_scene_params(args, self.sim_dt)
 
         self.table_pos = wp.vec3(self.scene_params.table_pos)
         self.table_top_center = wp.vec3(self.scene_params.table_top_center)
@@ -343,6 +344,10 @@ class Example:
 
         if hasattr(self.viewer, "register_ui_callback"):
             self.viewer.register_ui_callback(self._render_ui, position="side")
+
+        if not self.headless:
+            self.scene_params.dump()
+            inspect_model(self.model, self.contact_model)
 
 
     def simulate(self):
