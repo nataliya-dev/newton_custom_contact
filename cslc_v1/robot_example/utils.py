@@ -3,6 +3,7 @@ import numpy as np
 from newton.solvers import SolverSemiImplicit
 from newton.solvers import SolverMuJoCo
 import newton
+from newton._src.geometry.types import GeoType
 
 from cslc_v1.robot_example.config import SceneParams
 
@@ -34,7 +35,6 @@ def inspect_model(model, label=""):
     for confirming pad shapes survived ``add_builder`` and got the right
     contact model attached.
     """
-    GEO = {0: "PLANE", 1: "MESH", 3: "SPHERE", 4: "CAPSULE", 7: "BOX"}
     _log(
         f"Model '{label}': {model.body_count} bodies, {model.shape_count} shapes, "
         f"{model.joint_count} joints, {model.joint_dof_count} DOFs"
@@ -44,7 +44,8 @@ def inspect_model(model, label=""):
     sb = model.shape_body.numpy()
     for i in range(model.shape_count):
         cslc = " [CSLC]" if sf[i] & CSLC_FLAG else ""
-        _log(f"  shape {i}: {GEO.get(int(st[i]), '?')}  body={sb[i]}{cslc}", 1)
+        geo_name = GeoType(int(st[i])).name
+        _log(f"  shape {i}: {geo_name}  body={sb[i]}{cslc}", 1)
 
 
 def count_active_contacts(contacts):
