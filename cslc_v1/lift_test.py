@@ -164,9 +164,13 @@ class SceneParams:
     drive_ke: float = 5.0e4
     drive_kd: float = 1.0e3
 
-    # CSLC tuning — matched to squeeze_test.py
+    # CSLC tuning — matched to squeeze_test.py and the fair-calibration
+    # derivation in §2 of cslc_v1/summary.md.  ka=15000 is the fair-cal
+    # target: with N=4 active spheres at 1 mm face_pen the recalibration
+    # `kc = ke·ka/(N·ka − ke)` solves to kc=75000 → keff=12500 →
+    # aggregate per pad = 50000 N/m = ke_bulk ✓.
     cslc_spacing: float = 0.005
-    cslc_ka: float = 5000.0
+    cslc_ka: float = 15000.0
     cslc_kl: float = 500.0
     cslc_dc: float = 2.0
     cslc_n_iter: int = 20
@@ -181,10 +185,11 @@ class SceneParams:
     # Set None to keep the handler's default kc.
     cslc_contact_fraction: float | None = 0.025
 
-    # Hydroelastic modulus [Pa] for the hydro contact model.  See section 9
-    # in cslc_v1/convo_april_19.md for the kh stability sweep — 1e8 is
-    # silicone-rubber-stiff and stable; 1e10 ejects the sphere.
-    kh: float = 1.0e8
+    # Hydroelastic modulus [Pa] for the hydro contact model.
+    # Fair-calibrated default: kh · A_patch(1 mm pen) = ke_bulk.
+    # At r=30 mm sphere on flat pad, A_patch ≈ π·(2·r·pen) = 188 mm²,
+    # so kh = 5e4 / 1.88e-4 = 2.65e8 Pa.  See §2 in cslc_v1/summary.md.
+    kh: float = 2.65e8
     sdf_resolution: int = 64
 
     # Integration
@@ -701,6 +706,49 @@ def read_cslc_state(model):
     }
 
 
+# ── CSLC lattice visualisation (mirrors squeeze_test) ────────────────────
+#
+# Walks the CSLC handler's per-sphere data, applies the per-sphere
+# compression delta along the sphere's outward normal, and transforms
+# each surface lattice sphere into world coordinates so the viewer can
+# render coloured dots showing where the lattice is in contact and how
+# hard it's pressed.
+
+def _quat_rotate(q, v):
+    xyz = np.array([q[0], q[1], q[2]])
+    t = 2.0 * np.cross(xyz, v)
+    return v + q[3] * t + np.cross(xyz, t)
+
+
+def get_cslc_lattice_viz_data(model, state):
+    pipeline = getattr(model, "_collision_pipeline", None)
+    handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
+    if handler is None:
+        return None
+    d = handler.cslc_data
+    n = d.n_spheres
+    pl = d.positions.numpy()
+    nm = d.outward_normals.numpy()
+    dl = d.sphere_delta.numpy()
+    rd = d.radii.numpy()
+    sf = d.is_surface.numpy()
+    si = d.sphere_shape.numpy()
+    bq = state.body_q.numpy()
+    sb = model.shape_body.numpy()
+    sx = model.shape_transform.numpy()
+
+    pw = np.zeros((n, 3), np.float32)
+    for i in range(n):
+        if sf[i] == 0:
+            continue
+        s = si[i]
+        b = sb[s]
+        ql = pl[i] + dl[i] * nm[i]
+        qb = _quat_rotate(sx[s, 3:7], ql) + sx[s, :3]
+        pw[i] = _quat_rotate(bq[b, 3:7], qb) + bq[b, :3]
+    return pw, dl, rd, sf
+
+
 def inspect_model(model, label=""):
     GEO = {0: "PLANE", 1: "MESH", 3: "SPHERE", 4: "CAPSULE", 7: "BOX"}
     _log(f"Model '{label}': {model.body_count} bodies, {model.shape_count} shapes, "
@@ -855,6 +903,7 @@ class Example:
 
         self.contact_model = getattr(args, "contact_model", "cslc")
         self.solver_name = getattr(args, "solver", "mujoco")
+        self.show_lattice = getattr(args, "show_lattice", True)
 
         self.p = SceneParams(
             dt=self.sim_dt,
@@ -890,6 +939,8 @@ class Example:
         self.viewer.set_camera(
             pos=wp.vec3(0.3, -0.3, self.p.sphere_start_z + 0.15),
             pitch=-15.0, yaw=135.0)
+
+        self._init_lattice_rendering()
 
         if hasattr(self.viewer, "register_ui_callback"):
             self.viewer.register_ui_callback(self._render_ui, position="side")
@@ -975,7 +1026,57 @@ class Example:
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
         self.viewer.log_contacts(self.contacts, self.state_0)
+        if self.show_lattice and self.contact_model == "cslc":
+            self._render_lattice()
         self.viewer.end_frame()
+
+    def _init_lattice_rendering(self):
+        # Pre-allocate the per-surface-sphere viewer buffers once.  Sized
+        # to the total surface-sphere count across all pads, so both the
+        # left and right pad's lattice render in the same `log_shapes`
+        # call each frame.
+        self._lattice_n = 0
+        pipeline = getattr(self.model, "_collision_pipeline", None)
+        handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
+        if handler is None:
+            return
+        d = handler.cslc_data
+        n = d.n_surface
+        self._lattice_n = n
+        # Render lattice spheres at 40% of their lattice radius so the
+        # underlying pad geometry stays visible.
+        self._lattice_radius = float(d.radii.numpy()[0]) * 0.4
+        self._lattice_xforms = np.zeros((n, 7), np.float32)
+        self._lattice_xforms[:, 6] = 1.0  # identity quat
+        self._lattice_colors = np.zeros((n, 3), np.float32)
+        self._lattice_mats = np.tile(
+            [0.5, 0.3, 0.0, 0.0], (n, 1)).astype(np.float32)
+
+    def _render_lattice(self):
+        viz = get_cslc_lattice_viz_data(self.model, self.state_0)
+        if viz is None:
+            return
+        pw, dl, rd, sf = viz
+        idx = 0
+        # Normalise compression depth to the current step's max so colour
+        # tracks relative compression even when penetration grows or shrinks.
+        mx = max(float(np.max(np.abs(dl))), 1e-6)
+        for i in range(len(dl)):
+            if sf[i] == 0 or idx >= self._lattice_n:
+                continue
+            self._lattice_xforms[idx, :3] = pw[i]
+            t = min(abs(dl[i]) / mx, 1.0)
+            # Warm red for compressed spheres, cool gray for uncompressed.
+            self._lattice_colors[idx] = [
+                t, 0.2 * (1 - t), 1 - t] if dl[i] > 1e-8 else [0.3, 0.3, 0.35]
+            idx += 1
+        if idx == 0:
+            return
+        self.viewer.log_shapes(
+            "/cslc_lattice", newton.GeoType.SPHERE, self._lattice_radius,
+            wp.array(self._lattice_xforms[:idx], dtype=wp.transform),
+            wp.array(self._lattice_colors[:idx], dtype=wp.vec3),
+            wp.array(self._lattice_mats[:idx], dtype=wp.vec4))
 
     def _render_ui(self, imgui):
         imgui.text(f"Contact: {self.contact_model}")
@@ -1006,6 +1107,12 @@ class Example:
                             help="Skip APPROACH+SQUEEZE; start at squeeze-end position.")
         parser.add_argument("--warm-start-sphere-vz", action="store_true",
                             help="Init sphere vz = lift_speed at t=0.")
+        parser.add_argument(
+            "--show-lattice", action="store_true", default=True,
+            help="Render the CSLC lattice spheres in the viewer (default).")
+        parser.add_argument(
+            "--no-lattice", dest="show_lattice", action="store_false",
+            help="Hide the CSLC lattice viz.")
         parser.add_argument("--cslc-ka", type=float, default=None,
                             help="Override CSLC anchor stiffness ka [N/m].")
         parser.add_argument("--cslc-contact-fraction", type=float, default=None,

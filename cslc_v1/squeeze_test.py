@@ -121,8 +121,16 @@ class SceneParams:
     pad_hx: float = 0.01
     pad_hy: float = 0.02
     pad_hz: float = 0.05
-    pad_gap_initial: float = 0.04        # distance between inner pad faces
-    pad_squeeze_speed: float = 0.005     # m/s inward per pad
+    # Penetration regime is now aligned with lift_test.py: hold pen ≈ 1 mm
+    # per side after the active squeeze.  Sphere diameter = 60 mm, so
+    # gap_initial=59mm ⇒ initial pen = 0.5 mm/side; squeeze adds 0.5 mm
+    # over 0.5 s → 1 mm/side at HOLD start.  This puts both tests in the
+    # same operating point as the §2 fair-calibration derivation in
+    # cslc_v1/summary.md, where CSLC's distributed-constraint advantage
+    # is unambiguous (vs the previous 12.5 mm "deep-deformation" regime
+    # in which hydro happened to win on creep).
+    pad_gap_initial: float = 0.059       # 0.5 mm initial pen / side
+    pad_squeeze_speed: float = 0.001     # 1 mm/s → 0.5 mm extra in 0.5 s
     pad_squeeze_duration: float = 0.5    # seconds of active squeeze
     pad_hold_duration: float = 1.5       # seconds of holding under gravity
 
@@ -132,31 +140,33 @@ class SceneParams:
     kf: float = 100.0
     mu: float = 0.5
 
-    # ── CSLC tuning ──
+    # ── CSLC tuning (matched to lift_test.py fair calibration) ──
     cslc_spacing: float = 0.005
-    cslc_ka: float = 5000.0
+    cslc_ka: float = 15000.0  # fair-cal target: N·ka > ke_bulk so the
+                              # exact branch of recalibrate_cslc_kc_per_pad
+                              # solves for kc instead of falling back to
+                              # the kc = ke/N approximation.
     cslc_kl: float = 500.0
     cslc_dc: float = 2.0
     cslc_n_iter: int = 20
     cslc_alpha: float = 0.6
     # Contact fraction used for per-pad kc calibration (see
-    # `recalibrate_cslc_kc_per_pad`).  Default 0.46 matches the empirically
-    # observed active fraction in this squeeze scene (174 of 378 surface
-    # spheres active under 15 mm total penetration).  Setting this equal
-    # to the observed fraction makes each pad's aggregate contact stiffness
-    # at uniform contact equal to `ke_bulk`, which is the fair per-shape
-    # analogue of a point-contact spring at the same material stiffness.
-    # Use None to keep the built-in default from `calibrate_kc` (0.15, all
-    # pads sharing one budget).
-    cslc_contact_fraction: float | None = 0.46
+    # `recalibrate_cslc_kc_per_pad`).  At 1 mm face_pen on this pad
+    # geometry only ~5 of 189 surface spheres per pad lie inside the
+    # active patch — cf=0.025 reflects that.  With ka=15000 and
+    # ke_bulk=5e4 the calibration solves to kc=75000, keff=12500,
+    # aggregate per pad = 50000 N/m = ke_bulk ✓.  See §2 in
+    # cslc_v1/summary.md for the full derivation.
+    # Use None to keep the built-in default from `calibrate_kc` (0.15).
+    cslc_contact_fraction: float | None = 0.025
 
     # ── hydroelastic (for optional comparison) ──
-    # kh = hydroelastic modulus [Pa].  1e10 is steel-stiff and triggers a
-    # MuJoCo solver instability (sphere ejected from grip after squeeze).
-    # 1e8 is a stable starting point for silicone-rubber-stiff pads and
-    # gives a contact patch comparable in size to CSLC's.  Sweep cf
-    # SECTION 6 of cslc_v1/convo_april_19.md for the kh-stability curve.
-    kh: float = 1.0e8
+    # kh = hydroelastic modulus [Pa], fair-calibrated so that
+    # kh · A_patch(1 mm pen) = ke_bulk.  At r=30 mm the patch area
+    # A_patch = π·(2·r·pen) ≈ 188 mm², so kh = 5e4 / 1.88e-4 = 2.65e8 Pa.
+    # See §2 in cslc_v1/summary.md.  At kh=1e10 the solver ejects the
+    # sphere; the §1 stability sweep documents the safe range.
+    kh: float = 2.65e8
     sdf_resolution: int = 64
 
     # ── integration ──
@@ -1096,6 +1106,12 @@ class Example:
         self.current_contacts = 0
         self.initial_z = self.p.sphere_start_z
 
+        # FD telemetry (body_qd is stale under MuJoCo GPU — derive vz
+        # from position history sampled every print interval).
+        self._prev_sphere_z = None
+        self._prev_pad_lx = None
+        self._prev_pad_rx = None
+
         self.viewer.set_model(self.model)
         self.viewer.set_camera(
             pos=wp.vec3(0.4, -0.4, self.p.sphere_start_z + 0.1),
@@ -1140,8 +1156,40 @@ class Example:
         self.simulate()
         self.sim_time += self.frame_dt
         q = self.state_0.body_q.numpy()
-        self.current_z_drop_mm = (self.initial_z - float(q[2, 2])) * 1e3
+        sphere_z = float(q[2, 2])
+        pad_lx = float(q[0, 0])
+        pad_rx = float(q[1, 0])
+        self.current_z_drop_mm = (self.initial_z - sphere_z) * 1e3
         self.current_contacts = count_active_contacts(self.contacts)
+
+        # Periodic console diagnostics (every ~100 ms of sim time).  The
+        # mujoco GPU solver doesn't expose a usable sphere body_qd, so
+        # vz is derived from position history at the print stride.
+        if self.sim_step % (self.sim_substeps * 6) < self.sim_substeps:
+            t = self.sim_step * self.p.dt
+            phase = "SQUEEZE" if t < self.p.pad_squeeze_duration else "HOLD"
+            gap = (pad_rx - self.p.pad_hx) - (pad_lx + self.p.pad_hx)
+            face_pen = self.p.sphere_radius * 2.0 - gap
+
+            dt_print = 6.0 * self.frame_dt
+            if self._prev_sphere_z is None:
+                vz_sphere = 0.0
+            else:
+                vz_sphere = (sphere_z - self._prev_sphere_z) / dt_print
+            self._prev_sphere_z = sphere_z
+
+            cslc_str = ""
+            if self.contact_model == "cslc":
+                ci = read_cslc_state(self.model)
+                if ci:
+                    cslc_str = (f"  cslc={ci['n_active_surface']}/{ci['n_total_surface']}"
+                                f"  δ_max={ci['max_delta']*1e3:.2f}mm")
+
+            _log(f"[{phase:7s}] step={self.sim_step:5d}  "
+                 f"sz={sphere_z:+.4f}m  drop={self.current_z_drop_mm:+6.2f}mm  "
+                 f"vz={vz_sphere*1e3:+6.2f}mm/s  "
+                 f"face_pen={face_pen*1e3:+5.2f}mm  "
+                 f"n={self.current_contacts}{cslc_str}")
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)

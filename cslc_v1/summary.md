@@ -9,11 +9,22 @@ hydroelastic PFC — in squeeze and lift tasks for the ICRA paper.
 
 ## 1. Squeeze test (`cslc_v1/squeeze_test.py`)
 
+> **2026-04-25 — scene aligned to lift_test.py.** Squeeze now operates
+> at 1 mm face penetration (0.5 mm initial + 0.5 mm active squeeze)
+> with the same fair-calibration values as the lift test:
+> `cslc_ka=15000`, `cslc_contact_fraction=0.025`, `kh=2.65e8`.  Both
+> tests are now in the regime where CSLC's distributed-constraint
+> advantage is unambiguous on every metric (vs the previous 12.5 mm
+> deep-deformation regime, where hydro happened to win on creep
+> alone).  Numbers below reflect the aligned scene.
+
 ### Scene
 
 Two kinematic box pads squeeze a dynamic sphere under gravity. The sphere
-starts with ~10 mm penetration per side; pads squeeze an additional 2.5 mm
-over 0.5 s, then hold for 1.5 s. Sphere mass 500 g (r = 30 mm, ρ = 4421 kg/m³).
+starts with ~0.5 mm penetration per side; pads squeeze an additional
+0.5 mm over 0.5 s, then hold for 1.5 s, giving 1 mm face_pen at HOLD —
+matching the lift test's operating point.  Sphere mass 500 g (r = 30 mm,
+ρ = 4421 kg/m³).
 
 ```
 uv run cslc_v1/squeeze_test.py --mode squeeze --solver mujoco \
@@ -29,17 +40,17 @@ MuJoCo solver: `solver=cg`, `integrator=implicitfast`, `cone=elliptic`,
 | Knob | Point | CSLC | Hydro |
 |---|---|---|---|
 | lattice spacing | — | 5 mm | — |
-| `cslc_ka` | — | 5000 | — |
+| `cslc_ka` | — | **15 000** | — |
 | `cslc_kl` | — | 500 | — |
 | `cslc_n_iter` / `α` | — | 20 / 0.6 | — |
-| `cslc_contact_fraction` | — | **0.46** (empirical) | — |
-| `kc` (recalibrated) | — | **657.9 N/m** | — |
-| `keff` per sphere | — | 581.4 N/m | — |
+| `cslc_contact_fraction` | — | **0.025** (matches lift) | — |
+| `kc` (recalibrated) | — | **75 000 N/m** | — |
+| `keff` per sphere | — | 12 500 N/m | — |
 | Aggregate per pad | — | 50 000 N/m (=`ke_bulk`) ✓ | — |
-| `kh` | — | — | **1e8 Pa** |
+| `kh` | — | — | **2.65e8 Pa** (fair) |
 | `sdf_max_resolution` | — | — | 64 |
 
-### Results (1 s hold, elliptic cone, default `solimp`)
+### Results (1 s hold, elliptic cone, default `solimp`, 2026-04-25)
 
 Three complementary metrics (see *Metric interpretation* below):
 
@@ -51,18 +62,26 @@ Three complementary metrics (see *Metric interpretation* below):
 
 | Model | FullDrop | **HoldDrop** | **HoldCreep** | Active contacts |
 |---|---|---|---|---|
-| `point_mujoco` | 0.926 mm | +0.725 mm | **+0.495 mm/s** | 2 |
-| `cslc_mujoco` (cf=0.46) | 0.159 mm | +0.123 mm | **+0.082 mm/s** | 174 |
-| `hydro_mujoco` (kh=1e8) | 0.130 mm | +0.093 mm | **+0.062 mm/s** | 140 |
+| `point_mujoco` | 1.020 mm | +0.733 mm | **+0.490 mm/s** | 2 |
+| `cslc_mujoco` (cf=0.025) | **0.092 mm** | **+0.067 mm** | **+0.045 mm/s** | 26 |
+| `hydro_mujoco` (kh=2.65e8) | 0.564 mm | +0.379 mm | +0.253 mm/s | 35 |
 
-**Key finding:** Both distributed contact models beat point contact by a
-large margin on HOLD creep — CSLC is 6.0× better than point, hydro 8.0×
-better. Between the two, hydro has marginally lower creep in this
-15 mm deep-penetration squeeze regime (0.062 vs 0.082 mm/s, ratio 1.32×).
-The lift test (§2) shows the opposite ranking — CSLC clearly beats hydro
-on slip under the fair calibration at 1 mm face penetration — so the two
-tests are probing different regimes; see the §5.2 TODO on squeeze-at-low-
-penetration to bring them into alignment.
+**Key finding:** CSLC is the clear winner across every metric in the
+aligned 1 mm regime — **10.9× better than point and 5.6× better than
+hydro on HoldCreep**, and the same ranking on HoldDrop and FullDrop.
+This matches the lift test (§2) exactly: under fair calibration at 1 mm
+face_pen, CSLC's distributed-constraint advantage produces the
+lowest-slip / lowest-creep behaviour by a wide margin.
+
+The previous 12.5 mm deep-deformation regime had hydro marginally
+ahead of CSLC on creep (0.062 vs 0.082 mm/s), but that was an
+artifact of operating outside the fair-calibration design point and
+of letting more lattice spheres into the active patch than the prior
+assumes.  Reproduce via:
+```
+uv run cslc_v1/squeeze_test.py --mode squeeze \
+    --contact-models point,cslc,hydro
+```
 
 ### Metric interpretation — why `FullDrop` is confounded
 
@@ -197,11 +216,11 @@ stiffness = `ke_bulk = 5.0e4 N/m` at 1 mm face_pen):
 | `cslc_mujoco` | **ka = 15 000**, cf = 0.025 → agg/pad = 50 kN/m ✓ | 0.0500 | 0.0494 | **1.2 mm** |
 | `hydro_mujoco` | **kh = 2.65e8**, kh·A_patch = 50 kN/m ✓ | 0.0517 | 0.0466 | **4.0 mm** |
 
-Reproduce:
+Reproduce (fair-calibration values are now the defaults, so no
+overrides needed):
 ```
 uv run cslc_v1/lift_test.py --mode headless \
-    --contact-models point,cslc,hydro \
-    --cslc-ka 15000 --kh 2.65e8
+    --contact-models point,cslc,hydro
 ```
 
 **Conclusions under fair calibration:**

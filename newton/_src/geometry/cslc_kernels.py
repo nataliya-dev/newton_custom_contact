@@ -167,6 +167,45 @@ def lattice_solve_equilibrium(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Kernel 2b: Active-pad-selective copy
+#
+#  When `lattice_solve_equilibrium` runs for one pair (active pad P), it
+#  writes a per-sphere δ for *every* sphere — including spheres on other
+#  pads, where φ was zeroed in Kernel 1 and so δ ends up at zero.
+#  Unconditionally copying that full δ buffer back into
+#  `CSLCData.sphere_delta` would wipe the other pad's warm-start every
+#  step, leaving only the *last* pair's pad with non-zero compression in
+#  `sphere_delta`.  That breaks visualisation (lattice viz reads
+#  `sphere_delta` and would render only one pad as compressed) and warm
+#  starts (next step's φ for the wiped pad starts from δ=0 again).
+#
+#  The iterative jacobi path doesn't have this problem because
+#  `jacobi_step` has an active-pad branch that pass-throughs δ for
+#  non-active pads.  This selective-copy kernel adds the same guard to
+#  the dense-solve path's writeback: only update sphere_delta[i] when
+#  sphere i belongs to the active pad.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@wp.kernel
+def cslc_copy_active(
+    src: wp.array(dtype=wp.float32),
+    sphere_shape: wp.array(dtype=wp.int32),
+    active_cslc_shape_idx: int,
+    dst: wp.array(dtype=wp.float32),
+):
+    """dst[i] ← src[i] only for spheres on the active CSLC pad.
+
+    Used by `cslc_handler._launch_vs_sphere` to merge the dense-solve
+    output back into `CSLCData.sphere_delta` without clobbering other
+    pads' warm-starts.
+    """
+    i = wp.tid()
+    if sphere_shape[i] == active_cslc_shape_idx:
+        dst[i] = src[i]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Kernel 2: Damped Jacobi iteration
 # ═══════════════════════════════════════════════════════════════════════════
 

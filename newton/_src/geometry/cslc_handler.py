@@ -22,6 +22,7 @@ import warp as wp
 from .cslc_data import CSLCData, CSLCPad, calibrate_kc, create_pad_for_box, create_pad_for_box_face
 from .cslc_kernels import (
     compute_cslc_penetration_sphere,
+    cslc_copy_active,
     jacobi_step,
     lattice_solve_equilibrium,
     write_cslc_contacts,
@@ -483,8 +484,23 @@ class CSLCHandler:
                     )
                     src, dst = dst, src
 
-            # Warm-start: write converged delta back
-            wp.copy(data.sphere_delta, src)
+            # Warm-start: write converged delta back, but ONLY for the
+            # active pad's spheres.  In the dense-solve path, `src` carries
+            # zeros for non-active spheres (because their phi was zeroed
+            # in Kernel 1, and lattice_solve_equilibrium runs unfiltered);
+            # an unconditional `wp.copy` would wipe the other pad's
+            # warm-start every step.  The iterative jacobi path passes
+            # non-active deltas through unchanged via `jacobi_step`'s pad
+            # filter, so this selective copy is also a safe no-op for
+            # non-active spheres in that path.  See cslc_kernels.py
+            # `cslc_copy_active` for the rationale.
+            wp.launch(
+                kernel=cslc_copy_active,
+                dim=data.n_spheres,
+                inputs=[src, data.sphere_shape, pair.cslc_shape],
+                outputs=[data.sphere_delta],
+                device=self.device,
+            )
 
             # ── Kernel 3: Write contacts ──
             wp.launch(
