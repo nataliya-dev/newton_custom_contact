@@ -4,31 +4,36 @@ Newton + MuJoCo integration of the CSLC (Compliant Sphere Lattice Contact) model
 Goal: validate that CSLC outperforms point contact — and matches or beats
 hydroelastic PFC — in squeeze and lift tasks for the ICRA paper.
 
----
 
 
 ## 1. Squeeze test (`cslc_v1/squeeze_test.py`)
 
-> **2026-04-25 — scene aligned to lift_test.py.** Squeeze now operates
-> at 1 mm face penetration (0.5 mm initial + 0.5 mm active squeeze)
-> with the same fair-calibration values as the lift test:
-> `cslc_ka=15000`, `cslc_contact_fraction=0.025`, `kh=2.65e8`.  Both
-> tests are now in the regime where CSLC's distributed-constraint
-> advantage is unambiguous on every metric (vs the previous 12.5 mm
-> deep-deformation regime, where hydro happened to win on creep
-> alone).  Numbers below reflect the aligned scene.
-
 ### Scene
 
-Two kinematic box pads squeeze a dynamic sphere under gravity. The sphere
-starts with ~0.5 mm penetration per side; pads squeeze an additional
-0.5 mm over 0.5 s, then hold for 1.5 s, giving 1 mm face_pen at HOLD —
-matching the lift test's operating point.  Sphere mass 500 g (r = 30 mm,
-ρ = 4421 kg/m³).
+Two kinematic box pads squeeze a dynamic target (sphere or book) under
+gravity.  The pad geometry (40×100 mm contact face, 20 mm thick) and
+trajectory are shared across object kinds: ~0.5 mm initial penetration
+per side, 0.5 mm active squeeze over 0.5 s, 1.5 s HOLD — giving 1 mm
+face_pen at HOLD on the sphere target (matching the lift test's
+operating point) and ~4 mm at HOLD on the book target.
+
+The squeeze test supports two held targets via `--object`:
+
+- **`sphere`** (default) — r = 30 mm, m = 500 g, ρ = 4421 kg/m³.
+  The fair-calibration regime: 1 mm face_pen with
+  `cslc_ka=15000`, `cslc_contact_fraction=0.025`, `kh=2.65e8`.
+- **`book`** — trade-paperback dimensions (152 × 229 × 25 mm, 0.45 kg,
+  ρ ≈ 515 kg/m³).  Pads grip the wide ±x covers; the pad face fits
+  comfortably inside the cover (pad/cover area ≈ 11 %).  Book mode
+  uses `cslc_contact_fraction=1.0` (full pad-on-cover overlap → all
+  189 surface spheres engage) and patch-area-matched
+  `kh = ke/(2hy·2hz) ≈ 1.25e7 Pa`.
 
 ```
 uv run cslc_v1/squeeze_test.py --mode squeeze --solver mujoco \
-    --contact-models point,cslc,hydro
+    --contact-models point,cslc,hydro            # sphere
+uv run cslc_v1/squeeze_test.py --mode squeeze --object book \
+    --contact-models point,cslc,hydro            # book
 ```
 
 ### Tuning parameters (shared and per-model)
@@ -50,51 +55,90 @@ MuJoCo solver: `solver=cg`, `integrator=implicitfast`, `cone=elliptic`,
 | `kh` | — | — | **2.65e8 Pa** (fair) |
 | `sdf_max_resolution` | — | — | 64 |
 
-### Results (1 s hold, elliptic cone, default `solimp`, 2026-04-25)
+### Metrics
 
-Three complementary metrics (see *Metric interpretation* below):
+Three complementary HOLD-phase numbers are reported per model:
 
-- `FullDrop` = `sphere_z[0] − min(sphere_z)` (legacy metric — **confounded** by
-  the squeeze transient; do not use for cross-model comparison).
-- `HoldDrop` = `sphere_z[n_squeeze_steps] − sphere_z[-1]` (displacement
+- `FullDrop` = `target_z[0] − min(target_z)` (legacy metric —
+  **confounded** by the squeeze transient; do not use for
+  cross-model comparison).
+- `HoldDrop` = `target_z[n_squeeze_steps] − target_z[-1]` (displacement
   during HOLD only; positive = fell, negative = rose).
 - `HoldCreep` = second-half-of-HOLD mean velocity (positive = falling).
+- `MaxTilt` (book mode only) = peak rotation magnitude of the held body
+  during HOLD, in degrees.
 
-| Model | FullDrop | **HoldDrop** | **HoldCreep** | Active contacts |
+For the paper, `HoldCreep` is the primary number — solver-compliance-
+dominated and directly comparable across models.
+
+### Results — `--object sphere` (default)
+
+| Model | FullDrop | HoldDrop | **HoldCreep** | Active contacts |
 |---|---|---|---|---|
 | `point_mujoco` | 1.020 mm | +0.733 mm | **+0.490 mm/s** | 2 |
 | `cslc_mujoco` (cf=0.025) | **0.092 mm** | **+0.067 mm** | **+0.045 mm/s** | 26 |
 | `hydro_mujoco` (kh=2.65e8) | 0.564 mm | +0.379 mm | +0.253 mm/s | 35 |
 
-**Key finding:** CSLC is the clear winner across every metric in the
-aligned 1 mm regime — **10.9× better than point and 5.6× better than
-hydro on HoldCreep**, and the same ranking on HoldDrop and FullDrop.
-This matches the lift test (§2) exactly: under fair calibration at 1 mm
-face_pen, CSLC's distributed-constraint advantage produces the
-lowest-slip / lowest-creep behaviour by a wide margin.
+CSLC wins every metric — **10.9× better than point and 5.6× better than
+hydro on HoldCreep** — and the same ranking carries through HoldDrop and
+FullDrop.  This matches the lift test (§2) exactly: under fair
+calibration at 1 mm face_pen, CSLC's distributed-constraint advantage
+produces the lowest-slip / lowest-creep behaviour by a wide margin.
 
-The previous 12.5 mm deep-deformation regime had hydro marginally
-ahead of CSLC on creep (0.062 vs 0.082 mm/s), but that was an
-artifact of operating outside the fair-calibration design point and
-of letting more lattice spheres into the active patch than the prior
-assumes.  Reproduce via:
+### Results — `--object book` (trade paperback, post 2026-04-26 realistic dims)
+
+Pads grip the wide ±x covers of a 152×229×25 mm, 0.45 kg trade
+paperback (`book_hx=0.0125`, `book_hy=0.076`, `book_hz=0.115`,
+`book_density=515`).  Pad face penetration starts at 1.5 mm; HOLD pen
+is ~4 mm.  CSLC binds all 189 surface lattice spheres per pad (full
+pad-on-cover overlap), giving — with the calibration prior
+`cslc_contact_fraction=1.0` — `kc = 269.3 N/m`, `keff = 264.6 N/m`,
+agg/pad = 50 000 N/m = `ke_bulk` ✓.  Hydro uses the patch-area-matched
+modulus `kh = ke/(2hy·2hz) ≈ 1.25e7 Pa`.
+
+| Model | FullDrop | HoldDrop | HoldCreep | MaxTilt | Active contacts |
+|---|---|---|---|---|---|
+| `point_mujoco` | 0.238 mm | +0.179 mm | +0.119 mm/s | 0.00° | 8 |
+| `cslc_mujoco` (cf=1.0) | **0.088 mm** | **+0.067 mm** | **+0.045 mm/s** | **0.00°** | **378** |
+| `hydro_mujoco` (kh=1.25e7) | 0.563 mm | +0.378 mm | +0.260 mm/s | 1.11° | 105 |
+
+CSLC is **2.6× better than point** and **5.8× better than hydro** on
+HoldCreep, same qualitative ranking as the sphere scene.  CSLC also has
+the lowest baseline MaxTilt (exactly 0°) — hydro shows ~1° rotational
+drift from how its pressure-field polygons distribute around the book
+corners.
+
 ```
-uv run cslc_v1/squeeze_test.py --mode squeeze \
+uv run cslc_v1/squeeze_test.py --mode squeeze --object book \
     --contact-models point,cslc,hydro
 ```
 
-### Metric interpretation — why `FullDrop` is confounded
+### Disturbance experiments (HOLD-only external wrench)
 
-`FullDrop = z[0] − min(z)` commingles the SQUEEZE transient (pads closing,
-sphere accelerating through ~15 mm of penetration) with the HOLD-phase
-compliance drift we actually care about, so the number depends on the
-ramp profile as well as the contact model.
+The squeeze test supports `--external-force fx,fy,fz` and
+`--external-torque tx,ty,tz` (world frame, applied to the held body
+during HOLD only via `cslc_v1/common.py:apply_external_wrench`).
+At realistic trade-paperback dimensions the friction-cone budget is
+comfortably above gravity, so all three contact models hold under
+moderate disturbances; differentiation is on creep, not catastrophic
+failure.  Representative numbers (book, μ=0.5, default pen):
 
-Both `HoldDrop` and `HoldCreep` isolate the HOLD phase and so strip out the
-squeeze transient. For the paper, report `HoldCreep` (rate) as the primary
-number — it's solver-compliance-dominated and comparable across models.
-Keep `HoldDrop` as secondary so a reader can see sign and magnitude at a
-glance.
+| Disturbance | point HoldCreep / Tilt | cslc HoldCreep / Tilt | hydro HoldCreep / Tilt |
+|---|---|---|---|
+| none | +0.119 / 0.00° | **+0.045 / 0.00°** | +0.260 / 1.11° |
+| 5 N down | +0.119 / 0.06° | **+0.045 / 0.55°** | +0.258 / 1.27° |
+| τ_x = 5 N·m | +0.119 / 0.00° | **+0.045 / 0.00°** | +0.232 / 1.24° |
+| τ_z = 100 N·m | -0.924 / 0.00° (rises) | **-0.283 / 0.00°** | -0.942 / — |
+
+Caveat — the dramatic "point ejects the book" failures observed in
+earlier sweeps required the unrealistic 16×300×400 mm, 1.2 kg paper-
+spec panel (300 mm of book overhang past the pad on both sides, huge
+tilt-lever arms on every contact-line corner).  At realistic
+gripper-vs-book proportions point contact is much more competent — the
+edge of the book is closer to the pad, so corner-loss cascades don't
+get the leverage to develop.  To reproduce the original cliff,
+manually set `book_hx=0.008, book_hy=0.15, book_hz=0.20,
+book_density=625` in `SceneParams`.
 
 ### Active contacts — what the column actually means
 
@@ -108,47 +152,60 @@ apples-to-oranges.
 
 ### Per-pad calibration (kept invariant — do not revert)
 
-`calibrate_kc` defaults to `per_pad=True`: each pad's aggregate stiffness at
-uniform contact equals `ke_bulk`, regardless of pad count.
-`recalibrate_cslc_kc_per_pad(model, 0.46)` inside `squeeze_test.py` overrides
-`kc` so the actual active-contact count (174/378 ≈ 0.46) matches the
-calibration prior. Without this override the handler default cf=0.3
-under-estimates the active count and each pad aggregates to only 14 286 N/m,
-not the intended 50 000 N/m.
+`calibrate_kc` defaults to `per_pad=True`: each pad's aggregate stiffness
+at uniform contact equals `ke_bulk`, regardless of pad count.
+`recalibrate_cslc_kc_per_pad(model, contact_fraction)` (now in
+`cslc_v1/common.py`) overrides `kc` so the active-contact count
+matches the calibration prior.  Without this override, the handler
+default `cf=0.3` under-estimates the active count for sphere targets
+(only ~5/189 spheres active at 1 mm Hertzian pen) and each pad
+aggregates to far less than the intended `ke_bulk`.
 
 Exact derivation (positive denominator):
 ```
-N_contact_per_pad · kc·ka/(ka+kc) = ke_bulk
-→ kc = ke_bulk · ka / (N · ka − ke_bulk)
+N_contact_per_pad · kc · ka / (ka + kc) = ke_bulk
+→ kc = ke_bulk · ka / (N · ka − ke_bulk)        (if N·ka > ke_bulk)
+→ kc = ke_bulk / N                              (fallback otherwise)
 ```
-With N=86, ka=5000, ke=50000: `kc = 657.9 N/m`. Aggregate per pad ≈ 50 000 N/m ✓.
 
-### Resolution scaling experiment (spacing 5 mm → 2.5 mm)
+Operating-point values per scene:
+
+| Scene | cf prior | N_per_pad | `ka` | `kc` | `keff` | Aggregate / pad |
+|---|---|---|---|---|---|---|
+| Sphere (1 mm pen) | 0.025 | 4 | 15 000 | 75 000 | 12 500 | 50 000 ✓ |
+| Book (full pad-on-cover) | 1.0 | 189 | 15 000 | 269.3 (fallback) | 264.6 | 50 000 ✓ |
+
+### Historical sweeps (pre-2026-04-25 deep-pen regime)
+
+> The two tables below were collected at the original 15 mm-pen squeeze
+> (cf=0.46, ka=5000), before the scene was aligned to the lift test's
+> 1 mm operating point.  Absolute numbers don't carry over to the
+> current setup, but the **qualitative findings still apply** and
+> motivate today's defaults.
+
+**Resolution scaling (spacing 5 mm → 2.5 mm).** Doubling lattice
+density at fixed pad geometry roughly doubled the active sphere count
+and cut Z-drop by ~1.8× — sub-linear `N^0.4` scaling, consistent with
+diminishing returns from constraint distribution under MuJoCo's CG
+solver.
 
 | Spacing | N_active / pad | `kc` | Z-drop |
 |---|---|---|---|
 | 5 mm | 87 | 657.9 | 0.214 mm |
 | 2.5 mm | 309 | ~161 | **0.119 mm** (10.3× better than point) |
 
-Active count scaled 3.55×; z-drop reduced 1.79× — sub-linear N^0.4 scaling,
-consistent with diminishing returns from constraint distribution under
-MuJoCo's CG solver.
-
-### Creep mitigation knobs tested
-
-Numbers below use legacy `FullDrop`. Only point and CSLC are listed;
-hydro was not part of this mitigation sweep.
+**Creep-mitigation knobs.** `solimp[1]=0.99` is a no-op — creep is not
+dominated by the impedance `dmax` because the CSLC kernel flattens
+`solimp` width to 0.001 (so `dmax` applies above 1 mm pen regardless).
+**Elliptic cone reduces creep ~24 % for both models while preserving
+the ratio**; it is now the production default for both squeeze and
+lift.
 
 | Change | Point FullDrop | CSLC FullDrop (cf=0.46) | Ratio |
 |---|---|---|---|
 | baseline (`solimp[1]=0.95`, pyramidal cone) | 1.223 mm | 0.214 mm | 5.71× |
 | `solimp[1] = 0.99` (both models) | 1.223 mm | 0.211 mm | 5.80× |
 | `cone="elliptic"` (default solimp) | **0.926 mm** | **0.166 mm** | 5.58× |
-
-`solimp[1]=0.99` does nothing: creep is not dominated by the impedance
-`dmax` (the CSLC kernel flattens `solimp` width to 0.001, so `dmax` applies
-above 1 mm penetration regardless). Elliptic cone reduces creep ~24% for
-both models while preserving the ratio; now the production default.
 
 ---
 
@@ -479,13 +536,6 @@ reasons: SAP solves the constrained problem rigorously; SemiImplicit doesn't
 have one to leak from. The MuJoCo creep floor is a known limitation; the
 paper should acknowledge it explicitly.
 
-### 3.2 Implications for the paper
-
-- **Don't port SAP to Newton** — 3–6 month engineering project.
-- **Use Drake directly** for any solver-side comparison the paper needs
-  (CSLC under MuJoCo vs PFC under SAP). Maintain a parallel Drake harness
-  rather than wrapping SAP into Newton.
-- **Newton/MuJoCo stays the primary platform** for differentiable CSLC.
 
 ---
 
@@ -667,13 +717,6 @@ parameters, and lift results). What's left:
 - **Inspect hydroelastic active contacts during lift** (all on the pad
   face, or are corner/edge polygons producing off-axis forces?). Plot
   contact points in world frame for one HOLD step per model.
-- **Squeeze-scene fair calibration** at low penetration. The squeeze
-  test (§1) uses 15 mm penetration — a deep-deformation regime where
-  hydro beats CSLC on HOLD creep (opposite of the lift test at 1 mm
-  face_pen). Either (a) drop squeeze penetration to ~1 mm to match the
-  lift regime, or (b) report squeeze results at 15 mm pen explicitly
-  as a deep-deformation regime where the three models differ physically,
-  not just in calibration.
 - **Match patch area as a secondary criterion**. Once force-PD lands
   (§5.5), additionally constrain `A_patch` to be shared across models so
   both grip force AND contact area are fixed, isolating the purely
@@ -948,11 +991,40 @@ without re-tuning per scene).
   - `out_damping = 0.0` (see §4.2)
   - `out_friction = 1.0` (see §4.3)
   - Smooth-gate Kernel 3 with hybrid emission (see §4.5).
+  - **CSLC vs BOX kernels (2026-04-26)**: `_box_signed_dist`,
+    `_box_closest_local`, `compute_cslc_penetration_box`,
+    `write_cslc_contacts_box`.  Gate uses box centroid (sphere-
+    convention) to avoid the closest-point sign flip across the box
+    surface; `solver_pen` and `point1` still use the closest-point so
+    MuJoCo's penetration math matches the kernel's `pen_3d`.
 - `newton/_src/geometry/cslc_handler.py`:
   - `_from_model` passes `build_A_inv=True` (see §4.5a performance).
   - `_launch_vs_sphere` dispatches to `lattice_solve_equilibrium` when
     `A_inv` is present; falls back to iterative Jacobi otherwise.
-- `cslc_v1/squeeze_test.py` — 3-way comparison wired via `--contact-models`;
-  HOLD-phase metrics (`hold_drop_mm`, `hold_creep_rate_mm_per_s`).
+  - **CSLC vs BOX dispatch (2026-04-26)**: `_launch_vs_box` mirrors
+    `_launch_vs_sphere` for box targets; `CSLCShapePair` cached fields
+    `other_local_xform` (full transform) + `other_half_extents`;
+    `supported_pairs` filter now includes `_GEOTYPE_BOX`.
+- `cslc_v1/common.py` (new in 2026-04-26 refactor) — shared helpers
+  for squeeze/lift/robot tests: `make_solver`, `count_active_contacts`,
+  `read_cslc_state`, `recalibrate_cslc_kc_per_pad`,
+  `apply_external_wrench`, `inspect_model`, `get_cslc_lattice_viz_data`.
+- `cslc_v1/squeeze_test.py` — 3-way comparison wired via
+  `--contact-models`; HOLD-phase metrics (`hold_drop_mm`,
+  `hold_creep_rate_mm_per_s`).  Held target selectable via
+  **`--object {sphere,book}`** — book mode exercises the box kernels
+  with realistic trade-paperback defaults (152×229×25 mm, 0.45 kg).
+  HOLD-only external wrench via `--external-force fx,fy,fz` /
+  `--external-torque tx,ty,tz` (applied through
+  `common.apply_external_wrench`).  Geometry / material overrides:
+  `--initial-pen <m>` (recomputes `pad_gap_initial` against the
+  target's squeeze-axis half-extent), `--mu <coeff>`,
+  `--book-mass <kg>`, `--cslc-spacing`, `--contact-fraction`.
+  Rotational metrics on `Metrics`: `max_tilt_deg`, `final_tilt_deg`.
 - `cslc_v1/lift_test.py` — 3-way comparison; per-pad kc recalibration with
   cf=0.025 via `recalibrate_cslc_kc_per_pad`; `--cslc-ka` / `--cslc-contact-fraction` / `--kh` CLI overrides; per-step timing diagnostic.
+- `cslc_v1/cslc_box_test.py` (new 2026-04-26) — 12 tests for the box
+  kernels: SDF analytical (7), K1 contact-active gate (4) regressing
+  the d_proj sign-flip bug, and one full-pipeline aggregate-force test
+  on the book scene.  Run via
+  `uv run --extra dev -m unittest cslc_v1.cslc_box_test -v`.

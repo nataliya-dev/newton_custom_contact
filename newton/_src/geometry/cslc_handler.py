@@ -21,11 +21,13 @@ import warp as wp
 
 from .cslc_data import CSLCData, CSLCPad, calibrate_kc, create_pad_for_box, create_pad_for_box_face
 from .cslc_kernels import (
+    compute_cslc_penetration_box,
     compute_cslc_penetration_sphere,
     cslc_copy_active,
     jacobi_step,
     lattice_solve_equilibrium,
     write_cslc_contacts,
+    write_cslc_contacts_box,
 )
 
 if TYPE_CHECKING:
@@ -43,15 +45,28 @@ _GEOTYPE_BOX = 7      # GeoType.BOX
 
 @dataclass
 class CSLCShapePair:
-    """A shape pair where one shape has the CSLC flag."""
+    """A shape pair where one shape has the CSLC flag.
+
+    Both sphere and box targets share this dataclass; which fields are
+    meaningful depends on `other_geo_type`.  Sphere targets populate
+    `other_local_pos` and `other_radius`; box targets populate
+    `other_local_xform` (the shape's body-local 7-vector transform) and
+    `other_half_extents`.
+    """
 
     cslc_shape: int
     other_shape: int
     other_geo_type: int
     # Cached at construction — avoids GPU→CPU sync per step (Bug 3)
     other_body: int = 0
+    # Sphere-target fields:
     other_local_pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
     other_radius: float = 0.0
+    # Box-target fields:
+    other_local_xform: tuple[float, float, float, float, float, float, float] = (
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    )
+    other_half_extents: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 class CSLCHandler:
     """CSLC contact generation handler for Newton's collision pipeline.
@@ -309,6 +324,20 @@ class CSLCHandler:
                     float(xform[0]), float(xform[1]), float(xform[2]),
                 )
                 pair.other_radius = float(shape_scale_np[pair.other_shape][0])
+            elif pair.other_geo_type == _GEOTYPE_BOX:
+                pair.other_body = int(shape_body_np[pair.other_shape])
+                xform = shape_transform_np[pair.other_shape]
+                pair.other_local_xform = (
+                    float(xform[0]), float(xform[1]), float(xform[2]),
+                    float(xform[3]), float(xform[4]),
+                    float(xform[5]), float(xform[6]),
+                )
+                # shape_scale entries are stored as half-extents for boxes.
+                pair.other_half_extents = (
+                    float(shape_scale_np[pair.other_shape][0]),
+                    float(shape_scale_np[pair.other_shape][1]),
+                    float(shape_scale_np[pair.other_shape][2]),
+                )
 
         # Build surface slot map: surface sphere i -> sequential slot index
         is_surface_np = cslc_data.is_surface.numpy()
@@ -328,11 +357,10 @@ class CSLCHandler:
 
 
 
-        supported_pairs = [p for p in shape_pairs if p.other_geo_type == _GEOTYPE_SPHERE]
-        n_pair_blocks = len(supported_pairs)
-
-
-        supported_pairs = [p for p in shape_pairs if p.other_geo_type == _GEOTYPE_SPHERE]
+        supported_geo_types = (_GEOTYPE_SPHERE, _GEOTYPE_BOX)
+        supported_pairs = [
+            p for p in shape_pairs if p.other_geo_type in supported_geo_types
+        ]
         n_pair_blocks = len(supported_pairs)
 
         if n_pair_blocks == 0:
@@ -382,16 +410,25 @@ class CSLCHandler:
             contact_offset: Starting index in contacts buffer for CSLC slots.
         """
 
-        sphere_pair_idx = 0
+        # Walk all supported pairs (sphere + box) with a single index so
+        # they share the contiguous CSLC contact-slot range and the
+        # per-pair raw_penetration scratch buffers.
+        pair_idx = 0
         for pair in self.shape_pairs:
             if pair.other_geo_type == _GEOTYPE_SPHERE:
-                pair_contact_offset = contact_offset + sphere_pair_idx * self.n_surface_contacts
-                self._launch_vs_sphere(model, state, contacts, pair_contact_offset, pair, sphere_pair_idx)
-                sphere_pair_idx += 1
+                pair_contact_offset = contact_offset + pair_idx * self.n_surface_contacts
+                self._launch_vs_sphere(
+                    model, state, contacts, pair_contact_offset, pair, pair_idx)
+                pair_idx += 1
+            elif pair.other_geo_type == _GEOTYPE_BOX:
+                pair_contact_offset = contact_offset + pair_idx * self.n_surface_contacts
+                self._launch_vs_box(
+                    model, state, contacts, pair_contact_offset, pair, pair_idx)
+                pair_idx += 1
             else:
                 warnings.warn(
                     f"CSLC vs geometry type {pair.other_geo_type} not yet implemented. "
-                    f"Only CSLC vs SPHERE is supported.",
+                    f"Only CSLC vs SPHERE and CSLC vs BOX are supported.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
@@ -582,4 +619,131 @@ class CSLCHandler:
             reason_summary = {int(v): int(c) for v, c in zip(vals, counts)}
             # print(f"CSLC_SUMMARY pair=({pair.cslc_shape},{pair.other_shape}) "
             #       f"base={base_count} cslc={cslc_count}{dist_info} "
+
+    def _launch_vs_box(
+        self,
+        model: Model,
+        state: State,
+        contacts: Contacts,
+        contact_offset: int,
+        pair: CSLCShapePair,
+        pair_idx: int,
+    ) -> None:
+        """Three-kernel pipeline for CSLC shape vs BOX target.
+
+        Same structure as `_launch_vs_sphere` but uses the box-target
+        kernels.  The dense lattice solve is shared (it's geometry-
+        agnostic) and runs against the same per-pair raw_penetration
+        scratch buffer.
+        """
+        data = self.cslc_data
+
+        pen_buf = self.raw_penetration_pairs[pair_idx]
+        self.raw_penetration = pen_buf
+
+        target_body = pair.other_body
+        target_local_xform = wp.transform(
+            wp.vec3(pair.other_local_xform[0],
+                    pair.other_local_xform[1],
+                    pair.other_local_xform[2]),
+            wp.quat(pair.other_local_xform[3],
+                    pair.other_local_xform[4],
+                    pair.other_local_xform[5],
+                    pair.other_local_xform[6]),
+        )
+        target_half_extents = wp.vec3(
+            pair.other_half_extents[0],
+            pair.other_half_extents[1],
+            pair.other_half_extents[2],
+        )
+
+        eps = float(data.smoothing_eps)
+
+        # ── Kernel 1: per-sphere penetration vs box surface ──
+        wp.launch(
+            kernel=compute_cslc_penetration_box,
+            dim=data.n_spheres,
+            inputs=[
+                data.positions, data.radii, data.sphere_delta,
+                data.sphere_shape, data.is_surface, data.outward_normals,
+                state.body_q, model.shape_body, model.shape_transform,
+                pair.cslc_shape,
+                target_body, pair.other_shape,
+                target_local_xform, target_half_extents,
+                eps,
+            ],
+            outputs=[pen_buf, self.contact_normal_scratch],
+            device=self.device,
+        )
+
+        # ── Kernel 2: lattice equilibrium (same dense solve) ──
+        if data.A_inv is not None:
+            wp.launch(
+                kernel=lattice_solve_equilibrium,
+                dim=data.n_spheres,
+                inputs=[data.A_inv, pen_buf, data.kc],
+                outputs=[self._jacobi_a],
+                device=self.device,
+            )
+            src = self._jacobi_a
+        else:
+            wp.copy(self._jacobi_a, data.sphere_delta)
+            src, dst = self._jacobi_a, self._jacobi_b
+            for _ in range(self.n_iter):
+                wp.launch(
+                    kernel=jacobi_step,
+                    dim=data.n_spheres,
+                    inputs=[
+                        src, dst, pen_buf, data.is_surface,
+                        data.neighbor_start, data.neighbor_count, data.neighbor_list,
+                        data.ka, data.kl, data.kc, self.alpha,
+                        data.sphere_shape, pair.cslc_shape, eps,
+                    ],
+                    device=self.device,
+                )
+                src, dst = dst, src
+
+        # Selectively merge the active pad's delta back into
+        # CSLCData.sphere_delta (preserves other pads' warm-starts).
+        wp.launch(
+            kernel=cslc_copy_active,
+            dim=data.n_spheres,
+            inputs=[src, data.sphere_shape, pair.cslc_shape],
+            outputs=[data.sphere_delta],
+            device=self.device,
+        )
+
+        # ── Kernel 3: write Newton contacts vs box surface ──
+        wp.launch(
+            kernel=write_cslc_contacts_box,
+            dim=data.n_spheres,
+            inputs=[
+                data.positions, data.radii, src,
+                data.sphere_shape, data.is_surface, data.outward_normals,
+                state.body_q, model.shape_body, model.shape_transform,
+                pair.cslc_shape,
+                target_body, pair.other_shape,
+                target_local_xform, target_half_extents,
+                contact_offset, self.surface_slot_map,
+                pen_buf,
+                contacts.rigid_contact_shape0,
+                contacts.rigid_contact_shape1,
+                contacts.rigid_contact_point0,
+                contacts.rigid_contact_point1,
+                contacts.rigid_contact_offset0,
+                contacts.rigid_contact_offset1,
+                contacts.rigid_contact_normal,
+                contacts.rigid_contact_margin0,
+                contacts.rigid_contact_margin1,
+                contacts.rigid_contact_tids,
+                data.kc,
+                data.dc,
+                eps,
+                contacts.rigid_contact_stiffness,
+                contacts.rigid_contact_damping,
+                contacts.rigid_contact_friction,
+                self.debug_reason,
+            ],
+            device=self.device,
+        )
             #       f"reasons={reason_summary}")

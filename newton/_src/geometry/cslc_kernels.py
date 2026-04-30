@@ -550,3 +550,347 @@ def write_cslc_contacts(
     out_friction[buf_idx]  = 1.0
 
     debug_reason[slot] = 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CSLC vs BOX target — penetration and contact writing
+#
+#  The sphere variant above assumed the target is a SPHERE primitive
+#  (centre + radius).  For a flat, rectangular target (a "book") the
+#  contact geometry is different: the closest point on the target lies
+#  on a face of the box, not at the centre.  These two box kernels
+#  mirror the sphere chain (kernel 1 + kernel 3) but compute the
+#  closest point on a box surface to each lattice sphere.
+#
+#  Convention vs the sphere variant:
+#    – `point1` is the closest point on the box surface (in box body
+#      frame), NOT the box centre.
+#    – `margin1 = 0` (the contact point already sits on the surface).
+#    – The d_proj smooth gate is computed against the
+#      lattice-centre-to-box-surface direction along the pad's outward
+#      normal, so it stays positive when the pad is pressing into the
+#      box (matching the sphere formulation).
+#
+#  Both kernels handle the case where the lattice centre is INSIDE the
+#  box (snap to nearest face) — important for safety even though it's
+#  rare in steady-state operation: the lattice centre normally sits
+#  just outside the box surface during HOLD.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@wp.func
+def _box_closest_local(p: wp.vec3, h: wp.vec3) -> wp.vec3:
+    """Closest point on a box of half-extents h to a local-frame point p.
+
+    For an outside point this is the per-axis clamp.  For an inside
+    point we snap the axis with the smallest face distance to its
+    surface, leaving the other two axes unchanged.
+    """
+    cx = wp.clamp(p[0], -h[0], h[0])
+    cy = wp.clamp(p[1], -h[1], h[1])
+    cz = wp.clamp(p[2], -h[2], h[2])
+
+    inside_x = wp.abs(p[0]) <= h[0]
+    inside_y = wp.abs(p[1]) <= h[1]
+    inside_z = wp.abs(p[2]) <= h[2]
+    is_inside = inside_x and inside_y and inside_z
+
+    if is_inside:
+        dx = h[0] - wp.abs(p[0])
+        dy = h[1] - wp.abs(p[1])
+        dz = h[2] - wp.abs(p[2])
+        if dx <= dy and dx <= dz:
+            cx = wp.sign(p[0]) * h[0]
+        else:
+            if dy <= dz:
+                cy = wp.sign(p[1]) * h[1]
+            else:
+                cz = wp.sign(p[2]) * h[2]
+
+    return wp.vec3(cx, cy, cz)
+
+
+@wp.func
+def _box_signed_dist(p: wp.vec3, h: wp.vec3) -> float:
+    """Signed distance from local-frame point p to the box surface.
+
+    Positive when p is outside, negative when inside (negative the
+    perpendicular distance to the nearest face).
+    """
+    cx = wp.clamp(p[0], -h[0], h[0])
+    cy = wp.clamp(p[1], -h[1], h[1])
+    cz = wp.clamp(p[2], -h[2], h[2])
+    diff = p - wp.vec3(cx, cy, cz)
+    outside_dist = wp.length(diff)
+
+    inside_x = wp.abs(p[0]) <= h[0]
+    inside_y = wp.abs(p[1]) <= h[1]
+    inside_z = wp.abs(p[2]) <= h[2]
+    is_inside = inside_x and inside_y and inside_z
+
+    sd = outside_dist
+    if is_inside:
+        dx = h[0] - wp.abs(p[0])
+        dy = h[1] - wp.abs(p[1])
+        dz = h[2] - wp.abs(p[2])
+        sd = -wp.min(wp.min(dx, dy), dz)
+    return sd
+
+
+@wp.kernel
+def compute_cslc_penetration_box(
+    sphere_pos_local: wp.array(dtype=wp.vec3),
+    sphere_radii: wp.array(dtype=wp.float32),
+    sphere_delta: wp.array(dtype=wp.float32),
+    sphere_shape: wp.array(dtype=wp.int32),
+    is_surface: wp.array(dtype=wp.int32),
+    sphere_outward_normal: wp.array(dtype=wp.vec3),
+    body_q: wp.array(dtype=wp.transform),
+    shape_body: wp.array(dtype=wp.int32),
+    shape_transform: wp.array(dtype=wp.transform),
+    active_cslc_shape_idx: int,
+    target_body_idx: int,
+    target_shape_idx: int,
+    target_local_xform: wp.transform,
+    target_half_extents: wp.vec3,
+    eps: float,
+    raw_penetration: wp.array(dtype=wp.float32),
+    contact_normal_out: wp.array(dtype=wp.vec3),
+):
+    """Per-lattice-sphere overlap with a BOX target.
+
+    Mirrors `compute_cslc_penetration_sphere` but with the box-surface
+    signed-distance computation in place of sphere-sphere overlap.
+        phi = smooth_relu(pen_3d, eps) * smooth_step(d_proj_gate, eps)
+    where pen_3d = r_lat - signed_dist_to_box_surface and d_proj_gate
+    is the projection of (box_centre - lattice_centre) on the pad's
+    outward normal.
+
+    *** Why the gate uses the BOX CENTROID, not the closest-point ***
+    A naive `d_proj = dot(closest - q_world, n_pad)` flips sign when
+    the lattice sphere transitions from outside the box (closest is
+    in the +n_pad direction → gate opens correctly) to inside the box
+    (closest is on the entry face, in the -n_pad direction → gate
+    closes wrongly during the steady-state HOLD configuration where
+    the lattice sphere is intentionally inside the box by ~1.5 mm).
+    Replacing `closest` with the box centroid mirrors the sphere-vs-
+    sphere convention exactly: ``diff = target_centre - q_world`` and
+    ``d_proj = dot(diff, n_pad)``.  The centroid is on the +n_pad side
+    of the lattice sphere whenever the pad is pressing into the box,
+    regardless of whether the sphere has crossed the box surface.
+    """
+    tid = wp.tid()
+    phi = 0.0
+    n_world = wp.vec3(0.0, 0.0, 0.0)
+
+    if sphere_shape[tid] != active_cslc_shape_idx:
+        raw_penetration[tid] = 0.0
+        return
+
+    if is_surface[tid] == 1:
+        s_idx = sphere_shape[tid]
+        b_idx = shape_body[s_idx]
+        X_ws = shape_transform[s_idx]
+        X_wb = body_q[b_idx]
+
+        p_local = sphere_pos_local[tid]
+        r_lat = sphere_radii[tid]
+        out_n = sphere_outward_normal[tid]
+
+        q_body = wp.transform_point(X_ws, p_local)
+        q_world = wp.transform_point(X_wb, q_body)
+
+        # Box's world transform = target body transform composed with
+        # target shape's body-local transform.
+        X_tb = body_q[target_body_idx]
+        X_tw = wp.transform_multiply(X_tb, target_local_xform)
+        X_tw_inv = wp.transform_inverse(X_tw)
+
+        q_target_local = wp.transform_point(X_tw_inv, q_world)
+        h = target_half_extents
+        signed_dist = _box_signed_dist(q_target_local, h)
+
+        # Pad outward normal in world frame — the gate direction.
+        n_body = wp.transform_vector(X_ws, out_n)
+        n_world = wp.transform_vector(X_wb, n_body)
+
+        # Sphere-convention gate: project the lattice-centre-to-box-
+        # centroid vector onto the pad's outward normal.  Positive
+        # whenever the pad is pressing toward the box bulk (both
+        # "approaching" and "already inside" configurations) and
+        # negative when the pad has been pulled past the box.
+        box_centre_world = wp.transform_get_translation(X_tw)
+        d_proj_gate = wp.dot(box_centre_world - q_world, n_world)
+
+        pen_3d = r_lat - signed_dist
+        phi = smooth_relu(pen_3d, eps) * smooth_step(d_proj_gate, eps)
+
+    raw_penetration[tid] = phi
+    contact_normal_out[tid] = n_world
+
+
+@wp.kernel
+def write_cslc_contacts_box(
+    sphere_pos_local: wp.array(dtype=wp.vec3),
+    sphere_radii: wp.array(dtype=wp.float32),
+    sphere_delta: wp.array(dtype=wp.float32),
+    sphere_shape: wp.array(dtype=wp.int32),
+    is_surface: wp.array(dtype=wp.int32),
+    sphere_outward_normal: wp.array(dtype=wp.vec3),
+    body_q: wp.array(dtype=wp.transform),
+    shape_body: wp.array(dtype=wp.int32),
+    shape_transform: wp.array(dtype=wp.transform),
+    active_cslc_shape_idx: int,
+    target_body_idx: int,
+    target_shape_idx: int,
+    target_local_xform: wp.transform,
+    target_half_extents: wp.vec3,
+    contact_offset: int,
+    surface_slot_map: wp.array(dtype=wp.int32),
+    raw_penetration: wp.array(dtype=wp.float32),
+    out_shape0: wp.array(dtype=wp.int32),
+    out_shape1: wp.array(dtype=wp.int32),
+    out_point0: wp.array(dtype=wp.vec3),
+    out_point1: wp.array(dtype=wp.vec3),
+    out_offset0: wp.array(dtype=wp.vec3),
+    out_offset1: wp.array(dtype=wp.vec3),
+    out_normal: wp.array(dtype=wp.vec3),
+    out_margin0: wp.array(dtype=wp.float32),
+    out_margin1: wp.array(dtype=wp.float32),
+    out_tids: wp.array(dtype=wp.int32),
+    cslc_kc: float,
+    cslc_dc: float,
+    eps: float,
+    out_stiffness: wp.array(dtype=wp.float32),
+    out_damping: wp.array(dtype=wp.float32),
+    out_friction: wp.array(dtype=wp.float32),
+    debug_reason: wp.array(dtype=wp.int32),
+):
+    """Write one Newton contact per active surface lattice sphere vs a BOX target.
+
+    Mirrors `write_cslc_contacts` but uses the closest point on the box
+    as `point1` (margin1 = 0) instead of a sphere centre + radius pair.
+    Same hybrid emission policy: contacts whose smooth gate is below
+    1e-4 are hard-culled (shape0 = -1) to avoid swamping MuJoCo's
+    per-constraint compliance leak in the deep tail.
+
+    Two distinct projections of the lattice-centre-to-box vector onto
+    the pad's outward normal are used:
+
+      * ``d_proj_solver = dot(closest_world - q_world, n_pad)`` enters
+        ``solver_pen = effective_r - d_proj_solver``, which exactly
+        matches what MuJoCo reconstructs from
+        ``margin0 + margin1 - dot(point1_world - point0_world, normal)``
+        with margin0 = effective_r, margin1 = 0,
+        point1_world = closest_world.  Required for the solver-side
+        penetration to be physically correct.
+
+      * ``d_proj_gate = dot(box_centre_world - q_world, n_pad)`` drives
+        the smooth contact-active gate.  Uses the box centroid (sphere-
+        kernel convention) rather than ``closest_world`` because the
+        latter flips sign when the lattice centre crosses the box
+        surface from outside to inside.  See the analogous discussion
+        in ``compute_cslc_penetration_box``.
+    """
+    tid = wp.tid()
+
+    slot = surface_slot_map[tid]
+    if slot < 0:
+        return
+    buf_idx = contact_offset + slot
+
+    if sphere_shape[tid] != active_cslc_shape_idx:
+        out_shape0[buf_idx] = -1
+        debug_reason[slot] = 4
+        return
+
+    s_idx = sphere_shape[tid]
+    b_idx = shape_body[s_idx]
+    X_ws = shape_transform[s_idx]
+    X_wb = body_q[b_idx]
+
+    p_local = sphere_pos_local[tid]
+    out_n = sphere_outward_normal[tid]
+    delta_val = sphere_delta[tid]
+    r_lat = sphere_radii[tid]
+
+    q_body = wp.transform_point(X_ws, p_local)
+    q_world = wp.transform_point(X_wb, q_body)
+
+    effective_r = smooth_relu(r_lat - delta_val, eps)
+
+    # Pad outward normal in world frame.
+    n_body_normal = wp.transform_vector(X_ws, out_n)
+    normal_ab = wp.transform_vector(X_wb, n_body_normal)
+
+    # Box closest-point in box body frame.
+    X_tb = body_q[target_body_idx]
+    X_tw = wp.transform_multiply(X_tb, target_local_xform)
+    X_tw_inv = wp.transform_inverse(X_tw)
+
+    q_target_local = wp.transform_point(X_tw_inv, q_world)
+    h = target_half_extents
+    closest_local = _box_closest_local(q_target_local, h)
+    signed_dist = _box_signed_dist(q_target_local, h)
+    closest_world = wp.transform_point(X_tw, closest_local)
+
+    # Solver-side projection (matches MuJoCo's reconstruction).
+    diff_world = closest_world - q_world
+    d_proj_solver = wp.dot(diff_world, normal_ab)
+
+    # Gate-side projection (centroid-based; sphere-kernel convention).
+    box_centre_world = wp.transform_get_translation(X_tw)
+    d_proj_gate = wp.dot(box_centre_world - q_world, normal_ab)
+
+    # 3-D overlap (positive when sphere overlaps box) and the
+    # solver-side projected penetration.  margin1 = 0 here because the
+    # contact point already lies on the box surface.
+    pen_3d = r_lat - signed_dist
+    solver_pen = effective_r - d_proj_solver
+    pen_scale = pen_3d * solver_pen / (solver_pen * solver_pen + eps * eps)
+
+    contact_gate = smooth_step(d_proj_gate, eps) * smooth_step(pen_3d, eps)
+
+    # Body-frame transforms for point0 / offset0 (lattice side) and
+    # point1 / offset1 (box side).  point1 is the closest-point in the
+    # target BODY frame (box's body, not its shape frame), since
+    # rigid_contact_point* are body-relative.
+    X_wb_inv = wp.transform_inverse(X_wb)
+    X_tb_inv = wp.transform_inverse(X_tb)
+
+    p0_body = wp.transform_point(X_wb_inv, q_world)
+    p1_body = wp.transform_point(X_tb_inv, closest_world)
+
+    # offset1 is zero because margin1 is zero (the contact point IS on
+    # the surface).  offset0 still pushes the lattice sphere's surface
+    # contribution along the normal by effective_r, exactly as in the
+    # sphere variant.
+    offset0_body = wp.transform_vector(X_wb_inv, effective_r * normal_ab)
+    offset1_body = wp.vec3(0.0, 0.0, 0.0)
+
+    # Hybrid emission: hard-cull when the smooth gate has decayed deep
+    # into its tail to limit MuJoCo's per-constraint compliance leak.
+    gate_threshold = float(1.0e-4)
+    if contact_gate < gate_threshold:
+        out_shape0[buf_idx] = -1
+        out_stiffness[buf_idx] = 0.0
+        debug_reason[slot] = 3
+        return
+
+    out_shape0[buf_idx] = s_idx
+    out_shape1[buf_idx] = target_shape_idx
+    out_point0[buf_idx] = p0_body
+    out_point1[buf_idx] = p1_body
+    out_offset0[buf_idx] = offset0_body
+    out_offset1[buf_idx] = offset1_body
+    out_normal[buf_idx] = normal_ab
+    out_margin0[buf_idx] = effective_r
+    out_margin1[buf_idx] = 0.0
+    out_tids[buf_idx] = 0
+
+    out_stiffness[buf_idx] = smooth_relu(
+        cslc_kc * pen_scale * contact_gate, 1.0e-9)
+    out_damping[buf_idx] = 0.0
+    out_friction[buf_idx] = 1.0
+
+    debug_reason[slot] = 0

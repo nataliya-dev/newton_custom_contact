@@ -40,59 +40,57 @@ Key diagnostics (printed every 50 steps in SQUEEZE/HOLD phases)
 
 from __future__ import annotations
 
-import argparse
 import math
 import sys
-import time
-import warnings
 from dataclasses import dataclass, field
-from typing import Any
 
 import numpy as np
 import warp as wp
 
 import newton
 import newton.examples
-from newton.solvers import SolverSemiImplicit
 
-try:
-    from newton.solvers import SolverMuJoCo
-    HAS_MUJOCO = True
-except ImportError:
-    HAS_MUJOCO = False
-    warnings.warn("SolverMuJoCo not available. MuJoCo configs disabled.")
+from cslc_v1.common import (
+    CSLC_FLAG,
+    GEO_NAMES,
+    HAS_MUJOCO,
+    _log,
+    _section,
+    apply_external_wrench,
+    count_active_contacts,
+    get_cslc_lattice_viz_data,
+    make_solver,
+    read_cslc_state,
+    recalibrate_cslc_kc_per_pad,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Formatting helpers
+#  Local formatting helpers (squeeze-test-specific section breaks)
 # ═══════════════════════════════════════════════════════════════════════════
 
-_SEP = "─" * 72
 _HSEP = "━" * 72
 _DSEP = "═" * 72
 
 
-def _section(title):
-    print(f"\n{_DSEP}\n  {title}\n{_DSEP}")
-
-
 def _sub(title):
-    print(f"\n  {_SEP}\n  {title}\n  {_SEP}")
+    print(f"\n  {'─' * 72}\n  {title}\n  {'─' * 72}")
 
 
-def _log(msg, indent=0):
-    print(f"  {'  ' * indent}│ {msg}")
+def _parse_xyz(s: str, label: str) -> tuple[float, float, float]:
+    """Parse 'x,y,z' into a 3-tuple, or raise a helpful error."""
+    try:
+        parts = [float(t.strip()) for t in s.split(",")]
+    except ValueError as e:
+        raise ValueError(f"--{label} expects 'x,y,z' floats, got {s!r}") from e
+    if len(parts) != 3:
+        raise ValueError(f"--{label} expects exactly 3 values, got {len(parts)} ({s!r})")
+    return parts[0], parts[1], parts[2]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Scene parameters
 # ═══════════════════════════════════════════════════════════════════════════
-
-GEO_NAMES = {
-    0: "PLANE", 1: "MESH", 2: "HFIELD", 3: "SPHERE", 4: "CAPSULE",
-    5: "CYLINDER", 6: "CONE", 7: "BOX", 8: "CONVEX_MESH", 9: "ELLIPSOID",
-}
-CSLC_FLAG = 1 << 5
 
 
 @dataclass
@@ -112,10 +110,44 @@ class SceneParams:
     CSLC additionally needs: cslc_spacing, ka, kl, dc, n_iter, alpha.
     """
 
+    # ── held object: sphere or book ──
+    #
+    # `object_kind` selects the geometry the pads squeeze.  With "sphere"
+    # the test runs the legacy sphere-vs-pad scenario.  With "book" the
+    # held body is a flat rectangular box (matching the paper's
+    # rotational-stability experiment) — this exercises the new
+    # CSLC-vs-BOX kernel chain in cslc_kernels.py.
+    object_kind: str = "sphere"
+
     # ── sphere ──
     sphere_radius: float = 0.03
     sphere_density: float = 4421.0       # → ~0.5 kg for r=0.03
     sphere_start_z: float = 0.15
+
+    # ── book (flat box held on its widest faces) ──
+    #
+    # Defaults model a typical trade paperback (152 × 229 × 25 mm, 0.45 kg
+    # — roughly a 6"×9" softcover).  Pads (40 × 100 mm face) cover ~11 %
+    # of the cover, which keeps the gripper-vs-object proportion realistic
+    # for a Franka- or UR5-class arm.  `book_hx` is the *thin* dimension
+    # along the squeeze axis; book_hy/book_hz are the cover dimensions.
+    #
+    # The paper's original "Rotational Grasp Stability" experiment used
+    # a 16×300×400 mm, 1.2 kg synthetic panel — closer to a sheet of
+    # plywood than a book.  To reproduce that scene, set
+    # `--initial-pen` and (via SceneParams) book_hx/y/z/density manually,
+    # or restore the paper-spec values in this dataclass.
+    #
+    # Reference real-book sizes for tuning:
+    #   mass-market paperback:  108×175×17 mm,  ~0.18 kg
+    #   trade paperback:        152×229×25 mm,  ~0.45 kg   ← default
+    #   hardcover novel:        165×242×32 mm,  ~0.65 kg
+    #   coffee-table book:      280×320×25 mm,  ~1.5  kg
+    book_hx: float = 0.0125              # half-thickness, 25 mm total
+    book_hy: float = 0.076               # half-width, 152 mm total (~6")
+    book_hz: float = 0.115               # half-height, 230 mm total (~9")
+    book_density: float = 515.0          # → ~0.45 kg trade paperback
+    book_start_z: float = 0.30           # spawn high enough to hold under gravity
 
     # ── pads ──
     pad_hx: float = 0.01
@@ -172,6 +204,19 @@ class SceneParams:
     # ── integration ──
     dt: float = 1.0 / 500.0
     gravity: tuple = (0.0, 0.0, -9.81)
+
+    # ── external perturbation on the held object ──
+    #
+    # World-frame force [N] and torque [N·m] applied to the sphere body
+    # during the HOLD phase only.  Lets the user probe CSLC's
+    # distributed-contact response under a known disturbance — e.g.
+    # `--external-force 0,0,-5` adds an extra 5 N pulling the sphere
+    # downward (≈1× the sphere weight) so the friction constraints have
+    # to fight harder; a non-zero torque exercises the rotational
+    # stiffness paper claim (§4.2 in cslc_v1/overleaf_theory_cslc_icra.txt).
+    # Default zero → no perturbation.
+    external_force: tuple = (0.0, 0.0, 0.0)
+    external_torque: tuple = (0.0, 0.0, 0.0)
 
     # ── derived ──
 
@@ -247,6 +292,11 @@ class Metrics:
     name: str = ""
     sphere_z: list[float] = field(default_factory=list)
     sphere_x: list[float] = field(default_factory=list)
+    # Per-step (qx, qy, qz, qw) of the held body — populated for both
+    # the sphere and book objects.  Used to compute `max_tilt_deg` for
+    # the rotational-stability claim (book tests measure how far the
+    # body rotated from rest under an external torque).
+    sphere_quat: list[tuple[float, float, float, float]] = field(default_factory=list)
     active_contacts: list[int] = field(default_factory=list)
     cslc_max_delta: list[float] = field(default_factory=list)
     cslc_active_surface: list[int] = field(default_factory=list)
@@ -292,6 +342,37 @@ class Metrics:
     def peak_contacts(self):
         return max(self.active_contacts) if self.active_contacts else 0
 
+    @property
+    def max_tilt_deg(self):
+        """Maximum angular deviation of the held body from its rest pose [deg].
+
+        Computed from the body quaternion `(qx, qy, qz, qw)` as the
+        unsigned rotation angle 2·acos(|qw|).  When the body is at rest
+        with identity rotation this is zero; under an external torque
+        it grows.  Useful for the paper's rotational-stability metric.
+        """
+        if not self.sphere_quat:
+            return 0.0
+        max_a = 0.0
+        for q in self.sphere_quat:
+            qw = abs(q[3])
+            if qw >= 1.0:
+                continue
+            a = 2.0 * math.degrees(math.acos(qw))
+            if a > max_a:
+                max_a = a
+        return max_a
+
+    @property
+    def final_tilt_deg(self):
+        """Tilt at end of run [deg] — companion to max_tilt_deg."""
+        if not self.sphere_quat:
+            return 0.0
+        qw = abs(self.sphere_quat[-1][3])
+        if qw >= 1.0:
+            return 0.0
+        return 2.0 * math.degrees(math.acos(qw))
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Scene builders
@@ -310,30 +391,42 @@ def _sphere_cfg(p: SceneParams, **kw) -> newton.ModelBuilder.ShapeConfig:
     return newton.ModelBuilder.ShapeConfig(**d)
 
 
-def _add_pads_and_sphere(b, p, pad_cfg, sphere_cfg):
-    """Add two kinematic pads + one dynamic sphere.  Returns body indices.
+def _book_cfg(p, **kw):
+    d = dict(ke=p.ke, kd=p.kd, kf=p.kf, mu=p.mu,
+             gap=0.002, density=p.book_density)
+    d.update(kw)
+    return newton.ModelBuilder.ShapeConfig(**d)
 
-    Both pads must present their local +x face INWARD (toward the sphere)
-    because cslc_handler hardcodes face_axis=0, face_sign=+1 — the CSLC
-    lattice lives on the box's local +x face.  The left pad at world -x
-    naturally satisfies this.  The right pad at world +x needs a 180°
-    rotation around z, applied to the SHAPE (not the body) so kinematic
-    control via body_q still works unchanged.
 
-    Without this rotation the right pad's lattice points away from the
-    sphere, every surface sphere fails the d_proj>0 cull in kernel 1,
-    and — because CSLC pairs are filtered from the standard narrow phase
-    — the right pad produces zero contacts with the sphere.  Result:
-    unilateral grip, sphere slides out of the gripper under gravity.
+def _target_z(p):
+    return p.book_start_z if p.object_kind == "book" else p.sphere_start_z
+
+
+def _add_pads_and_target(b, p, pad_cfg, target_cfg):
+    """Add two kinematic pads + the chosen dynamic target.  Returns body indices.
+
+    Both pads must present their local +x face INWARD (toward the
+    target) because cslc_handler hardcodes face_axis=0, face_sign=+1 —
+    the CSLC lattice lives on the box's local +x face.  The left pad at
+    world -x naturally satisfies this; the right pad at world +x needs
+    a 180° rotation around z, applied to the SHAPE so kinematic control
+    via body_q stays unchanged.
+
+    The held target is either a sphere (`p.object_kind == "sphere"`) or
+    a flat box (`"book"`).  Pad positions track `pad_gap_initial`,
+    which the caller is expected to size correctly for the chosen
+    object (the squeeze main override does this for book mode).
     """
+    target_z = _target_z(p)
+
     lx = -(p.pad_gap_initial / 2 + p.pad_hx)
     rx = (p.pad_gap_initial / 2 + p.pad_hx)
 
-    left = b.add_body(xform=wp.transform((lx, 0, p.sphere_start_z), wp.quat_identity()),
+    left = b.add_body(xform=wp.transform((lx, 0, target_z), wp.quat_identity()),
                       is_kinematic=True, label="left_pad")
     b.add_shape_box(left, hx=p.pad_hx, hy=p.pad_hy, hz=p.pad_hz, cfg=pad_cfg)
 
-    right = b.add_body(xform=wp.transform((rx, 0, p.sphere_start_z), wp.quat_identity()),
+    right = b.add_body(xform=wp.transform((rx, 0, target_z), wp.quat_identity()),
                        is_kinematic=True, label="right_pad")
     right_box_xform = wp.transform(
         wp.vec3(0.0, 0.0, 0.0),
@@ -342,15 +435,43 @@ def _add_pads_and_sphere(b, p, pad_cfg, sphere_cfg):
     b.add_shape_box(right, xform=right_box_xform,
                     hx=p.pad_hx, hy=p.pad_hy, hz=p.pad_hz, cfg=pad_cfg)
 
-    sphere = b.add_body(xform=wp.transform((0, 0, p.sphere_start_z), wp.quat_identity()),
-                        label="sphere")
-    b.add_shape_sphere(sphere, radius=p.sphere_radius, cfg=sphere_cfg)
-    return left, right, sphere
+    target = b.add_body(
+        xform=wp.transform((0, 0, target_z), wp.quat_identity()),
+        label=p.object_kind,
+    )
+    if p.object_kind == "sphere":
+        b.add_shape_sphere(target, radius=p.sphere_radius, cfg=target_cfg)
+    elif p.object_kind == "book":
+        b.add_shape_box(target,
+                        hx=p.book_hx, hy=p.book_hy, hz=p.book_hz,
+                        cfg=target_cfg)
+    else:
+        raise ValueError(f"Unknown object_kind: {p.object_kind!r}")
+
+    return left, right, target
+
+
+def _target_cfg(p, contact_model: str):
+    """Material config for the held target depending on object + model.
+
+    Hydro point/cslc paths use the basic config; the hydro path
+    additionally tags the target with hydroelastic params so the
+    handler emits pressure-field contacts.
+    """
+    base_kwargs = {}
+    if contact_model == "hydro":
+        base_kwargs = dict(kh=p.kh, is_hydroelastic=True,
+                           sdf_max_resolution=p.sdf_resolution)
+    if p.object_kind == "sphere":
+        return _sphere_cfg(p, **base_kwargs)
+    elif p.object_kind == "book":
+        return _book_cfg(p, **base_kwargs)
+    raise ValueError(f"Unknown object_kind: {p.object_kind!r}")
 
 
 def build_point_scene(p):
     b = newton.ModelBuilder()
-    _add_pads_and_sphere(b, p, _pad_cfg(p), _sphere_cfg(p))
+    _add_pads_and_target(b, p, _pad_cfg(p), _target_cfg(p, "point"))
     m = b.finalize()
     m.set_gravity(p.gravity)
     return m
@@ -361,7 +482,7 @@ def build_cslc_scene(p):
     cslc_pad = _pad_cfg(p, is_cslc=True,
                         cslc_spacing=p.cslc_spacing, cslc_ka=p.cslc_ka, cslc_kl=p.cslc_kl,
                         cslc_dc=p.cslc_dc, cslc_n_iter=p.cslc_n_iter, cslc_alpha=p.cslc_alpha)
-    _add_pads_and_sphere(b, p, cslc_pad, _sphere_cfg(p))
+    _add_pads_and_target(b, p, cslc_pad, _target_cfg(p, "cslc"))
     m = b.finalize()
     m.set_gravity(p.gravity)
     return m
@@ -371,9 +492,7 @@ def build_hydro_scene(p):
     b = newton.ModelBuilder()
     hp = _pad_cfg(p, kh=p.kh, is_hydroelastic=True,
                   sdf_max_resolution=p.sdf_resolution)
-    hs = _sphere_cfg(p, kh=p.kh, is_hydroelastic=True,
-                     sdf_max_resolution=p.sdf_resolution)
-    _add_pads_and_sphere(b, p, hp, hs)
+    _add_pads_and_target(b, p, hp, _target_cfg(p, "hydro"))
     m = b.finalize()
     m.set_gravity(p.gravity)
     return m
@@ -437,13 +556,7 @@ def set_kinematic_pads(state, step, p, debug=False):
 #  Contact inspection
 # ═══════════════════════════════════════════════════════════════════════════
 
-def count_active_contacts(contacts):
-    """Count contacts where shape0 >= 0 (valid, non-ghost)."""
-    n = int(contacts.rigid_contact_count.numpy()[0])
-    if n == 0:
-        return 0
-    return int(np.sum(contacts.rigid_contact_shape0.numpy()[:n] >= 0))
-
+# `count_active_contacts` lives in cslc_v1.common.
 
 def dump_contacts(contacts, label="", max_show=20):
     """Print the contact buffer in detail."""
@@ -555,31 +668,7 @@ def inspect_cslc_handler(model, label=""):
     return handler
 
 
-def read_cslc_state(model, state=None):
-    """Read CSLC delta / penetration arrays.  Returns dict or empty."""
-    pipeline = getattr(model, "_collision_pipeline", None)
-    handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
-    if handler is None:
-        return {}
-    d = handler.cslc_data
-    deltas = d.sphere_delta.numpy()
-    is_surf = d.is_surface.numpy()
-    pen = handler.raw_penetration.numpy()
-
-    sm = is_surf == 1
-    sd = deltas[sm]
-    sp = pen[sm]
-    act = sp > 0
-
-    return dict(
-        max_delta=float(sd.max()) if len(sd) else 0,
-        mean_delta=float(sd.mean()) if len(sd) else 0,
-        max_pen=float(sp.max()) if len(sp) else 0,
-        mean_pen_active=float(sp[act].mean()) if act.sum() else 0,
-        n_active_surface=int(act.sum()),
-        n_total_surface=int(sm.sum()),
-    )
-
+# `read_cslc_state` lives in cslc_v1.common.
 
 def print_cslc_state(model, step=-1, inline=False):
     info = read_cslc_state(model)
@@ -629,57 +718,9 @@ def inspect_model(model, label=""):
     _log(f"rigid_contact_max: {getattr(model, 'rigid_contact_max', '?')}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Solver creation
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _make_solver(model, solver_name, p):
-    if solver_name == "mujoco":
-        if not HAS_MUJOCO:
-            raise RuntimeError("MuJoCo solver not available")
-
-        # Estimate contact buffer size (must cover narrow phase + CSLC slots)
-        ncon = 5000
-        if model.shape_cslc_spacing is not None:
-            spacing_np = model.shape_cslc_spacing.numpy()
-            flags_np = model.shape_flags.numpy()
-            scale_np = model.shape_scale.numpy()
-            total_surface = 0
-            for i in range(model.shape_count):
-                if not (flags_np[i] & CSLC_FLAG):
-                    continue
-                sp = float(spacing_np[i])
-                if sp <= 0:
-                    continue
-                hx, hy, hz = float(scale_np[i][0]), float(
-                    scale_np[i][1]), float(scale_np[i][2])
-                nx = max(int(round(2*hx/sp))+1, 2)
-                ny = max(int(round(2*hy/sp))+1, 2)
-                nz = max(int(round(2*hz/sp))+1, 2)
-                nt = nx*ny*nz
-                ni = max(nx-2, 0)*max(ny-2, 0)*max(nz-2, 0)
-                total_surface += nt - ni
-                _log(
-                    f"Shape {i}: CSLC grid ({nx},{ny},{nz})={nt} spheres, {nt-ni} surface")
-            if total_surface > 0:
-                ncon = total_surface + 5000
-                _log(f"MuJoCo buffer: nconmax={ncon}")
-
-        # Increased from 20 → 100 iterations (2026-04-19).
-        # CSLC generates ~170 contacts vs point contact's ~2.  With only 20
-        # CG iterations the solver was not converging on the full constraint
-        # set, causing the sphere to creep downward under gravity even when
-        # theoretical friction >> weight.  Point contact held fine at 20 iters
-        # because 2 constraints converge almost instantly.
-        n_iters = 100 if model.shape_cslc_spacing is not None else 20
-        return SolverMuJoCo(model, use_mujoco_contacts=False,
-                            solver="cg", integrator="implicitfast",
-                            cone="elliptic",
-                            iterations=n_iters, ls_iterations=10,
-                            njmax=ncon, nconmax=ncon)
-    elif solver_name == "semi":
-        return SolverSemiImplicit(model)
-    raise ValueError(f"Unknown solver: {solver_name}")
+# Solver factory and per-pad CSLC calibration both live in cslc_v1.common.
+# Lattice visualisation helpers (`_quat_rotate`, `get_cslc_lattice_viz_data`)
+# also live in cslc_v1.common.
 
 
 def _reset_cslc(model):
@@ -688,120 +729,6 @@ def _reset_cslc(model):
     if handler:
         handler.cslc_data.sphere_delta.zero_()
         _log("CSLC warm-start reset")
-
-
-def recalibrate_cslc_kc_per_pad(model, contact_fraction):
-    """Override per-sphere contact stiffness `kc` so that EACH PAD's aggregate
-    stiffness at uniform contact equals the bulk material stiffness `ke_bulk`.
-
-    Background
-    ----------
-    The default `calibrate_kc` in `cslc_data.py` sums `n_surface` across all
-    pads and equates the total to a single `ke_bulk`, which (a) splits the
-    material budget across pads in multi-pad grasps, and (b) hardcodes a
-    `contact_fraction=0.15` that under-estimates the actual active count
-    for a flat squeeze (observed ~0.46 in this scene).
-
-    Per-pad calibration (this function)
-    -----------------------------------
-        N_contact_per_pad * (kc * ka) / (ka + kc) = ke_bulk
-    Solving for `kc` (with positive denominator):
-        kc = ke_bulk * ka / (N_per_pad * ka - ke_bulk)
-    Otherwise fall back to a single-spring approximation
-    `kc = ke_bulk / N_per_pad`.
-
-    This makes a CSLC pad's aggregate stiffness at saturated uniform contact
-    equal to a single point contact at `ke_bulk`, isolating the
-    distributed-area effect from the calibration mismatch effect.
-
-    Args:
-        model: A finalized model whose `_collision_pipeline` has been
-            initialized (call `model.contacts()` first).
-        contact_fraction: Fraction of surface spheres expected to be active
-            in contact for this scene's geometry/penetration combination.
-            Pass the observed empirical fraction (e.g. 0.46 for the squeeze
-            scene with 0.4 mm/side penetration).
-
-    Returns:
-        New kc value if the handler exists, else None.
-    """
-    pipeline = getattr(model, "_collision_pipeline", None)
-    handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
-    if handler is None:
-        return None
-
-    d = handler.cslc_data
-    ke_bulk = float(model.shape_material_ke.numpy()[0])
-
-    shape_ids = d.sphere_shape.numpy()
-    is_surface = d.is_surface.numpy()
-    n_pads = int(len(np.unique(shape_ids)))
-    n_surface_per_pad = int(is_surface.sum()) // max(n_pads, 1)
-    n_contact_per_pad = max(int(n_surface_per_pad * contact_fraction), 1)
-
-    ka = float(d.ka)
-    denom = n_contact_per_pad * ka - ke_bulk
-    if denom <= 0.0:
-        new_kc = ke_bulk / max(n_contact_per_pad, 1)
-        derivation = "fallback (denom<=0): kc = ke/N"
-    else:
-        new_kc = ke_bulk * ka / denom
-        derivation = "exact: kc = ke*ka/(N*ka - ke)"
-
-    old_kc = float(d.kc)
-    d.kc = new_kc
-    keff = new_kc * ka / (ka + new_kc)
-    aggregate_per_pad = n_contact_per_pad * keff
-
-    _sub("CSLC RECALIBRATION (per-pad)")
-    _log(f"pads={n_pads}  surface/pad={n_surface_per_pad}  "
-         f"contact_fraction={contact_fraction:.3f}  "
-         f"N_contact_per_pad={n_contact_per_pad}")
-    _log(f"ka={ka:.0f}  ke_bulk={ke_bulk:.0f}  ({derivation})")
-    _log(f"kc: {old_kc:.2f}  →  {new_kc:.2f}  N/m")
-    _log(f"keff_per_sphere = kc*ka/(ka+kc) = {keff:.2f} N/m")
-    _log(f"aggregate per-pad = N * keff = {aggregate_per_pad:.1f} N/m  "
-         f"(target ke_bulk={ke_bulk:.0f})")
-    return new_kc
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Lattice visualisation helper
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _quat_rotate(q, v):
-    xyz = np.array([q[0], q[1], q[2]])
-    t = 2.0 * np.cross(xyz, v)
-    return v + q[3] * t + np.cross(xyz, t)
-
-
-def get_cslc_lattice_viz_data(model, state):
-    pipeline = getattr(model, "_collision_pipeline", None)
-    handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
-    if handler is None:
-        return None
-    d = handler.cslc_data
-    n = d.n_spheres
-    pl = d.positions.numpy()
-    nm = d.outward_normals.numpy()
-    dl = d.sphere_delta.numpy()
-    rd = d.radii.numpy()
-    sf = d.is_surface.numpy()
-    si = d.sphere_shape.numpy()
-    bq = state.body_q.numpy()
-    sb = model.shape_body.numpy()
-    sx = model.shape_transform.numpy()
-
-    pw = np.zeros((n, 3), np.float32)
-    for i in range(n):
-        if sf[i] == 0:
-            continue
-        s = si[i]
-        b = sb[s]
-        ql = pl[i] + dl[i] * nm[i]
-        qb = _quat_rotate(sx[s, 3:7], ql) + sx[s, :3]
-        pw[i] = _quat_rotate(bq[b, 3:7], qb) + bq[b, :3]
-    return pw, dl, rd, sf
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -860,9 +787,21 @@ def run_squeeze(name, model, solver, p, verbose=1):
     weight_N = m_sphere * g_accel
     PRINT_INTERVAL = 50   # print every N HOLD steps
 
+    # Per-step external wrench on the sphere body (idx 2) — applied during
+    # HOLD only, so squeeze dynamics are unperturbed.  Skipped entirely
+    # when both vectors are zero (the default).
+    has_external = any(p.external_force) or any(p.external_torque)
+    sphere_body_idx = 2
+
     for step in range(p.n_total_steps):
         set_kinematic_pads(s0, step, p, debug=(verbose >= 3 and step % 100 == 0))
         s0.clear_forces()
+
+        if has_external and step >= p.n_squeeze_steps:
+            apply_external_wrench(
+                s0, sphere_body_idx,
+                force=p.external_force, torque=p.external_torque,
+            )
 
         model.collide(s0, con)
         solver.step(s0, s1, ctrl, con, p.dt)
@@ -871,10 +810,16 @@ def run_squeeze(name, model, solver, p, verbose=1):
         q  = s1.body_q.numpy()
         sz = float(q[2, 2])
         sx = float(q[2, 0])
+        # body_q layout: (px, py, pz, qx, qy, qz, qw) — pull the four
+        # quaternion components for the held body so Metrics can compute
+        # `max_tilt_deg` for the rotational-stability metric.
+        squat = (float(q[2, 3]), float(q[2, 4]),
+                 float(q[2, 5]), float(q[2, 6]))
         nc = count_active_contacts(con)
 
         met.sphere_z.append(sz)
         met.sphere_x.append(sx)
+        met.sphere_quat.append(squat)
         met.active_contacts.append(nc)
 
         if is_cslc:
@@ -957,7 +902,7 @@ def test_squeeze(p, solver_name="mujoco", contact_models=None):
                 recalibrate_cslc_kc_per_pad(model, p.cslc_contact_fraction)
                 # Re-inspect so the printed handler reflects the new kc.
                 inspect_cslc_handler(model, f"{label} (recalibrated)")
-        solver = _make_solver(model, solver_name, p)
+        solver = make_solver(model, solver_name)
         m = run_squeeze(label, model, solver, p, verbose=1)
         results.append(m)
         _log(
@@ -1017,7 +962,7 @@ def test_inspect(p, solver_name, n_steps=10):
         if cm == "cslc":
             inspect_cslc_handler(model, label)
 
-        solver = _make_solver(model, solver_name, p)
+        solver = make_solver(model, solver_name)
         s0 = model.state()
         s1 = model.state()
         ctrl = model.control()
@@ -1089,6 +1034,25 @@ class Example:
         self.show_lattice = getattr(args, "show_lattice", True)
 
         self.p = SceneParams(dt=self.sim_dt)
+        if getattr(args, "object", "sphere") == "book":
+            self.p.object_kind = "book"
+            self.p.pad_gap_initial = 2.0 * (self.p.book_hx - 0.0015)
+            self.p.cslc_contact_fraction = 1.0
+            pad_face_area = (2.0 * self.p.pad_hy) * (2.0 * self.p.pad_hz)
+            self.p.kh = self.p.ke / pad_face_area
+        if getattr(args, "external_force", None):
+            self.p.external_force = _parse_xyz(
+                args.external_force, "external-force")
+        if getattr(args, "external_torque", None):
+            self.p.external_torque = _parse_xyz(
+                args.external_torque, "external-torque")
+        # `--initial-pen` / `--mu` overrides — see main() for rationale.
+        if getattr(args, "initial_pen", None) is not None:
+            target_half = (self.p.book_hx if self.p.object_kind == "book"
+                           else self.p.sphere_radius)
+            self.p.pad_gap_initial = 2.0 * (target_half - float(args.initial_pen))
+        if getattr(args, "mu", None) is not None:
+            self.p.mu = float(args.mu)
         self.p.dump()
 
         self.model = BUILDERS[self.contact_model](self.p)
@@ -1096,7 +1060,7 @@ class Example:
         if self.contact_model == "cslc":
             inspect_cslc_handler(self.model, self.contact_model)
 
-        self.solver = _make_solver(self.model, self.solver_name, self.p)
+        self.solver = make_solver(self.model, self.solver_name)
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
@@ -1143,9 +1107,18 @@ class Example:
             [0.5, 0.3, 0.0, 0.0], (n, 1)).astype(np.float32)
 
     def simulate(self):
+        has_external = (any(self.p.external_force)
+                        or any(self.p.external_torque))
+        n_squeeze_steps = self.p.n_squeeze_steps
         for _ in range(self.sim_substeps):
             set_kinematic_pads(self.state_0, self.sim_step, self.p)
             self.state_0.clear_forces()
+            if has_external and self.sim_step >= n_squeeze_steps:
+                apply_external_wrench(
+                    self.state_0, 2,
+                    force=self.p.external_force,
+                    torque=self.p.external_torque,
+                )
             self.model.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1,
                              self.control, self.contacts, self.sim_dt)
@@ -1266,6 +1239,41 @@ class Example:
             "--contact-models", type=str, default=None,
             help="Comma-separated list of contact models to run in squeeze "
                  "mode (e.g. 'point,cslc,hydro'). Default: 'point,cslc'.")
+        parser.add_argument(
+            "--external-force", type=str, default=None,
+            help="World-frame force [N] applied to the sphere during HOLD, "
+                 "as 'fx,fy,fz' (e.g. '0,0,-5' for an extra 5N pulling down). "
+                 "Default: no external force.")
+        parser.add_argument(
+            "--external-torque", type=str, default=None,
+            help="World-frame torque [N·m] on the sphere during HOLD, as "
+                 "'tx,ty,tz' (e.g. '0,0,0.05' for a 0.05 N·m twist about z).")
+        parser.add_argument(
+            "--object", type=str, default="sphere", choices=["sphere", "book"],
+            help="Held object geometry. 'sphere' is the legacy r=30mm test "
+                 "object; 'book' is a flat 16×300×400 mm box (paper §4.2 "
+                 "rotational-stability scene). Defaults to sphere.")
+        parser.add_argument(
+            "--book-mass", type=float, default=None,
+            help="Override the book's total mass [kg] by adjusting its "
+                 "density.  Lighter books are easier for CSLC to hold "
+                 "under MuJoCo's regularised friction (less per-contact "
+                 "compliance leak f/k).  Default ≈1.2 kg (paper-spec).")
+        parser.add_argument(
+            "--initial-pen", type=float, default=None,
+            help="Override the initial pad-face penetration [m].  Sets "
+                 "pad_gap_initial = 2 · (target_half_extent − initial_pen) "
+                 "so the pad face starts `initial_pen` inside the target "
+                 "surface at t=0.  Default: 1.5 mm for book, 10 mm for "
+                 "sphere.  Used by the compass-needle disturbance "
+                 "experiment to bring the friction-cone budget close to "
+                 "the operating torque.")
+        parser.add_argument(
+            "--mu", type=float, default=None,
+            help="Override the shared Coulomb friction coefficient on "
+                 "both pads and target.  Default 0.5.  Lower values "
+                 "shrink the friction-cone budget and expose model-"
+                 "differentiation under torque disturbance.")
         return parser
 
 
@@ -1304,11 +1312,62 @@ def main():
         wp.set_device("cpu")
 
     p = SceneParams()
+    if getattr(args, "object", "sphere") == "book":
+        p.object_kind = "book"
+        # ── pad_gap_initial: geometry override ──
+        # 2 * (half_extent_along_pad_axis - initial_pen).  Different
+        # objects have different sizes, so the gap that puts the pad
+        # face 1.5 mm inside the target is different.  Sphere uses
+        # 0.059 m (2 * (0.030 - 0.0005)); book needs 0.013 m
+        # (2 * (0.008 - 0.0015)).  Heavier book → bigger initial pen
+        # so the t=0 friction has enough headroom to catch the body
+        # before it slides out of the pad's z-range.
+        p.pad_gap_initial = 2.0 * (p.book_hx - 0.0015)
+        # ── cslc_contact_fraction: calibration prior override ──
+        # Sphere target: only ~5/189 surface spheres engage (small
+        # Hertzian patch) → cf ≈ 0.025.
+        # Book target: pad face fully overlaps book cover → all 189
+        # engage → cf ≈ 1.0.
+        # `recalibrate_cslc_kc_per_pad` uses cf to solve for kc such
+        # that N · keff = ke_bulk.  Wrong cf gives wrong kc — at
+        # cf=0.025 with 189 active spheres the aggregate stiffness
+        # becomes 47× ke_bulk and MuJoCo ejects the book.
+        p.cslc_contact_fraction = 1.0
+        # ── kh: hydroelastic-modulus override ──
+        # Same fair-calibration principle as CSLC: kh · A_patch =
+        # ke_bulk.  Sphere target's patch area is the Hertzian
+        # contact (≈π·2r·pen = 188 mm² @ 1 mm pen) → kh = 2.65e8 Pa.
+        # Book target's patch area is the pad face fully inside the
+        # book (≈ 2hy · 2hz = 4000 mm²) → kh ≈ 1.25e7 Pa, 21× softer.
+        # Without this override hydro is 21× too stiff for the book
+        # and the body is ejected the same way as miscalibrated CSLC.
+        pad_face_area = (2.0 * p.pad_hy) * (2.0 * p.pad_hz)
+        p.kh = p.ke / pad_face_area
+        # Optional: override book mass via CLI for stability sweeps.
+        if getattr(args, "book_mass", None) is not None:
+            book_volume = 8.0 * p.book_hx * p.book_hy * p.book_hz
+            p.book_density = float(args.book_mass) / book_volume
     if getattr(args, "contact_fraction", None) is not None:
         cf = float(args.contact_fraction)
         p.cslc_contact_fraction = None if cf < 0 else cf
     if getattr(args, "cslc_spacing", None) is not None:
         p.cslc_spacing = float(args.cslc_spacing)
+    if getattr(args, "external_force", None):
+        p.external_force = _parse_xyz(args.external_force, "external-force")
+    if getattr(args, "external_torque", None):
+        p.external_torque = _parse_xyz(args.external_torque, "external-torque")
+    # ── --initial-pen / --mu overrides ──
+    # Applied AFTER the object-mode block so the user can override the
+    # default pen/mu values that mode would otherwise pick.
+    # `--initial-pen` recomputes pad_gap_initial from the target's
+    # squeeze-axis half-extent (book_hx for book, sphere_radius for
+    # sphere) so the geometric meaning ("pad face starts initial_pen
+    # past the target surface at t=0") is preserved across object kinds.
+    if getattr(args, "initial_pen", None) is not None:
+        target_half = p.book_hx if p.object_kind == "book" else p.sphere_radius
+        p.pad_gap_initial = 2.0 * (target_half - float(args.initial_pen))
+    if getattr(args, "mu", None) is not None:
+        p.mu = float(args.mu)
     sn = args.solver if hasattr(args, "solver") else (
         "mujoco" if HAS_MUJOCO else "semi")
     all_res = []
@@ -1331,11 +1390,14 @@ def main():
 
     if all_res:
         _section("SUMMARY")
-        print(f"  {'Config':<30} {'FullDrop':>10} {'HoldDrop':>10} {'Creep':>10} {'Contacts':>10}")
-        print(f"  {'':<30} {'[mm]':>10} {'[mm]':>10} {'[mm/s]':>10}")
+        print(f"  {'Config':<30} {'FullDrop':>10} {'HoldDrop':>10} "
+              f"{'Creep':>10} {'MaxTilt':>9} {'EndTilt':>9} {'Contacts':>10}")
+        print(f"  {'':<30} {'[mm]':>10} {'[mm]':>10} {'[mm/s]':>10} "
+              f"{'[deg]':>9} {'[deg]':>9}")
         for m in all_res:
             print(f"  {m.name:<30} {m.z_drop_mm:10.3f} "
                   f"{m.hold_drop_mm:+10.3f} {m.hold_creep_rate_mm_per_s:+10.3f} "
+                  f"{m.max_tilt_deg:9.2f} {m.final_tilt_deg:9.2f} "
                   f"{m.peak_contacts:10d}")
         print(f"{_DSEP}")
 

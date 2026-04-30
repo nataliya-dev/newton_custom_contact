@@ -54,7 +54,6 @@ Usage
 from __future__ import annotations
 
 import math
-import warnings
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -63,33 +62,23 @@ import warp as wp
 import newton
 import newton.examples
 from newton import JointTargetMode
-from newton.solvers import SolverSemiImplicit
 
-try:
-    from newton.solvers import SolverMuJoCo
-    HAS_MUJOCO = True
-except ImportError:
-    HAS_MUJOCO = False
-    warnings.warn(
-        "SolverMuJoCo not available — falling back to semi-implicit.")
-
-
-# ── Formatting ────────────────────────────────────────────────────────────
-
-_SEP = "─" * 60
-
-
-def _log(msg, indent=0):
-    print(f"  {'  ' * indent}│ {msg}")
-
-
-def _section(title):
-    print(f"\n{'═' * 60}\n  {title}\n{'═' * 60}")
+from cslc_v1.common import (
+    CSLC_FLAG,
+    HAS_MUJOCO,
+    _SEP,
+    _log,
+    _section,
+    count_active_contacts,
+    get_cslc_lattice_viz_data,
+    inspect_model,
+    make_solver,
+    read_cslc_state,
+    recalibrate_cslc_kc_per_pad,
+)
 
 
 # ── Scene parameters ─────────────────────────────────────────────────────
-
-CSLC_FLAG = 1 << 5
 
 
 @dataclass
@@ -639,157 +628,9 @@ def set_pad_targets(control, step, p: SceneParams, dof_map, debug=False):
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
-def count_active_contacts(contacts):
-    n = int(contacts.rigid_contact_count.numpy()[0])
-    return int(np.sum(contacts.rigid_contact_shape0.numpy()[:n] >= 0)) if n else 0
-
-
-def recalibrate_cslc_kc_per_pad(model, contact_fraction):
-    """Override per-sphere kc on a per-pad basis (mirror of the squeeze_test
-    helper).  Sets each pad's aggregate stiffness at uniform contact equal to
-    `ke_bulk`, using the empirical contact fraction for this scene."""
-    pipeline = getattr(model, "_collision_pipeline", None)
-    handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
-    if handler is None:
-        return None
-
-    d = handler.cslc_data
-    # Read ke from the FIRST CSLC-flagged shape, not shape 0 (which may be a
-    # ground plane in lift_test).  Squeeze_test happens to have shape 0 == a
-    # CSLC pad, so its helper got away with `shape_material_ke[0]` directly.
-    shape_flags = model.shape_flags.numpy()
-    cslc_shape_idx = next(
-        (i for i in range(model.shape_count) if (shape_flags[i] & CSLC_FLAG)),
-        0,
-    )
-    ke_bulk = float(model.shape_material_ke.numpy()[cslc_shape_idx])
-    shape_ids = d.sphere_shape.numpy()
-    is_surface = d.is_surface.numpy()
-    n_pads = int(len(np.unique(shape_ids)))
-    n_surface_per_pad = int(is_surface.sum()) // max(n_pads, 1)
-    n_contact_per_pad = max(int(n_surface_per_pad * contact_fraction), 1)
-
-    ka = float(d.ka)
-    denom = n_contact_per_pad * ka - ke_bulk
-    if denom <= 0.0:
-        new_kc = ke_bulk / max(n_contact_per_pad, 1)
-        derivation = "fallback (denom<=0): kc = ke/N"
-    else:
-        new_kc = ke_bulk * ka / denom
-        derivation = "exact: kc = ke*ka/(N*ka - ke)"
-
-    old_kc = float(d.kc)
-    d.kc = new_kc
-    keff = new_kc * ka / (ka + new_kc)
-    aggregate_per_pad = n_contact_per_pad * keff
-    _log(f"CSLC RECAL: pads={n_pads}  N_contact_per_pad={n_contact_per_pad}  "
-         f"({derivation})")
-    _log(f"            kc: {old_kc:.1f}  →  {new_kc:.1f} N/m  "
-         f"keff={keff:.1f}  agg/pad={aggregate_per_pad:.0f} (target={ke_bulk:.0f})")
-    return new_kc
-
-
-def read_cslc_state(model):
-    pipeline = getattr(model, "_collision_pipeline", None)
-    handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
-    if handler is None:
-        return None
-    d = handler.cslc_data
-    is_surf = d.is_surface.numpy() == 1
-    deltas = d.sphere_delta.numpy()[is_surf]
-    pen = handler.raw_penetration.numpy()[is_surf]
-    active = pen > 0
-    return {
-        "n_active": int(active.sum()), "n_surface": int(is_surf.sum()),
-        "max_delta_mm": float(deltas.max()) * 1e3 if len(deltas) else 0,
-        "max_pen_mm": float(pen.max()) * 1e3 if len(pen) else 0,
-    }
-
-
-# ── CSLC lattice visualisation (mirrors squeeze_test) ────────────────────
-#
-# Walks the CSLC handler's per-sphere data, applies the per-sphere
-# compression delta along the sphere's outward normal, and transforms
-# each surface lattice sphere into world coordinates so the viewer can
-# render coloured dots showing where the lattice is in contact and how
-# hard it's pressed.
-
-def _quat_rotate(q, v):
-    xyz = np.array([q[0], q[1], q[2]])
-    t = 2.0 * np.cross(xyz, v)
-    return v + q[3] * t + np.cross(xyz, t)
-
-
-def get_cslc_lattice_viz_data(model, state):
-    pipeline = getattr(model, "_collision_pipeline", None)
-    handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
-    if handler is None:
-        return None
-    d = handler.cslc_data
-    n = d.n_spheres
-    pl = d.positions.numpy()
-    nm = d.outward_normals.numpy()
-    dl = d.sphere_delta.numpy()
-    rd = d.radii.numpy()
-    sf = d.is_surface.numpy()
-    si = d.sphere_shape.numpy()
-    bq = state.body_q.numpy()
-    sb = model.shape_body.numpy()
-    sx = model.shape_transform.numpy()
-
-    pw = np.zeros((n, 3), np.float32)
-    for i in range(n):
-        if sf[i] == 0:
-            continue
-        s = si[i]
-        b = sb[s]
-        ql = pl[i] + dl[i] * nm[i]
-        qb = _quat_rotate(sx[s, 3:7], ql) + sx[s, :3]
-        pw[i] = _quat_rotate(bq[b, 3:7], qb) + bq[b, :3]
-    return pw, dl, rd, sf
-
-
-def inspect_model(model, label=""):
-    GEO = {0: "PLANE", 1: "MESH", 3: "SPHERE", 4: "CAPSULE", 7: "BOX"}
-    _log(f"Model '{label}': {model.body_count} bodies, {model.shape_count} shapes, "
-         f"{model.joint_count} joints, {model.joint_dof_count} DOFs")
-    st, sf, sb = model.shape_type.numpy(
-    ), model.shape_flags.numpy(), model.shape_body.numpy()
-    for i in range(model.shape_count):
-        cslc = " [CSLC]" if sf[i] & CSLC_FLAG else ""
-        _log(f"  shape {i}: {GEO.get(int(st[i]), '?')}  body={sb[i]}{cslc}", 1)
-
-
-# ── Solver creation ───────────────────────────────────────────────────────
-
-def make_solver(model, solver_name, p: SceneParams):
-    if solver_name == "mujoco":
-        if not HAS_MUJOCO:
-            raise RuntimeError("MuJoCo solver not available")
-        ncon = 5000
-        if model.shape_cslc_spacing is not None:
-            spacing = model.shape_cslc_spacing.numpy()
-            flags = model.shape_flags.numpy()
-            scale = model.shape_scale.numpy()
-            for i in range(model.shape_count):
-                if not (flags[i] & CSLC_FLAG):
-                    continue
-                sp = float(spacing[i])
-                if sp <= 0:
-                    continue
-                hx, hy, hz = (float(scale[i][j]) for j in range(3))
-                nx, ny, nz = (max(int(round(2*h/sp))+1, 2)
-                              for h in [hx, hy, hz])
-                interior = max(nx-2, 0)*max(ny-2, 0)*max(nz-2, 0)
-                ncon += nx*ny*nz - interior
-        return SolverMuJoCo(model, use_mujoco_contacts=False,
-                            solver="cg", integrator="implicitfast",
-                            cone="elliptic",
-                            iterations=100, ls_iterations=10,
-                            njmax=ncon, nconmax=ncon)
-    elif solver_name == "semi":
-        return SolverSemiImplicit(model)
-    raise ValueError(f"Unknown solver: {solver_name}")
+# `count_active_contacts`, `recalibrate_cslc_kc_per_pad`,
+# `read_cslc_state`, `_quat_rotate`, `get_cslc_lattice_viz_data`,
+# `inspect_model`, and `make_solver` all live in cslc_v1.common.
 
 
 # ── Headless runner ───────────────────────────────────────────────────────
@@ -873,7 +714,7 @@ def test_headless(p, solver_name, contact_models=None):
         inspect_model(model, label)
         if cm == "cslc" and p.cslc_contact_fraction is not None:
             recalibrate_cslc_kc_per_pad(model, p.cslc_contact_fraction)
-        solver = make_solver(model, solver_name, p)
+        solver = make_solver(model, solver_name)
         met = run_headless(label, model, solver, p, dof_map)
         results.append(met)
         _log(f"RESULT: max_z={met.max_z:.4f}  final_z={met.final_z:.4f}  "
@@ -916,7 +757,7 @@ class Example:
         self.model, self.dof_map = BUILDERS[self.contact_model](self.p)
         inspect_model(self.model, self.contact_model)
 
-        self.solver = make_solver(self.model, self.solver_name, self.p)
+        self.solver = make_solver(self.model, self.solver_name)
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
