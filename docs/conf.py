@@ -168,7 +168,7 @@ intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
     "numpy": ("https://numpy.org/doc/stable", None),
     "jax": ("https://docs.jax.dev/en/latest", None),
-    "pytorch": ("https://docs.pytorch.org/docs/stable", None),
+    "pytorch": ("https://docs.pytorch.org/docs/2.10", None),
     "warp": ("https://nvidia.github.io/warp", None),
     "usd": ("https://docs.omniverse.nvidia.com/kit/docs/pxr-usd-api/latest", None),
 }
@@ -183,6 +183,7 @@ autodoc_type_aliases = {
     "UsdGeom.Mesh": "pxr.UsdGeom.Mesh",
     "UsdShade.Material": "pxr.UsdShade.Material",
     "UsdShade.Shader": "pxr.UsdShade.Shader",
+    "State": "newton.State",
 }
 
 
@@ -196,15 +197,13 @@ extlinks = {
 }
 
 doctest_global_setup = """
+import warnings
 from typing import Any
 import numpy as np
 import warp as wp
 import newton
 
-# Suppress warnings by setting warp_showwarning to an empty function
-def empty_warning(*args, **kwargs):
-    pass
-wp.utils.warp_showwarning = empty_warning
+warnings.filterwarnings("ignore")
 
 wp.config.quiet = True
 wp.init()
@@ -226,7 +225,7 @@ autodoc_default_options = {
     "member-order": "groupwise",
     "special-members": "__init__",
     "undoc-members": False,
-    "exclude-members": "__weakref__",
+    "exclude-members": "__weakref__, State",
     "imported-members": True,
     "autosummary": True,
 }

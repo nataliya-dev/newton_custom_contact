@@ -213,12 +213,11 @@ class _ExampleBrowser:
                             if clicked:
                                 self.switch_target = module_path
                         imgui.tree_pop()
-                imgui.separator()
-                if imgui.button("Reset"):
-                    self._reset_requested = True
 
         self.callback = _browser_ui
         viewer.register_ui_callback(_browser_ui, position="panel")
+        if hasattr(viewer, "set_reset_callback"):
+            viewer.set_reset_callback(lambda: setattr(self, "_reset_requested", True))
 
     def _register_ui(self, example):
         """Re-register the example's GUI callback (panel callbacks survive clear_model)."""
@@ -289,7 +288,7 @@ def run(example, args):
             viewer.end_frame()
             continue
 
-        if not viewer.is_paused():
+        if viewer.should_step():
             with wp.ScopedTimer("step", active=False):
                 example.step()
         if test_post_step:
@@ -405,6 +404,12 @@ def get_examples() -> dict[str, str]:
                 example_name = filename[8:-3]
                 example_map[example_name] = f"newton.examples.{module}.{filename[:-3]}"
     return example_map
+
+
+def _print_examples(examples: dict[str, str]) -> None:
+    print("Available examples:")
+    for name in examples:
+        print(f"  {name}")
 
 
 def create_parser():
@@ -708,20 +713,27 @@ def main():
 
     examples = get_examples()
 
-    if len(sys.argv) < 2:
-        print("Usage: python -m newton.examples <example_name>")
-        print("\nAvailable examples:")
-        for name in examples:
-            print(f"  {name}")
-        sys.exit(1)
+    if len(sys.argv) >= 2 and sys.argv[1] in ("-h", "--help"):
+        print("Usage: python -m newton.examples <example_name> [options]")
+        print("       python -m newton.examples          # run default basic_pendulum")
+        print("       python -m newton.examples --list   # print available examples")
+        print()
+        print("Run 'python -m newton.examples <example_name> --help' to see the")
+        print("options supported by a given example.")
+        sys.exit(0)
 
-    example_name = sys.argv[1]
+    if len(sys.argv) >= 2 and sys.argv[1] == "--list":
+        _print_examples(examples)
+        sys.exit(0)
+
+    if len(sys.argv) < 2:
+        example_name = "basic_pendulum"
+    else:
+        example_name = sys.argv[1]
 
     if example_name not in examples:
-        print(f"Error: Unknown example '{example_name}'")
-        print("\nAvailable examples:")
-        for name in examples:
-            print(f"  {name}")
+        print(f"Error: Unknown example '{example_name}'\n")
+        _print_examples(examples)
         sys.exit(1)
 
     # Set up sys.argv for the target script
