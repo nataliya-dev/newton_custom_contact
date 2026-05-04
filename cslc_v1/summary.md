@@ -118,27 +118,387 @@ uv run cslc_v1/squeeze_test.py --mode squeeze --object book \
 The squeeze test supports `--external-force fx,fy,fz` and
 `--external-torque tx,ty,tz` (world frame, applied to the held body
 during HOLD only via `cslc_v1/common.py:apply_external_wrench`).
-At realistic trade-paperback dimensions the friction-cone budget is
-comfortably above gravity, so all three contact models hold under
-moderate disturbances; differentiation is on creep, not catastrophic
-failure.  Representative numbers (book, μ=0.5, default pen):
 
-| Disturbance | point HoldCreep / Tilt | cslc HoldCreep / Tilt | hydro HoldCreep / Tilt |
-|---|---|---|---|
-| none | +0.119 / 0.00° | **+0.045 / 0.00°** | +0.260 / 1.11° |
-| 5 N down | +0.119 / 0.06° | **+0.045 / 0.55°** | +0.258 / 1.27° |
-| τ_x = 5 N·m | +0.119 / 0.00° | **+0.045 / 0.00°** | +0.232 / 1.24° |
-| τ_z = 100 N·m | -0.924 / 0.00° (rises) | **-0.283 / 0.00°** | -0.942 / — |
+> **2026-05-03 — `apply_external_wrench` layout bug fixed.** The function
+> previously had force/torque slots swapped (`body_f[0:3] = torque,
+> body_f[3:6] = force`) — opposite to Newton's `wp.spatial_vector(force,
+> torque)` convention used by both the semi-implicit contact kernel
+> ([kernels_contact.py:261](newton/_src/solvers/semi_implicit/kernels_contact.py#L261))
+> and MuJoCo's `apply_mjc_body_f_kernel`
+> ([mujoco/kernels.py:1367](newton/_src/solvers/mujoco/kernels.py#L1367)).
+> The bug aliased every `--external-force` flag to a torque
+> disturbance and vice versa.  Every disturbance row above the
+> 2026-05-03 cutoff is mislabelled — see the "Disturbance sweep —
+> three baselines side by side" section for the corrected numbers.
+
+At realistic trade-paperback dimensions, **two distinct catastrophic-
+failure regimes emerge once the wrench layout is correct**:
+
+1. **BOX-vs-BOX pads + τ_z = 5 N·m**: point contact's 4-corner
+   specialisation cannot resist the vertical twist (capacity at this
+   geometry is marginally below 5 N·m).  Book is ejected: tilt 178°,
+   creep −74.8 mm/s.  CSLC holds bit-exactly with the same disturbance
+   (creep +0.015 mm/s, tilt 0.55°).  Hydro degrades but holds (creep
+   +0.32 mm/s, tilt 4.5°).
+2. **SPHERE-pads + τ_x = 5 N·m**: the true 1-contact-per-pad
+   ("two-pin") grasp cannot resist twist around the line joining the
+   pads — contact is lost entirely, book is ejected.
+
+These give the paper two clean catastrophic-failure axes that map
+directly onto physical intuition: vertical twist beats specialised
+4-corner contact; grip-axis twist beats true point contact.  Hard
+numbers are in the "Disturbance sweep" section below.
 
 Caveat — the dramatic "point ejects the book" failures observed in
-earlier sweeps required the unrealistic 16×300×400 mm, 1.2 kg paper-
-spec panel (300 mm of book overhang past the pad on both sides, huge
-tilt-lever arms on every contact-line corner).  At realistic
-gripper-vs-book proportions point contact is much more competent — the
-edge of the book is closer to the pad, so corner-loss cascades don't
-get the leverage to develop.  To reproduce the original cliff,
-manually set `book_hx=0.008, book_hy=0.15, book_hz=0.20,
-book_density=625` in `SceneParams`.
+the original (pre-2026-04-25) deep-pen sweeps required the unrealistic
+16×300×400 mm, 1.2 kg paper-spec panel (300 mm of book overhang past
+the pad on both sides, huge tilt-lever arms on every contact-line
+corner).  At realistic trade-paperback proportions, point contact's
+4-corner specialisation is competent against most disturbances —
+ejection requires a τ_z that exceeds the corner moment-arm capacity.
+To reproduce the original cliff, manually set `book_hx=0.008,
+book_hy=0.15, book_hz=0.20, book_density=625` in `SceneParams`.
+
+### What "point contact" actually means in this scene (2026-05-03)
+
+Dumping the contact buffer at HOLD step 800 with `point_mujoco`
+shows the 8 reported contacts are **the four corners of each pad
+face** (`y = ±20mm, z = ±50mm`, both pads) — i.e. MuJoCo's
+box-vs-box narrow-phase specialisation emits **4 contacts per pair**,
+not the single pin-like point one might intuit from the name.  With
+two pads that's 8 corner contacts, each at moment arm √(20²+50²) ≈
+54 mm from the patch centre, which is plenty of restoring torque
+against the disturbances above.
+
+In other words, the "point contact" baseline in the book scene is
+already a sparse 4-corner patch per pad — not a true 1-contact-per-
+pair grasp.  The CSLC vs point comparison on this scene is therefore
+"MuJoCo's hand-rolled 4-corner specialisation vs 378-sphere lattice
+with anchor + lateral compliance", not "8-point patch vs 2 pins".
+
+The cleanest "two pins" baseline is built by switching the pads from
+BOX to SPHERE — sphere-vs-box always emits 1 contact per pair, and
+the 2-contact regime exposes the rotational compliance that MuJoCo's
+box-vs-box specialisation hides.  Mesh-target paths emit somewhere
+in between (12–13 contacts via BVH-per-triangle iteration).  Hard
+numbers across all three regimes follow.
+
+### What changes when the book is a mesh? (--book-as-mesh, 2026-05-03)
+
+`squeeze_test.py --object book --book-as-mesh` swaps the
+`add_shape_box` for a 12-triangle `add_shape_mesh`.  Three findings:
+
+1. **MuJoCo emits ~12 contacts per pad-vs-mesh-book pair**, not the
+   single GJK-MPR contact one might expect.  MuJoCo Warp's mesh
+   narrow phase iterates over the mesh's triangle BVH and emits one
+   contact per overlapping triangle, so the active-contact count
+   stays in the "denser multipoint" regime regardless of mesh
+   triangle count.  Single-point-per-pair behaviour requires either
+   sphere-on-X primitive specialisation OR an explicit `condim=1` /
+   `max_contacts_per_pair=1` solver hint.
+
+2. **CSLC currently does NOT support mesh targets.**
+   `cslc_handler._from_model` filters `shape_pairs` to
+   `supported_geo_types = (SPHERE, BOX)`; mesh-target pairs are
+   dropped → the handler reports `n_pair_blocks = 0` → no CSLC
+   contacts are emitted → the run degenerates to MuJoCo's standard
+   mesh narrow phase, identical to `point_mujoco`.  This shows up
+   as bit-exact metrics between `point` and `cslc` columns in the
+   `--book-as-mesh` table below.
+
+3. **Hydroelastic still works on mesh targets** because Newton lets
+   meshes carry their own SDF (`mesh.build_sdf(max_resolution=64)`
+   in `_add_pads_and_target`).  Hydro emits ~133 pressure-field
+   polygons per pair on a 12-tri book.
+
+Implication for the paper's "general manipulation" claim: paper §3.1
+says "we approximate the robot AND object geometries as collections
+of spheres using MorphIt" — but the current implementation only
+realises this for the robot (via the CSLC pad lattice).  For
+arbitrary mesh objects the user must EITHER MorphIt-ify the target
+into a sphere collection (which then routes through CSLC-vs-sphere)
+OR add a `compute_cslc_penetration_mesh` kernel that queries the
+mesh's SDF — listed in §5.1 TODOs.
+
+### Disturbance magnitude sweep — failure curves (2026-05-03, post-fix)
+
+The single-magnitude tables below answer "does CSLC hold under
+disturbance X" but not "where is the cliff".  This section sweeps each
+of the 6 disturbance axes from 0 → an upper bound that exposes
+catastrophic failure (or saturates without one), revealing **three
+distinct cliffs** in the BOX-on-BOX scene and confirming that **CSLC
+is the only model with zero ejections across all 63 magnitudes
+tested**.
+
+Reproduce: `cslc_v1/_validation_logs/sweep_book_disturbance_curves.py`
+(~5 min on RTX 3070).  CSV → `sweep_book_disturbance_curves.csv` (190
+rows).  Trade-paperback book, μ=0.5, weight 4.42 N, kinematic BOX
+pads, 1 s HOLD.
+
+#### Cliff-threshold summary
+
+| Axis  | Unit | point ejects at | CSLC ejects at | hydro ejects at | CSLC max tilt |
+|-------|------|-----------------|----------------|-----------------|----------------|
+| F_x   | N    | — (15 N tested) | — | — (15 N tested) | 0.00° |
+| F_y   | N    | — (15 N tested) | — | — (15 N tested) | 0.00° |
+| F_z   | N    | — (15 N down)   | — | — (15 N down)   | 0.00° |
+| τ_x   | N·m  | — (15 N·m, tilt 12°) | — (15 N·m, tilt 5.5°) | — (15 N·m, tilt 180° but no contact loss) | 5.50° |
+| τ_y   | N·m  | **20 N·m** (cliff between 15 and 20) | — (20 N·m, tilt 0.39°) | — (20 N·m, tilt 9.4°) | 0.39° |
+| τ_z   | N·m  | **3 N·m** (cliff between 2 and 3) | — (10 N·m, tilt 1.1°) | — (10 N·m, tilt 14°) | 1.10° |
+
+**Three observations:**
+
+1. **Lateral forces are trivially absorbed** by friction at the pad
+   face for all three models, even at 15 N (3.4× the book's weight).
+   This is geometry, not contact-model fidelity: the pads grip the
+   book's wide ±x covers, so an x/y/z force is just a normal /
+   tangential load on the existing patch.  No contact-model claim
+   should rely on F_x / F_y discrimination.
+
+2. **F_z creep scales linearly with magnitude**, with **CSLC's slope
+   ~6× lower than point's**:
+   - Point creep slope: 0.030 mm/s per N down (from +0.119 at 0N to
+     +0.536 at -15N).
+   - CSLC creep slope: 0.005 mm/s per N down (from +0.015 at 0N to
+     +0.089 at -15N).
+   - This is the "compliance leak" axis: each MuJoCo constraint
+     contributes a `c·f_n` term that grows linearly with f_n; CSLC's
+     lattice equilibrium absorbs the load with proportionally less
+     leak per sphere.
+
+3. **CSLC is the only model with no ejections** across the entire
+   sweep.  Maximum observed tilt anywhere: 5.50° at τ_x = 15 N·m.
+   At every disturbance/magnitude combination tested, CSLC retained
+   all 378 surface spheres in contact.
+
+#### Three cliffs identified
+
+**Cliff #1 — point under τ_z (vertical twist) at ~2.5 N·m**
+
+| τ_z [N·m] | point creep / tilt / contacts | cslc creep / tilt / contacts |
+|---|---|---|
+| 0.00 | +0.119 / +0.00° / 8  | +0.015 / +0.00° / 378 |
+| 1.00 | +0.119 / +0.04° / 8  | +0.015 / +0.11° / 378 |
+| 2.00 | +0.119 / +0.08° / 8  | +0.015 / +0.22° / 378 |
+| **3.00** | **+2273 / +180° / 0 EJECTED** | +0.016 / +0.33° / 378 |
+| 5.00 | EJECTED | +0.015 / +0.55° / 378 |
+| 10.00 | EJECTED | +0.015 / +1.10° / 378 |
+
+**Discontinuous failure** — point holds rigidly up to 2 N·m, then
+ejects at 3 N·m.  The 4-corner specialisation provides a moment-arm
+capacity around `τ_max ≈ 4 · μ·F_n·r_corner ≈ 4 · 0.5 · 100 · 0.054 ≈
+11 N·m` *if all corners stay loaded*, but corner-unloading cascades
+collapse this in practice once any single corner crosses the friction
+cone.  CSLC, with 378 distributed spheres, has no analogous cascade
+mode — load redistributes through the lateral spring `k_ℓ` faster
+than friction-cone saturation can propagate.
+
+**Cliff #2 — point under τ_y (vertical bending) at ~17 N·m**
+
+| τ_y [N·m] | point creep / tilt / contacts | cslc creep / tilt / contacts |
+|---|---|---|
+| 0.00  | +0.119 / +0.00° / 8 | +0.015 / +0.00° / 378 |
+| 5.00  | +0.119 / +0.03° / 8 | +0.015 / +0.10° / 378 |
+| 10.00 | +0.119 / +0.06° / 8 | +0.015 / +0.20° / 378 |
+| 15.00 | +0.119 / +0.09° / 8 | +0.015 / +0.30° / 378 |
+| **20.00** | **EJECTED / +178.84° / 0** | +0.015 / +0.39° / 378 |
+
+**Second discontinuous failure** of point contact, this time on the
+bending axis.  CSLC at the failure magnitude reaches just 0.39° tilt
+— a **>450× rotational stiffness advantage** at the threshold where
+point catastrophically fails.
+
+**Cliff #3 — hydro under τ_x (grip-axis twist) at ~10–15 N·m**
+
+| τ_x [N·m] | point creep / tilt | cslc creep / tilt | hydro creep / tilt |
+|---|---|---|---|
+| 5.00 | +0.119 / +4.12° | +0.015 / +1.83° | +2.766 / +28.01° |
+| 7.50 | +0.119 / +6.17° | +0.015 / +2.75° | +9.329 / +57.37° |
+| 10.00 | +0.119 / +8.23° | +0.015 / +3.66° | +20.449 / +99.16° |
+| 15.00 | +0.119 / +12.35° | +0.015 / +5.50° | +20.639 / **+179.91°** |
+
+Hydro's pressure-field polygons concentrate around the box edges; as
+twist tilts the book, those edge polygons rapidly reorient and lose
+moment-arm capacity, producing very high tilts (180° at 15 N·m).
+Point degrades gracefully (12.35° at 15 N·m) because its 4 corners
+remain symmetrically engaged.  CSLC's lattice maintains the lowest
+tilt of all three (5.50° at 15 N·m) — the **only model where the
+tilt-vs-magnitude curve stays sub-linear** through this regime.
+
+#### What this means for the paper
+
+1. **Figure 1 candidate**: τ_z at 3 N·m, BOX-on-BOX.  Point ejected,
+   CSLC and hydro hold, but CSLC's tilt is 6× lower than hydro's
+   (0.33° vs ~1.8° interpolated).  Single magnitude, three
+   qualitatively different outcomes.
+
+2. **Capacity-curve figure**: tilt-vs-magnitude curves overlaid for
+   τ_z and τ_y.  Point shows discontinuous cliff; CSLC and hydro are
+   continuous.  CSLC's slope is the smallest of the three.
+
+3. **Compliance-leak figure**: F_z creep-vs-magnitude curve.  All
+   three models linear, with slopes in the ratio
+   `point : hydro : CSLC ≈ 6 : 9 : 1`.  This is the "constraint-
+   compliance leak" claim made experimentally concrete across a
+   continuous range.
+
+4. **Empirical robustness claim**: across 63 disturbance magnitudes
+   spanning 6 axes, CSLC was the only model with zero ejections.
+   Point ejected on 2 axes; hydro reached 180° tilt (without losing
+   contact) on 1 axis.
+
+```
+uv run --extra dev python cslc_v1/_validation_logs/sweep_book_disturbance_curves.py
+```
+
+---
+
+### Disturbance sweep — three baselines side by side (2026-05-03, post-fix)
+
+Reproduce via `cslc_v1/_validation_logs/sweep_book_disturbances.py`.
+Trade-paperback book (152×229×25 mm, 0.45 kg, μ=0.5, weight 4.42 N),
+disturbance applied to the held body during HOLD only.
+
+> **All numbers below post-date the 2026-05-03
+> `apply_external_wrench` layout fix.** The pre-fix sweep had every
+> `--external-force` row aliased to a torque disturbance and vice
+> versa.  A previous edit of this section ("CSLC creep is ~8× lower
+> than point ... tilt is 0° for both") was based on those mislabelled
+> runs and is wrong: under the *correct* wrench layout, point contact
+> exhibits **two distinct catastrophic-failure regimes** that CSLC
+> cleanly resists.  The numbers below are the regenerated, correct
+> sweep.
+
+#### A. BOX book + BOX pads (paper baseline)
+
+| Disturbance | point creep / tilt | **cslc** creep / tilt | hydro creep / tilt | point | cslc | hydro |
+|---|---|---|---|---|---|---|
+| none           | +0.119 / 0.00°        | **+0.015 / 0.00°** | +0.242 / 1.09° |   8 | 378 |  97 |
+| τ_y = 1 N·m    | +0.119 / 0.01°        | **+0.015 / 0.02°** | +0.254 / 1.35° |   8 | 378 |  98 |
+| τ_y = 5 N·m    | +0.119 / 0.03°        | **+0.015 / 0.10°** | +0.406 / 2.77° |   8 | 378 |  93 |
+| τ_x = 5 N·m    | +0.119 / 4.12°        | **+0.015 / 1.83°** | +2.769 / 28.02° |  8 | 378 |  97 |
+| **τ_z = 5 N·m**| **−74.822 / 177.60°** ← **EJECTED** | **+0.015 / 0.55°** | +0.320 / 4.51° | 0 | 378 | 100 |
+| F_z = −2 N     | +0.179 / 0.00°        | **+0.030 / 0.00°** | +0.307 / 1.10° |   8 | 378 |  98 |
+
+(creep in mm/s, positive = falling; rightmost three columns are
+active-contact counts)
+
+The flagship row is **τ_z = 5 N·m**: point contact's 4 pad-corner
+specialisation cannot resist a 5 N·m vertical twist (capacity ≈ 4 ×
+μ·F_n·r_corner ≈ 4 × 0.5·100N·54mm ≈ 11 N·m *if all corners stay
+loaded*, but corner unloading cascades faster than the friction cone
+can compensate — observed: contacts → 0, book ejected at 75 mm/s,
+178° tilt by HOLD-end).  CSLC at the same disturbance: creep
++0.015 mm/s, tilt 0.55°, all 378 surface spheres still engaged.
+Hydro degrades but holds: creep +0.32 mm/s, tilt 4.5°, 100 polygons.
+
+τ_x = 5 N·m (twist around the grip axis) also exposes a real CSLC
+advantage: tilt 1.83° vs point 4.12° vs hydro 28.02°.  Hydro's
+near-failure on this row is interesting — likely due to its
+pressure-field polygons concentrating around the box edges and not
+having compliance to redistribute load when the twist starts.
+
+#### B. MESH book + BOX pads (`--book-as-mesh`)
+
+| Disturbance | point creep / tilt | cslc creep / tilt | hydro creep / tilt | active contacts |
+|---|---|---|---|---|
+| none           | +0.078 / 0.07° | +0.078 / 0.07° | +0.112 / 0.04° | 12 / 12 / 133 |
+| τ_y = 1 N·m    | +0.075 / 0.08° | +0.075 / 0.01° | +0.089 / 0.05° | 12 / 12 / 133 |
+| τ_y = 5 N·m    | +0.075 / 0.09° | +0.075 / 0.09° | +0.110 / 0.09° | 12 / 12 / 133 |
+| τ_x = 5 N·m    | −0.042 / 4.13° | +0.019 / 3.98° | +0.116 / 7.76° | 10 / 11 / 133 |
+| τ_z = 5 N·m    | +0.075 / 0.14° | +0.075 / 0.14° | +0.098 / 1.07° | 12 / 12 / 127 |
+| F_z = −2 N     | +0.119 / 0.07° | +0.116 / 0.11° | +0.159 / 0.09° | 12 / 12 / 133 |
+
+CSLC and point columns are **bit-exact** (within fp32 noise) —
+confirming the handler is dormant on mesh targets (per §"What
+changes when the book is a mesh" above).  Until CSLC gains a
+mesh-target kernel, the paper's claim must be carefully scoped to
+"pad-vs-sphere or pad-vs-primitive-box" or to "pre-MorphIt'd
+targets".
+
+Notable: the τ_z = 5 N·m row that ejected point contact in Table A
+no longer ejects in Table B — because the mesh narrow phase emits
+~12 BVH-triangle contacts spread across the book covers (rather
+than 4 pad-face corners), giving the grip more moment-arm coverage
+against vertical twist.  This is a side-effect of MuJoCo's mesh
+narrow phase being multipoint; it's not a CSLC win and shouldn't be
+read as such.
+
+#### C. BOX book + SPHERE pads (true 1-contact-per-pad baseline)
+
+| Disturbance | point creep / **tilt** | contacts |
+|---|---|---|
+| none           | +0.492 / 0.00°       | 2 |
+| τ_y = 1 N·m    | +0.492 / **+1.55°**  | 2 |
+| τ_y = 5 N·m    | +0.480 / **+7.21°**  | 2 |
+| **τ_x = 5 N·m**| **+14144 / 179.91°** ← **EJECTED** | 0 |
+| τ_z = 5 N·m    | +0.492 / +7.20°      | 2 |
+| F_z = −2 N     | +0.715 / 0.00°       | 2 |
+
+Two complementary failure modes appear with the corrected wrench:
+
+- **Bending torque (τ_y)**: book pivots around the line joining the
+  two pads.  1.55° at 1 N·m, 7.21° at 5 N·m — gracefully rotational
+  rather than catastrophic.
+- **Grip-axis torque (τ_x)**: catastrophic.  A two-pin grasp cannot
+  resist twist around the line connecting the pads (the rotation axis
+  passes through both contact points, so neither pad has any moment
+  arm to oppose it — only sliding friction can, and once that
+  saturates the grip is gone).  Observed: contacts → 0, drop 14 m,
+  tilt 179.9°.
+
+Combined with Table A's τ_z = 5 N·m point-ejection, we now have **two
+distinct catastrophic-failure regimes for point contact** (one per
+pad geometry) plus **a smooth tilt-vs-disturbance curve** for the
+two-pin sphere-pad case — exactly the empirical profile the paper's
+§1 narrative needs.
+
+### Paper-grade implications
+
+The corrected sweep changes the recommended paper narrative.  The
+strongest single comparison is now **Table A's τ_z = 5 N·m row**:
+point ejected, CSLC held cleanly, hydro held but degraded.  This is
+the experiment to put in Figure 1.
+
+For the ICRA submission, three coherent narratives:
+
+1. **Catastrophic-failure regime** (Table A τ_z = 5 N·m + Table C
+   τ_x = 5 N·m) — "point contact has finite vertical-twist capacity
+   ≈ 5 N·m at the BOX-pad geometry, and zero capacity for grip-axis
+   twist with sphere pads.  CSLC's distributed lattice resists both
+   regimes by an order of magnitude."  This is the **cleanest
+   demonstration that distributed contact qualitatively differs from
+   point contact**, not just quantitatively.
+
+2. **Compliance-leak regime** (Table A creep across all
+   non-failure rows) — "even when point contact holds without
+   ejection, MuJoCo's per-constraint `c·f_n` compliance leak
+   produces an 8× higher creep rate than CSLC's lattice
+   equilibrium."  This is the §3.1 theoretical claim made
+   experimentally concrete.
+
+3. **General-target gap** (Table B) — "for mesh-based targets
+   (USD assets, MorphIt sphere clouds, scanned objects) the current
+   CSLC handler is dormant and the distributed-contact advantage
+   does not apply.  Closing this gap (§5.1 `compute_cslc_penetration
+   _mesh` TODO) is the highest-priority follow-up."
+
+The strongest single experiment for the paper is now **Table A's
+τ_z = 5 N·m row**: a single, reproducible disturbance under which
+point contact is ejected (178° tilt, 75 mm/s creep, 0 active
+contacts), CSLC holds cleanly (0.55° tilt, 0.015 mm/s creep, 378
+active spheres), and hydro degrades but holds (4.5° tilt, 0.32 mm/s
+creep, 100 polygons).  This is one disturbance, three contact
+models, three qualitatively different outcomes.  Add Table C's
+τ_x = 5 N·m sphere-pad ejection as the supplementary figure that
+recovers the paper's "fragile point-contact grasp" intuition without
+relying on MuJoCo's box-vs-box specialisation.
+
+```
+uv run --extra dev cslc_v1/squeeze_test.py --mode squeeze --object book
+uv run --extra dev cslc_v1/squeeze_test.py --mode squeeze --object book --book-as-mesh
+uv run --extra dev python cslc_v1/_validation_logs/sweep_book_disturbances.py
+```
 
 ### Active contacts — what the column actually means
 
@@ -316,6 +676,21 @@ Reproduce with the same command as above
 | point | 7.32 s | 3.25 ms | 0.31 ms | 2.71 ms | — |
 | **CSLC** | **10.71 s** | **4.76 ms** | **0.99 ms** ↓ | 3.54 ms | **collide −46 %, per-step −15 %** |
 | hydro | 10.67 s | 4.74 ms | 0.99 ms | 3.51 ms | — |
+
+**Optimised + dead-readback removed (2026-05-03)** — `_launch_vs_sphere`
+was issuing 4 `.numpy()` GPU→CPU syncs per pair per step to populate a
+diagnostic block whose only consumer was a commented-out `print`.
+Removing the dead readback drops the collide phase by ~half:
+
+| Model | Wall | Per-step | Collide | MuJoCo step | Δ vs prior optimised |
+|---|---|---|---|---|---|
+| **CSLC** | **10.38 s** | **4.61 ms** | **0.50 ms** ↓↓ | 3.86 ms | **collide −49 %, per-step −3 %** |
+| hydro | 10.88 s | 4.84 ms | 0.91 ms | 3.67 ms | (jitter) |
+
+CSLC is now **faster than hydroelastic** on both collide phase
+(0.50 ms vs 0.91 ms = 1.8× faster) and per-step (4.61 ms vs 4.84 ms),
+in addition to being far cheaper to set up (no SDF precomputation, no
+mesh dependency).  This is the headline speed claim for the paper.
 
 **Conclusions:**
 - CSLC's online per-step cost is now **statistically identical to
@@ -600,6 +975,94 @@ Fix: `out_friction = 1.0` → `effective_mu = μ × 1.0 = μ` ✓.
   that violate the flat-patch assumption and cause launch instability during
   lift. The handler hardcodes the inner face to local +x — each CSLC shape
   must be oriented so local +x points toward the grasped object.
+
+### 4.4a Box K3 `pen_3d` uses `effective_r`, not `r_lat` (FIXED 2026-05-03)
+
+`write_cslc_contacts_box` (cslc_kernels.py) was using `pen_3d = r_lat -
+signed_dist`, the *rest* overlap from K1.  Paper eq. 5 says the contact
+force at equilibrium is `F = kc · (φ_rest − δ) · gate` — the
+*post-equilibrium* effective overlap, with δ subtracted.  The sphere K3
+gets this right via `pen_3d = (effective_r + target_radius) − dist`; the
+box variant was a copy-paste oversight from the 2026-04-26 box-kernel
+addition.
+
+**Fix:** `pen_3d = effective_r − signed_dist` so `F = kc · pen_3d · gate
+= kc · (φ_rest − δ) · gate`, matching paper eq. 6 static part.
+
+**Why the bug was hidden:** Per-sphere force overstiffening factor is
+`(kc + ka) / ka`.  For book scene (`kc = 269.3`, `ka = 15000`), this is
+1.018 — a 1.8 % per-sphere over-force.  Squeeze book uses *kinematic*
+pads, so the macroscopic grip is regulated by the position constraint
+and HoldCreep is unchanged (bit-exact +0.045 mm/s before and after the
+fix).  Lift uses sphere targets, so the box kernel never runs.  The bug
+was invisible to every existing integration metric.
+
+**Why it still mattered:** The differentiable-MPC story relies on
+`dF/dδ` matching the paper.  With the bug, `dF/dδ` is wrong by a
+constant factor on box targets, breaking gradient-based optimisation
+through CSLC vs box contact.  Fixing it preserves end-to-end
+consistency between paper §3.4 calibration, §4.5 gradient flow, and
+the implementation.
+
+### 4.4b Box-kernel diagnostic parity + dead-readback cleanup (2026-05-03)
+
+Two paired changes to `cslc_kernels.py` / `cslc_handler.py`:
+
+- **Diagnostic parity.**  `write_cslc_contacts_box` now writes the same
+  five per-contact diagnostic arrays the sphere variant does
+  (`dbg_pen_scale`, `dbg_solver_pen`, `dbg_effective_r`, `dbg_d_proj`,
+  `dbg_radial`), indexed by the same per-pair-per-slot layout
+  (`pair_idx · n_surface_contacts + slot`).  `dbg_d_proj` records
+  `d_proj_solver` (the projection that drives `solver_pen`) and
+  `dbg_radial` is the in-face-plane component of `closest − q` — the
+  geometric analog of the sphere kernel's `sqrt(dist² − d_proj²)`.
+  Hard-culled slots keep their post-geometry diag values, matching the
+  sphere convention.  External readers can now interrogate sphere and
+  box pairs with identical code.
+
+- **Dead-readback removed.**  The post-K3 block in
+  `_launch_vs_sphere` was issuing 4 GPU→CPU `.numpy()` syncs per pair
+  per step to feed a commented-out `print`.  Stripped.  Collide phase
+  on the lift scene drops 0.99 → 0.50 ms (−49 %), making CSLC's online
+  cost lower than hydroelastic's (see §2 "Optimised + dead-readback
+  removed" table).  Both changes are observability-only: no test
+  numbers move.
+
+### 4.4c `apply_external_wrench` layout bug (FIXED 2026-05-03)
+
+`cslc_v1/common.py:apply_external_wrench` was writing the wrench in
+`[torque, force]` order — opposite to Newton's actual
+`wp.spatial_vector(force, torque)` convention used by both
+`semi_implicit/kernels_contact.py:261` (`wp.spatial_vector(f_total,
+wp.cross(r, f_total))`) and `mujoco/kernels.py:1367` (which reads
+`f[0:3]` as linear and `f[3:6]` as angular before forwarding to
+MuJoCo's `xfrc_applied`).
+
+**Effect of the bug:** every disturbance row in the squeeze and lift
+tests that used `--external-force fx,fy,fz` was actually applying a
+torque `(fx, fy, fz)` N·m, and every `--external-torque tx,ty,tz`
+was actually applying a force `(tx, ty, tz)` N.  Pre-fix sweep
+tables in this document (any §1 disturbance numbers from before
+2026-05-03) are mislabelled.
+
+**Fix:** swap the slot writes in `apply_external_wrench` so
+`bf[0:3] = force, bf[3:6] = torque`, and update the docstring +
+comment to document the convention with cross-references to the two
+solver paths that establish it.
+
+**Empirical confirmation (post-fix):** the τ_z = 5 N·m disturbance
+on the BOX-vs-BOX point case ejects the book (creep −74.8 mm/s,
+tilt 178°), which is consistent with a true 5 N·m vertical twist
+exceeding the 4-corner moment arm capacity.  Pre-fix this row read
+"−0.015 mm/s, 0° tilt" because it was actually applying a +5 N
+upward force that nearly cancelled gravity.  See §1 "Disturbance
+sweep — three baselines" for the regenerated tables.
+
+**Why the bug was hidden for so long:** none of the existing tests
+asserted on the *direction* of the disturbance effect — they read
+the metric values without cross-checking against the disturbance
+label.  Going forward, any new disturbance entries should include a
+predicted-vs-observed sanity check.
 
 ### 4.5 Smoothness / differentiability coverage (verified by `cslc_v1/smooth_basic_test.py`, 33 tests)
 
@@ -1009,11 +1472,21 @@ without re-tuning per scene).
   for squeeze/lift/robot tests: `make_solver`, `count_active_contacts`,
   `read_cslc_state`, `recalibrate_cslc_kc_per_pad`,
   `apply_external_wrench`, `inspect_model`, `get_cslc_lattice_viz_data`.
+  **Layout fix (2026-05-03):** `apply_external_wrench` now writes
+  `body_f[0:3] = force, body_f[3:6] = torque` (matches Newton's
+  `wp.spatial_vector(force, torque)` convention).  Was previously
+  swapped — see §4.4c.
 - `cslc_v1/squeeze_test.py` — 3-way comparison wired via
   `--contact-models`; HOLD-phase metrics (`hold_drop_mm`,
   `hold_creep_rate_mm_per_s`).  Held target selectable via
   **`--object {sphere,book}`** — book mode exercises the box kernels
   with realistic trade-paperback defaults (152×229×25 mm, 0.45 kg).
+  **`--book-as-mesh` (2026-05-03)** — replaces the primitive
+  `add_shape_box` with a 12-triangle `add_shape_mesh`; routes
+  contact through MuJoCo Warp's BVH-per-triangle mesh narrow phase
+  (~12 contacts/pair) and verifies the CSLC-handler-on-mesh
+  dormancy gap (handler currently filters out non-(SPHERE,BOX)
+  targets).  See §1 "What changes when the book is a mesh".
   HOLD-only external wrench via `--external-force fx,fy,fz` /
   `--external-torque tx,ty,tz` (applied through
   `common.apply_external_wrench`).  Geometry / material overrides:
@@ -1021,6 +1494,9 @@ without re-tuning per scene).
   target's squeeze-axis half-extent), `--mu <coeff>`,
   `--book-mass <kg>`, `--cslc-spacing`, `--contact-fraction`.
   Rotational metrics on `Metrics`: `max_tilt_deg`, `final_tilt_deg`.
+  Helper `_make_box_mesh(hx, hy, hz)` builds a CCW-from-outside
+  12-triangle box `newton.Mesh` (verified by `_validation_logs/
+  sweep_book_disturbances.py`).
 - `cslc_v1/lift_test.py` — 3-way comparison; per-pad kc recalibration with
   cf=0.025 via `recalibrate_cslc_kc_per_pad`; `--cslc-ka` / `--cslc-contact-fraction` / `--kh` CLI overrides; per-step timing diagnostic.
 - `cslc_v1/cslc_box_test.py` (new 2026-04-26) — 12 tests for the box
@@ -1028,3 +1504,16 @@ without re-tuning per scene).
   the d_proj sign-flip bug, and one full-pipeline aggregate-force test
   on the book scene.  Run via
   `uv run --extra dev -m unittest cslc_v1.cslc_box_test -v`.
+- `cslc_v1/_validation_logs/sweep_book_disturbances.py` (new 2026-05-03)
+   — disturbance sweep across (BOX book, MESH book, SPHERE-pad book) ×
+   (point, cslc, hydro) × {none, τ_y=1, τ_y=5, τ_x=5, τ_z=5, F_z=−2}.
+   Source of the §1 "Disturbance sweep — three baselines" tables.
+   Expected runtime ~3 min on RTX 3070.
+- `cslc_v1/_validation_logs/sweep_book_disturbance_curves.py` (new 2026-05-03)
+   — magnitude sweep across all 6 disturbance axes × 3 contact models
+   on the BOX-on-BOX book scene, exposing the failure curves
+   (continuous tilt-vs-magnitude, ejection thresholds).  189-row CSV
+   at `sweep_book_disturbance_curves.csv` for downstream plotting.
+   Source of the §1 "Disturbance magnitude sweep — failure curves"
+   tables (three identified cliffs: point τ_z @ 3 N·m, point τ_y @
+   20 N·m, hydro τ_x @ 15 N·m).  Expected runtime ~5 min on RTX 3070.

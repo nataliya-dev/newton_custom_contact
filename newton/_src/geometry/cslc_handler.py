@@ -580,45 +580,7 @@ class CSLCHandler:
                     self.dbg_radial,
                 ],
                 device=self.device,
-
             )
-
-            # ── Diagnostic summary ──
-            shape0_np = contacts.rigid_contact_shape0.numpy()
-            reason_np = self.debug_reason.numpy()
-
-            start = contact_offset
-            end   = contact_offset + self.n_surface_contacts
-            valid_mask   = shape0_np[start:end] != -1
-            active_slots = np.nonzero(valid_mask)[0]
-            active_tids  = self.slot_to_tid[active_slots]
-
-            base_count  = int(np.sum(shape0_np[:contact_offset] != -1))
-            cslc_count  = int(valid_mask.sum())
-
-            if len(active_tids) > 0:
-                delta_np = data.sphere_delta.numpy()
-                phi_np   = pen_buf.numpy()
-                act_d = delta_np[active_tids]
-                act_p = phi_np[active_tids]
-                # F_total is an ESTIMATE of the aggregate normal force.  The
-                # actual solver force per contact is kc · pen_3d (by design,
-                # via the pen_scale factor in write_cslc_contacts), but it
-                # saturates once δ converges — so use (kc · phi_avg · n_active)
-                # here only as a quick order-of-magnitude indicator.  Real
-                # force magnitude comes from reading Fn through the rigid-body
-                # solver's contact output.
-                f_total = float(data.kc * act_p.sum())
-                dist_info = (f" | δ[mm] max={act_d.max()*1e3:.2f} mean={act_d.mean()*1e3:.2f}"
-                             f" | pen[mm] max={act_p.max()*1e3:.2f} mean={act_p.mean()*1e3:.2f}"
-                             f" | F≈{f_total:.2f}N")
-            else:
-                dist_info = ""
-
-            vals, counts = np.unique(reason_np, return_counts=True)
-            reason_summary = {int(v): int(c) for v, c in zip(vals, counts)}
-            # print(f"CSLC_SUMMARY pair=({pair.cslc_shape},{pair.other_shape}) "
-            #       f"base={base_count} cslc={cslc_count}{dist_info} "
 
     def _launch_vs_box(
         self,
@@ -743,7 +705,16 @@ class CSLCHandler:
                 contacts.rigid_contact_damping,
                 contacts.rigid_contact_friction,
                 self.debug_reason,
+                # Diagnostic outputs — same per-pair-per-slot layout the
+                # sphere variant uses, so external readers can index both
+                # sphere and box pairs uniformly via
+                # `pair_idx * n_surface_contacts + slot`.
+                pair_idx * self.n_surface_contacts,  # diag_offset
+                self.dbg_pen_scale,
+                self.dbg_solver_pen,
+                self.dbg_effective_r,
+                self.dbg_d_proj,
+                self.dbg_radial,
             ],
             device=self.device,
         )
-            #       f"reasons={reason_summary}")

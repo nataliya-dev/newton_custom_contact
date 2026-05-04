@@ -256,30 +256,49 @@ def shape_cfg_hydro(*, ke, kd, kf, mu, density, kh, sdf_resolution=64,
 
 # ── External wrench application ──────────────────────────────────────────
 #
-# Newton's `body_f` is a per-body spatial vector laid out
-# [tx, ty, tz, fx, fy, fz] (Featherstone — torque first, then force).
+# Newton's `body_f` is a per-body `wp.spatial_vector` laid out
+# [fx, fy, fz, tx, ty, tz] — i.e. linear force in `wp.spatial_top()`
+# (slots 0..2) and angular torque in `wp.spatial_bottom()` (slots 3..5).
+# This matches:
+#   - `wp.spatial_vector(f_total, wp.cross(r, f_total))` in
+#     newton/_src/solvers/semi_implicit/kernels_contact.py:261
+#   - `apply_mjc_body_f_kernel` in
+#     newton/_src/solvers/mujoco/kernels.py:1367, which reads f[0:3] as
+#     linear and f[3:6] as angular before forwarding to MuJoCo.
+#   - `body_qd[i]` in newton/_src/solvers/semi_implicit/kernels_contact.py:215
+#     where `wp.spatial_top` returns linear velocity.
 # `state.clear_forces()` zeros it; setting it before `solver.step()`
 # adds an external wrench in the world frame.  Used by squeeze_test's
-# `--external-force` to demonstrate CSLC's distributed-contact response
-# to a perturbation force during HOLD.
+# `--external-force` and `--external-torque`.
+#
+# 2026-05-03: this function previously had force/torque slots swapped
+# (slots 0..2 = torque, 3..5 = force) — opposite to Newton's convention.
+# Result: every disturbance reported as "F_z = -5 N" was actually a
+# "τ_z = -5 N·m" torque, and vice versa.  Verified against the
+# semi-implicit contact kernel and against MuJoCo's xfrc reconstruction.
 
 def apply_external_wrench(state, body_idx: int,
                           force: tuple[float, float, float] = (0.0, 0.0, 0.0),
                           torque: tuple[float, float, float] = (0.0, 0.0, 0.0)
                           ) -> None:
-    """Set the spatial wrench on ``body_idx`` to (torque, force) for one step.
+    """Set the spatial wrench on ``body_idx`` to (force, torque) for one step.
+
+    Layout: ``body_f[body_idx] = [fx, fy, fz, tx, ty, tz]`` — linear
+    force in slots 0..2 (`wp.spatial_top`), angular torque in slots
+    3..5 (`wp.spatial_bottom`).  Matches `wp.spatial_vector(force,
+    torque)` constructor convention used throughout newton/_src.
 
     Must be called AFTER ``state.clear_forces()`` and BEFORE
     ``solver.step()``.  Overwrites whatever was previously in
     ``body_f[body_idx]``; other bodies are untouched.
     """
     bf = state.body_f.numpy()
-    bf[body_idx, 0] = float(torque[0])
-    bf[body_idx, 1] = float(torque[1])
-    bf[body_idx, 2] = float(torque[2])
-    bf[body_idx, 3] = float(force[0])
-    bf[body_idx, 4] = float(force[1])
-    bf[body_idx, 5] = float(force[2])
+    bf[body_idx, 0] = float(force[0])
+    bf[body_idx, 1] = float(force[1])
+    bf[body_idx, 2] = float(force[2])
+    bf[body_idx, 3] = float(torque[0])
+    bf[body_idx, 4] = float(torque[1])
+    bf[body_idx, 5] = float(torque[2])
     state.body_f.assign(
         wp.array(bf, dtype=wp.spatial_vector, device=state.body_f.device))
 

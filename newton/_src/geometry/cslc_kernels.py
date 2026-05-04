@@ -765,6 +765,19 @@ def write_cslc_contacts_box(
     out_damping: wp.array(dtype=wp.float32),
     out_friction: wp.array(dtype=wp.float32),
     debug_reason: wp.array(dtype=wp.int32),
+    # ── Diagnostic outputs (physics-neutral; read back by the handler) ──
+    # Same layout as the sphere variant: indexed by
+    # (diag_offset + slot) where diag_offset = pair_idx * n_surface_contacts.
+    # `dbg_d_proj` here records `d_proj_solver` (the projection that enters
+    # solver_pen), and `dbg_radial` is the in-face-plane component of
+    # (closest − q) — the analog of the sphere kernel's
+    # sqrt(dist² − d_proj²) lateral offset.
+    diag_offset: int,
+    dbg_pen_scale: wp.array(dtype=wp.float32),
+    dbg_solver_pen: wp.array(dtype=wp.float32),
+    dbg_effective_r: wp.array(dtype=wp.float32),
+    dbg_d_proj: wp.array(dtype=wp.float32),
+    dbg_radial: wp.array(dtype=wp.float32),
 ):
     """Write one Newton contact per active surface lattice sphere vs a BOX target.
 
@@ -798,10 +811,17 @@ def write_cslc_contacts_box(
     if slot < 0:
         return
     buf_idx = contact_offset + slot
+    dslot = diag_offset + slot
 
     if sphere_shape[tid] != active_cslc_shape_idx:
         out_shape0[buf_idx] = -1
         debug_reason[slot] = 4
+        # Sentinel: negative pen_scale signals "no contact this slot".
+        dbg_pen_scale[dslot]   = -1.0
+        dbg_solver_pen[dslot]  = 0.0
+        dbg_effective_r[dslot] = 0.0
+        dbg_d_proj[dslot]      = 0.0
+        dbg_radial[dslot]      = 0.0
         return
 
     s_idx = sphere_shape[tid]
@@ -842,10 +862,19 @@ def write_cslc_contacts_box(
     box_centre_world = wp.transform_get_translation(X_tw)
     d_proj_gate = wp.dot(box_centre_world - q_world, normal_ab)
 
-    # 3-D overlap (positive when sphere overlaps box) and the
-    # solver-side projected penetration.  margin1 = 0 here because the
-    # contact point already lies on the box surface.
-    pen_3d = r_lat - signed_dist
+    # Post-equilibrium effective 3-D overlap (paper eq. 5 analog for box).
+    # MUST use effective_r = r_lat - δ, not r_lat: the kernel-3 force the
+    # solver applies is F ≈ kc · pen_3d · gate (see pen_scale below), and
+    # paper eq. 6 says F = kc · (φ_rest − δ) · gate at equilibrium.  For
+    # a box target, φ_rest − δ = (r_lat − δ) − signed_dist = effective_r
+    # − signed_dist.  Using r_lat here (i.e. the K1 rest overlap) instead
+    # would over-stiffen each sphere by a factor (kc+ka)/ka — invisible
+    # under kinematic pads (squeeze book) but wrong for dynamic pads or
+    # for the per-sphere pressure-distribution claim.  Mirrors the sphere
+    # variant which uses (effective_r + target_radius) − dist.  margin1
+    # is 0 below because the contact point already lies on the box
+    # surface.
+    pen_3d = effective_r - signed_dist
     solver_pen = effective_r - d_proj_solver
     pen_scale = pen_3d * solver_pen / (solver_pen * solver_pen + eps * eps)
 
@@ -867,6 +896,21 @@ def write_cslc_contacts_box(
     # sphere variant.
     offset0_body = wp.transform_vector(X_wb_inv, effective_r * normal_ab)
     offset1_body = wp.vec3(0.0, 0.0, 0.0)
+
+    # In-face-plane lateral offset of (closest − q) — analog of the
+    # sphere kernel's sqrt(dist² − d_proj²) "radial" diagnostic.
+    radial_vec = diff_world - d_proj_solver * normal_ab
+    radial = wp.length(radial_vec)
+
+    # ── Record per-contact diagnostics (physics-neutral) ──
+    # Always written so the hard-cull below preserves the physical
+    # values for inspection.  pen_scale * gate matches the stiffness
+    # actually handed to MuJoCo when the gate is non-negligible.
+    dbg_pen_scale[dslot]   = pen_scale * contact_gate
+    dbg_solver_pen[dslot]  = solver_pen
+    dbg_effective_r[dslot] = effective_r
+    dbg_d_proj[dslot]      = d_proj_solver
+    dbg_radial[dslot]      = radial
 
     # Hybrid emission: hard-cull when the smooth gate has decayed deep
     # into its tail to limit MuJoCo's per-constraint compliance leak.

@@ -149,6 +149,17 @@ class SceneParams:
     book_density: float = 515.0          # → ~0.45 kg trade paperback
     book_start_z: float = 0.30           # spawn high enough to hold under gravity
 
+    # When True the book is added as a 12-triangle mesh instead of a
+    # primitive `add_shape_box`.  This routes contact through Newton's
+    # general-convex GJK + MPR narrow phase rather than the box-vs-box
+    # corner-clipping specialization, so MuJoCo emits ONE contact per
+    # pad-vs-book pair (the deepest point) instead of four.  It's the
+    # honest "point contact" baseline for any real manipulation scene
+    # whose target geometry comes from a USD asset, MorphIt sphere
+    # cloud, or a tessellated mesh — i.e. essentially everything that
+    # isn't a hand-tuned primitive.  See summary §1 "TRUE-point baseline".
+    book_as_mesh: bool = False
+
     # ── pads ──
     pad_hx: float = 0.01
     pad_hy: float = 0.02
@@ -402,6 +413,32 @@ def _target_z(p):
     return p.book_start_z if p.object_kind == "book" else p.sphere_start_z
 
 
+def _make_box_mesh(hx: float, hy: float, hz: float) -> "newton.Mesh":
+    """Tessellated cuboid as a 12-triangle Newton Mesh.
+
+    Vertices indexed (binary: bit0 → ±x, bit1 → ±y, bit2 → ±z).  All
+    triangle winding orders verified CCW from outside (cross-product of
+    two edge vectors recovers the +face normal); incorrect winding
+    would let MuJoCo's narrow phase cull back-face contacts and drop
+    the active-contact count to a fraction of 12.
+    """
+    v = np.array([
+        [-hx, -hy, -hz], [+hx, -hy, -hz],   # 0, 1
+        [+hx, +hy, -hz], [-hx, +hy, -hz],   # 2, 3
+        [-hx, -hy, +hz], [+hx, -hy, +hz],   # 4, 5
+        [+hx, +hy, +hz], [-hx, +hy, +hz],   # 6, 7
+    ], dtype=np.float32)
+    idx = np.array([
+        0, 2, 1,  0, 3, 2,    # -z (bottom)
+        4, 5, 6,  4, 6, 7,    # +z (top)
+        0, 1, 5,  0, 5, 4,    # -y (front)
+        3, 7, 6,  3, 6, 2,    # +y (back)
+        0, 4, 7,  0, 7, 3,    # -x (left)
+        1, 2, 6,  1, 6, 5,    # +x (right)
+    ], dtype=np.int32)
+    return newton.Mesh(v, idx)
+
+
 def _add_pads_and_target(b, p, pad_cfg, target_cfg):
     """Add two kinematic pads + the chosen dynamic target.  Returns body indices.
 
@@ -442,9 +479,33 @@ def _add_pads_and_target(b, p, pad_cfg, target_cfg):
     if p.object_kind == "sphere":
         b.add_shape_sphere(target, radius=p.sphere_radius, cfg=target_cfg)
     elif p.object_kind == "book":
-        b.add_shape_box(target,
-                        hx=p.book_hx, hy=p.book_hy, hz=p.book_hz,
-                        cfg=target_cfg)
+        if p.book_as_mesh:
+            # Tessellated cuboid: 8 vertices, 12 triangles, CCW from
+            # outside.  Routes through MuJoCo Warp's mesh narrow phase
+            # (BVH-per-triangle iteration) rather than the box-vs-box
+            # corner-clipping specialisation.  Empirically this still
+            # emits multipoint contacts (~12 per pad-vs-book pair, one
+            # per overlapping triangle) — NOT a single contact per pair
+            # as a naive "GJK-MPR converges to one deepest point"
+            # reading would suggest.  Useful for verifying that the
+            # paper's CSLC vs point comparison generalises to
+            # mesh-based targets, even though the contact count stays
+            # closer to "denser multipoint" than to "two pins".
+            book_mesh = _make_box_mesh(p.book_hx, p.book_hy, p.book_hz)
+            mesh_cfg = target_cfg
+            if getattr(target_cfg, "is_hydroelastic", False):
+                # Hydroelastic on a mesh requires a precomputed SDF.
+                # The primitive-box path autogens it from cfg.sdf_*;
+                # for meshes we have to build it on the mesh AND strip
+                # the sdf_* fields from cfg (Newton's add_shape rejects
+                # mesh shapes that carry primitive-style sdf_* hints).
+                book_mesh.build_sdf(max_resolution=p.sdf_resolution)
+                mesh_cfg = _book_cfg(p, kh=p.kh, is_hydroelastic=True)
+            b.add_shape_mesh(target, mesh=book_mesh, cfg=mesh_cfg)
+        else:
+            b.add_shape_box(target,
+                            hx=p.book_hx, hy=p.book_hy, hz=p.book_hz,
+                            cfg=target_cfg)
     else:
         raise ValueError(f"Unknown object_kind: {p.object_kind!r}")
 
@@ -1260,6 +1321,16 @@ class Example:
                  "under MuJoCo's regularised friction (less per-contact "
                  "compliance leak f/k).  Default ≈1.2 kg (paper-spec).")
         parser.add_argument(
+            "--book-as-mesh", action="store_true",
+            help="Add the book as a 12-triangle MESH instead of a "
+                 "primitive box.  This routes contact through Newton's "
+                 "GJK + MPR general-convex narrow phase (1 contact per "
+                 "pad-vs-book pair) instead of the box-vs-box corner "
+                 "specialization (4 contacts per pair).  Use this for "
+                 "the honest 'point contact' baseline — it matches what "
+                 "any real manipulation scene with a USD/MorphIt/mesh "
+                 "target would see.")
+        parser.add_argument(
             "--initial-pen", type=float, default=None,
             help="Override the initial pad-face penetration [m].  Sets "
                  "pad_gap_initial = 2 · (target_half_extent − initial_pen) "
@@ -1347,6 +1418,9 @@ def main():
         if getattr(args, "book_mass", None) is not None:
             book_volume = 8.0 * p.book_hx * p.book_hy * p.book_hz
             p.book_density = float(args.book_mass) / book_volume
+        # Mesh book — see SceneParams.book_as_mesh docstring for why.
+        if getattr(args, "book_as_mesh", False):
+            p.book_as_mesh = True
     if getattr(args, "contact_fraction", None) is not None:
         cf = float(args.contact_fraction)
         p.cslc_contact_fraction = None if cf < 0 else cf
