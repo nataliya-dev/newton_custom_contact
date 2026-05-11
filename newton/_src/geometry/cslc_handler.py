@@ -24,6 +24,7 @@ from .cslc_kernels import (
     compute_cslc_penetration_box,
     compute_cslc_penetration_sphere,
     cslc_copy_active,
+    h3_pcwc_friction,
     jacobi_step,
     lattice_solve_equilibrium,
     write_cslc_contacts,
@@ -58,7 +59,8 @@ class CSLCShapePair:
     other_shape: int
     other_geo_type: int
     # Cached at construction — avoids GPU→CPU sync per step (Bug 3)
-    other_body: int = 0
+    cslc_body: int = 0   # body index for the CSLC pad shape
+    other_body: int = 0  # body index for the target shape
     # Sphere-target fields:
     other_local_pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
     other_radius: float = 0.0
@@ -67,6 +69,12 @@ class CSLCShapePair:
         0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
     )
     other_half_extents: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # H1: target-body material stiffness, cached at construction.  Used by
+    # write_cslc_contacts / write_cslc_contacts_box to compose
+    # per-constraint compliance as the harmonic mean of lattice and target
+    # moduli (Masterjohn21 eq 23).  Rigid target → very large value →
+    # series stiffness ≈ cslc_kc (current behavior).
+    other_ke: float = 0.0
 
 class CSLCHandler:
     """CSLC contact generation handler for Newton's collision pipeline.
@@ -99,6 +107,24 @@ class CSLCHandler:
         self.n_iter = n_iter
         self.alpha = alpha
         self.surface_slot_map = surface_slot_map
+
+        # H2: SAP-R damping emission (Castro 2022 eq 19).
+        # Set to the simulation timestep (s) to enable H2; leave at 0.0 to
+        # use the kd=0 path (current default, R = 1/ke_series either way).
+        self.sim_dt: float = 0.0
+
+        # H3: Predictive Contact Wrench Compensation (PCWC).
+        # Set h3_target_body >= 0 to enable.  Requires state.body_f to be
+        # pre-allocated (wp.zeros(model.body_count, dtype=wp.spatial_vector)).
+        # h3_v_desired: desired CoM velocity of the target body [m/s] — set to
+        # (0,0,0) for static holding; update each step for dynamic tasks.
+        # h3_gravity: full 3-D gravity vector [m/s²], e.g. (0, 0, -9.81).
+        self.h3_target_body: int = -1
+        self.h3_mass: float = 0.0
+        self.h3_mu: float = 0.0
+        self.h3_dt: float = 0.0
+        self.h3_v_desired: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self.h3_gravity: tuple[float, float, float] = (0.0, 0.0, -9.81)
 
         self.n_pair_blocks = n_pair_blocks
 
@@ -317,6 +343,7 @@ class CSLCHandler:
         shape_body_np = model.shape_body.numpy()
         shape_transform_np = model.shape_transform.numpy()
         for pair in shape_pairs:
+            pair.cslc_body = int(shape_body_np[pair.cslc_shape])
             if pair.other_geo_type == _GEOTYPE_SPHERE:
                 pair.other_body = int(shape_body_np[pair.other_shape])
                 xform = shape_transform_np[pair.other_shape]
@@ -338,6 +365,10 @@ class CSLCHandler:
                     float(shape_scale_np[pair.other_shape][1]),
                     float(shape_scale_np[pair.other_shape][2]),
                 )
+            # H1: cache the target's material stiffness for harmonic-mean
+            # composition in the kernel.  Done once at construction; the
+            # array index never changes during the simulation.
+            pair.other_ke = float(shape_ke[pair.other_shape])
 
         # Build surface slot map: surface sphere i -> sequential slot index
         is_surface_np = cslc_data.is_surface.numpy()
@@ -432,6 +463,58 @@ class CSLCHandler:
                     RuntimeWarning,
                     stacklevel=2,
                 )
+
+        if self.h3_target_body >= 0 and state.body_f is not None:
+            self._apply_h3_friction(model, state)
+
+
+    def _apply_h3_friction(self, model: Model, state: State) -> None:
+        """Launch h3_pcwc_friction once per pair whose other_body matches h3_target_body.
+
+        Runs after all pair launches so sphere_delta and contact_normal_scratch
+        reflect the final equilibrium from the last matching pair.
+        Accumulates force + torque directly into state.body_f[h3_target_body].
+
+        Mass is split evenly across matching pairs so the total applied force
+        is correct regardless of how many pads contact the same target body.
+        """
+        data = self.cslc_data
+        gravity = wp.vec3(*self.h3_gravity)
+        v_desired = wp.vec3(*self.h3_v_desired)
+
+        n_pairs = sum(
+            1 for pair in self.shape_pairs if pair.other_body == self.h3_target_body
+        )
+        effective_mass = self.h3_mass / max(1, n_pairs)
+
+        for pair in self.shape_pairs:
+            if pair.other_body != self.h3_target_body:
+                continue
+            wp.launch(
+                kernel=h3_pcwc_friction,
+                dim=1,
+                inputs=[
+                    data.positions,
+                    data.sphere_delta,
+                    data.is_surface,
+                    self.contact_normal_scratch,
+                    data.n_spheres,
+                    float(data.kc),
+                    state.body_q,
+                    model.shape_transform,
+                    pair.cslc_shape,
+                    pair.cslc_body,
+                    state.body_qd,
+                    state.body_f,
+                    self.h3_target_body,
+                    effective_mass,
+                    gravity,
+                    v_desired,
+                    self.h3_mu,
+                    self.h3_dt,
+                ],
+                device=self.device,
+            )
 
 
     def _launch_vs_sphere(
@@ -565,7 +648,9 @@ class CSLCHandler:
                     # Per-contact material properties
                     model.shape_material_mu,
                     data.kc,
+                    pair.other_ke,
                     data.dc,
+                    self.sim_dt,
                     eps,
                     contacts.rigid_contact_stiffness,
                     contacts.rigid_contact_damping,
@@ -699,7 +784,9 @@ class CSLCHandler:
                 contacts.rigid_contact_margin1,
                 contacts.rigid_contact_tids,
                 data.kc,
+                pair.other_ke,
                 data.dc,
+                self.sim_dt,
                 eps,
                 contacts.rigid_contact_stiffness,
                 contacts.rigid_contact_damping,

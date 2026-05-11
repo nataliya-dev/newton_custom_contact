@@ -331,7 +331,9 @@ def write_cslc_contacts(
     # remove it from both here and cslc_handler.py in a future cleanup.
     shape_material_mu: wp.array(dtype=wp.float32),
     cslc_kc: float,
+    target_ke: float,
     cslc_dc: float,
+    sim_dt: float,
     eps: float,
     out_stiffness: wp.array(dtype=wp.float32),
     out_damping: wp.array(dtype=wp.float32),
@@ -524,29 +526,37 @@ def write_cslc_contacts(
     out_margin1[buf_idx]   = target_radius
     out_tids[buf_idx]      = 0
 
-    # Gated stiffness with a smooth lower floor so MuJoCo's
-    # timeconst = sqrt(imp / ke) stays finite when the gate drives ke → 0.
-    # For fully active contacts (gate ≈ 1), the floor is invisible and the
-    # stiffness recovers `cslc_kc · pen_scale` exactly.
+    # H1 (2026-05-10): harmonic-mean per-constraint compliance composition.
+    # Masterjohn21 eq 23 / Castro22: per-constraint emitted stiffness is the
+    # series composition of lattice-side and target-side material moduli,
+    # which under MuJoCo's `F = ke · pen` constraint correctly enforces the
+    # physical series-spring force.  Geometric correction (pen_scale ·
+    # contact_gate) is applied to the FORCE (i.e. to `kc_series`), not to
+    # the modulus composition itself, so the gate continues to ramp the
+    # emitted stiffness smoothly to zero outside the contact region.
+    # Rigid limit: as target_ke → ∞, kc_series → cslc_kc (current behavior).
+    # Soft limit: as target_ke → 0, kc_series → 0 (no contact force, correct).
+    # The eps² floor in the denominator guards against 0/0 when both are
+    # zero; not expected at runtime.
+    kc_series = (cslc_kc * target_ke) / (cslc_kc + target_ke + eps * eps)
     out_stiffness[buf_idx] = smooth_relu(
-        cslc_kc * pen_scale * contact_gate, 1.0e-9)
-    # DAMPING BUG (2026-04-19):
-    # cslc_dc=2.0 N·s/m is calibrated for Newton's semi-implicit solver.
-    # In the MuJoCo conversion kernel, kd>0 triggers timeconst = 2/kd = 1.0s,
-    # making both normal AND friction constraints 250× softer than standard
-    # contacts (timeconst=0.004s for ke=50000, kd=500). This soft friction
-    # timeconst causes excessive Coulomb creep in the HOLD phase.
-    # FIX: write 0.0 → uses kd=0 branch → timeconst = sqrt(imp/ke) ≈ 0.030s.
-    # Normal force is unchanged by design of the stiffness fix; only friction
-    # stiffness improves (33× stiffer timeconst). cslc_dc retained in signature.
-    out_damping[buf_idx]   = 0.0
-    # FRICTION BUG FIX (2026-04-19):
-    # The MuJoCo conversion kernel (kernels.py) treats rigid_contact_friction as a
-    # SCALE FACTOR multiplied onto the geom pair's base friction:
-    #   effective_mu = geom_friction_max × rigid_contact_friction
-    # The geom pair base friction is max(mu_pad, mu_sphere) = mu (from shape materials).
-    # ORIGINAL: out_friction = shape_material_mu → effective_mu = mu × mu = mu² (WRONG!)
-    # FIX:      out_friction = 1.0              → effective_mu = mu × 1.0 = mu (CORRECT)
+        kc_series * pen_scale * contact_gate, 1.0e-9)
+    # H2: SAP-R damping emission (Castro 2022 eq 19).
+    # When sim_dt > 0, emit kd = 2·sqrt(R_n_inv / imp) where
+    #   R_n_inv = dt² · kc_series   (τ_d = 0 simplification)
+    #   imp = 0.9                   (matches solimp max impedance)
+    # Newton's MuJoCo conversion (kd > 0 branch) then gives:
+    #   tc  = 2/kd = sqrt(imp/R_n_inv) = sqrt(0.9 / (dt² · kc_series))
+    #   dr  = sqrt(imp / (tc² · ke))  = sqrt(R_n_inv / kc_series)
+    # which preserves ke_mujoco = kc_series exactly (F = kc_series · pen).
+    # When sim_dt == 0: falls back to kd=0 branch (tc = sqrt(imp/ke), dr=1).
+    # THEORETICAL NOTE: both encodings give R = tc²·dr²/imp = 1/kc_series,
+    # so the Anitescu velocity gap is identical — H2 is expected to produce
+    # zero HoldCreep change vs the kd=0 baseline (empirical Rung 3 confirms).
+    _IMP_SAP = float(0.9)
+    R_n_inv = sim_dt * sim_dt * kc_series
+    kd_sap = 2.0 * wp.sqrt(R_n_inv / _IMP_SAP) if sim_dt > 0.0 else 0.0
+    out_damping[buf_idx] = kd_sap * contact_gate
     out_friction[buf_idx]  = 1.0
 
     debug_reason[slot] = 0
@@ -759,7 +769,9 @@ def write_cslc_contacts_box(
     out_margin1: wp.array(dtype=wp.float32),
     out_tids: wp.array(dtype=wp.int32),
     cslc_kc: float,
+    target_ke: float,
     cslc_dc: float,
+    sim_dt: float,
     eps: float,
     out_stiffness: wp.array(dtype=wp.float32),
     out_damping: wp.array(dtype=wp.float32),
@@ -932,9 +944,174 @@ def write_cslc_contacts_box(
     out_margin1[buf_idx] = 0.0
     out_tids[buf_idx] = 0
 
+    # H1: harmonic-mean compliance composition; see sphere-variant kernel
+    # for the full derivation comment.
+    kc_series = (cslc_kc * target_ke) / (cslc_kc + target_ke + eps * eps)
     out_stiffness[buf_idx] = smooth_relu(
-        cslc_kc * pen_scale * contact_gate, 1.0e-9)
-    out_damping[buf_idx] = 0.0
+        kc_series * pen_scale * contact_gate, 1.0e-9)
+    # H2: SAP-R damping — same formula as sphere-variant kernel (see above).
+    _IMP_SAP = float(0.9)
+    R_n_inv = sim_dt * sim_dt * kc_series
+    kd_sap = 2.0 * wp.sqrt(R_n_inv / _IMP_SAP) if sim_dt > 0.0 else 0.0
+    out_damping[buf_idx] = kd_sap * contact_gate
     out_friction[buf_idx] = 1.0
 
     debug_reason[slot] = 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  H3: Predictive Contact Wrench Compensation (PCWC)
+#
+#  Generalized predictive Coulomb friction kernel.  For each active surface
+#  sphere on the current CSLC pad:
+#    1. Computes the contact point in world frame from the sphere's shape-local
+#       position and the pad body transform.
+#    2. Computes the target body's velocity at that contact point (v_com + ω × r).
+#    3. Projects the velocity error (actual − desired) onto the tangential plane
+#       of the contact normal (from Kernel 1's contact_normal_scratch).
+#    4. Applies a predictive Coulomb force: the force needed to eliminate the
+#       tangential velocity error in one semi-implicit Euler step, clamped to
+#       the per-sphere Coulomb bound μ · kc · δ.
+#    5. Accumulates the force and its moment arm (r × f) into body_f as a
+#       full wrench (force + torque).
+#
+#  Generalizations vs. the original scalar z-only implementation:
+#    - v_desired: arbitrary desired CoM velocity (not hardcoded to zero)
+#    - Contact normal from Kernel 1: any orientation, not just z-aligned
+#    - Full wrench (force + torque): correct for off-center contact points
+#
+#  Runs as a single thread (dim=1) to avoid atomics; n_spheres ≤ ~400 so
+#  the serial loop cost is negligible compared to the Jacobi solve.
+#  Must be called per-pair inside _launch_vs_sphere, after cslc_copy_active
+#  has written converged deltas and while contact_normal_scratch is still
+#  valid for the current pair.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@wp.kernel
+def h3_pcwc_friction(
+    # CSLC geometry (all pairs, already merged into sphere_delta)
+    sphere_pos_local: wp.array(dtype=wp.vec3),
+    sphere_delta: wp.array(dtype=wp.float32),
+    is_surface: wp.array(dtype=wp.int32),
+    contact_normals: wp.array(dtype=wp.vec3),   # world-frame normals (any pair)
+    n_spheres: int,
+    kc: float,
+    # Pad body transform (for contact-point positions → torque arms)
+    body_q: wp.array(dtype=wp.transform),
+    shape_transform: wp.array(dtype=wp.transform),
+    cslc_shape: int,
+    cslc_body: int,
+    # Target body dynamics
+    body_qd: wp.array(dtype=wp.spatial_vector),
+    body_f: wp.array(dtype=wp.spatial_vector),
+    target_body: int,
+    # Control parameters
+    mass: float,
+    gravity: wp.vec3,    # full 3-D gravity vector, e.g. (0, 0, -9.81)
+    v_desired: wp.vec3,  # desired CoM velocity; (0,0,0) for static hold
+    mu: float,
+    dt: float,
+):
+    """Predictive Contact Wrench Compensation — runs as a single thread (dim=1).
+
+    Computes the aggregate Coulomb friction wrench needed to arrest the target
+    body's velocity error in one semi-implicit Euler step, across all active
+    CSLC contacts from the current pair.
+
+    Algorithm:
+      Pass 1: sum total normal force (fn_total) and fn-weighted contact normals
+              (to find the aggregate contact-normal direction n_agg).
+      Pass 2: project gravity and velocity error onto the tangential plane of
+              n_agg; compute a single predictive wrench for the body.
+      Pass 3: distribute the wrench across contact points proportional to fn_i
+              to obtain per-sphere torque arms.
+
+    Generalisations over the original scalar z-only kernel:
+      - gravity: arbitrary 3-D gravity, not hardcoded to z
+      - v_desired: arbitrary desired CoM velocity (not fixed to zero)
+      - n_agg: friction is in the tangential plane of the actual contact normal
+      - Wrench: force + torque at the body CoM (not just force in z)
+
+    Must run AFTER Kernel 2 writes sphere_delta for this pair, and BEFORE
+    solver.step() consumes body_f.
+    """
+    # ── Pass 1: aggregate normal force and fn-weighted normal direction ──
+    fn_total = float(0.0)
+    n_fn_weighted = wp.vec3(0.0, 0.0, 0.0)
+
+    for i in range(n_spheres):
+        if is_surface[i] == 0:
+            continue
+        d = sphere_delta[i]
+        if d <= 0.0:
+            continue
+        fn_i = kc * d
+        fn_total = fn_total + fn_i
+        n_i = contact_normals[i]
+        n_fn_weighted = n_fn_weighted + fn_i * n_i
+
+    if fn_total <= 0.0:
+        return
+
+    f_coulomb = mu * fn_total
+
+    # Aggregate contact normal direction (fn-weighted mean, then normalize).
+    # For symmetric contact (e.g. two opposing pads) the normals cancel; fall
+    # back to zero-tangential-projection (treat all directions as tangential).
+    n_agg_len = wp.length(n_fn_weighted)
+    has_agg_normal = n_agg_len > fn_total * 1.0e-4  # relative threshold
+    if has_agg_normal:
+        n_agg_hat = n_fn_weighted / n_agg_len
+    else:
+        n_agg_hat = wp.vec3(0.0, 0.0, 0.0)   # treat all directions as tangential
+
+    # ── Aggregate predictive force at body CoM ──
+    qd = body_qd[target_body]
+    v_com = wp.vec3(qd[3], qd[4], qd[5])   # body_qd = [ω_xyz, v_xyz]
+    omega = wp.vec3(qd[0], qd[1], qd[2])
+
+    # Velocity error and gravity projected onto tangential plane
+    dv = v_com - v_desired
+    dv_t = dv - wp.dot(dv, n_agg_hat) * n_agg_hat
+    g_t = gravity - wp.dot(gravity, n_agg_hat) * n_agg_hat
+
+    # Predictive force: eliminate velocity error + compensate tangential gravity
+    f_pred = -mass * (dv_t / dt + g_t)
+    f_pred_mag = wp.length(f_pred)
+
+    if f_pred_mag < 1.0e-8:
+        return
+
+    # Clamp to aggregate Coulomb bound
+    f_applied_mag = wp.min(f_pred_mag, f_coulomb)
+    f_applied = (f_applied_mag / f_pred_mag) * f_pred
+
+    # ── Pass 2: distribute force across contact points to compute torque ──
+    # Each sphere i carries fraction fn_i/fn_total of the total force.
+    # The resulting torque is τ = Σ_i r_i × (fn_i/fn_total · f_applied).
+    X_pad_body = body_q[cslc_body]
+    X_pad_shape = shape_transform[cslc_shape]
+    X_pad_world = wp.transform_multiply(X_pad_body, X_pad_shape)
+    X_target = body_q[target_body]
+    p_com = wp.transform_get_translation(X_target)
+
+    tau_total = wp.vec3(0.0, 0.0, 0.0)
+    for i in range(n_spheres):
+        if is_surface[i] == 0:
+            continue
+        d = sphere_delta[i]
+        if d <= 0.0:
+            continue
+        fn_i = kc * d
+        f_i = (fn_i / fn_total) * f_applied
+        p_world = wp.transform_point(X_pad_world, sphere_pos_local[i])
+        r_i = p_world - p_com
+        tau_total = tau_total + wp.cross(r_i, f_i)
+
+    # Accumulate wrench into body_f  [force_xyz, torque_xyz]
+    bf = body_f[target_body]
+    body_f[target_body] = wp.spatial_vector(
+        bf[0] + f_applied[0], bf[1] + f_applied[1], bf[2] + f_applied[2],
+        bf[3] + tau_total[0], bf[4] + tau_total[1], bf[5] + tau_total[2],
+    )

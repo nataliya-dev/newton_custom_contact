@@ -1,0 +1,18 @@
+Hydroelastic and Drake foundations
+https://arxiv.org/pdf/1904.11433
+https://arxiv.org/pdf/2110.04157
+"Differentiable Physics Simulations with Contacts: Do They Have Correct Gradients w.r.t. Position, Velocity and Control?"
+https://arxiv.org/pdf/2207.05060
+Contact Models in Robotics: a Comparative Analysis
+https://arxiv.org/pdf/2304.06372
+Mujoco foundations
+https://roboti.us/lab/papers/TodorovICRA11.pdf
+A Review of Differentiable Simulators
+https://arxiv.org/pdf/2407.05560
+Contact-Implicit Model Predictive Control for Dexterous
+In-hand Manipulation: A Long-Horizon and Robust Approach
+https://arxiv.org/pdf/2402.18897
+Beyond Coulomb: Stochastic Friction Models for
+Practical Grasping and Manipulation
+https://bpb-us-e1.wpmucdn.com/sites.harvard.edu/dist/1/512/files/2024/01/Beyond_Coulomb_Stochastic_Friction_Models_for_Practical_Grasping_and_Manipulation-1a27d8a62c7fe9ad.pdf
+https://www.feynmanlectures.caltech.edu/

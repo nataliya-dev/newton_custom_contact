@@ -635,7 +635,8 @@ def set_pad_targets(control, step, p: SceneParams, dof_map, debug=False):
 
 # ── Headless runner ───────────────────────────────────────────────────────
 
-def run_headless(name, model, solver, p, dof_map, verbose=True):
+
+def run_headless(name, model, solver, p, dof_map, verbose=True, sim_dt: float = 0.0, h3: bool = False):
     import time as _time
     met = Metrics(name=name)
     s0, s1 = model.state(), model.state()
@@ -650,6 +651,29 @@ def run_headless(name, model, solver, p, dof_map, verbose=True):
     model.collide(s0, con)
     solver.step(s0, s1, ctrl, con, p.dt)
     wp.synchronize()
+
+    pipeline = getattr(model, "_collision_pipeline", None)
+    handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
+
+    # H2: enable SAP-R damping emission after pipeline is created.
+    if sim_dt > 0.0:
+        if handler is not None:
+            handler.sim_dt = sim_dt
+            print(f"  H2 SAP-R enabled: sim_dt={sim_dt*1e3:.3f}ms")
+
+    # H3: configure handler for PCWC and allocate body_f.
+    if h3 and handler is not None:
+        handler.h3_target_body = SPHERE_BODY
+        handler.h3_mass = p.sphere_mass
+        handler.h3_mu = p.mu
+        handler.h3_dt = p.dt
+        handler.h3_v_desired = (0.0, 0.0, 0.0)  # updated per-step below if needed
+        handler.h3_gravity = (0.0, 0.0, -9.81)
+        for state in [s0, s1]:
+            if state.body_f is None:
+                state.body_f = wp.zeros(model.body_count, dtype=wp.spatial_vector,
+                                        device=model.device)
+        print(f"  H3 PCWC enabled: sphere_mass={p.sphere_mass:.4f}kg  mu={p.mu:.2f}")
 
     _time_start = _time.perf_counter()
     _time_collide = 0.0
@@ -698,10 +722,32 @@ def run_headless(name, model, solver, p, dof_map, verbose=True):
         f"realtime×={rtx:.2f}"
     )
 
+    # Compute HoldCreep and HoldDrop from per-step sphere_z trace.
+    # HoldDrop: sphere_z at HOLD-start minus sphere_z at HOLD-end (positive = downward drift).
+    # HoldCreep: mean downward velocity in the second half of HOLD (positive = sinking).
+    if p.start_gripped:
+        hold_start_idx = p.lift_steps
+    else:
+        hold_start_idx = p.approach_steps + p.squeeze_steps + p.lift_steps
+    hold_end_idx = hold_start_idx + p.hold_steps - 1
+    second_half_idx = hold_start_idx + p.hold_steps // 2
+    if hold_end_idx < len(met.sphere_z) and hold_start_idx > 0:
+        hold_drop_m = met.sphere_z[hold_start_idx] - met.sphere_z[hold_end_idx]
+        second_half_z = met.sphere_z[second_half_idx : hold_end_idx + 1]
+        dt_half = (len(second_half_z) - 1) * p.dt
+        creep_rate_m_per_s = (second_half_z[0] - second_half_z[-1]) / dt_half if dt_half > 0 else 0.0
+        met.hold_drop_mm = hold_drop_m * 1000.0
+        met.hold_creep_mm_per_s = creep_rate_m_per_s * 1000.0
+        print(
+            f"  METRICS {name:16s}  "
+            f"HoldCreep={met.hold_creep_mm_per_s:+.4f} mm/s  "
+            f"HoldDrop={met.hold_drop_mm:+.3f} mm"
+        )
+
     return met
 
 
-def test_headless(p, solver_name, contact_models=None):
+def test_headless(p, solver_name, contact_models=None, sim_dt: float = 0.0, h3: bool = False):
     if contact_models is None:
         contact_models = ["point", "cslc"]
     p.dump()
@@ -715,7 +761,9 @@ def test_headless(p, solver_name, contact_models=None):
         if cm == "cslc" and p.cslc_contact_fraction is not None:
             recalibrate_cslc_kc_per_pad(model, p.cslc_contact_fraction)
         solver = make_solver(model, solver_name)
-        met = run_headless(label, model, solver, p, dof_map)
+        met = run_headless(label, model, solver, p, dof_map,
+                          sim_dt=sim_dt if cm == "cslc" else 0.0,
+                          h3=h3 if cm == "cslc" else False)
         results.append(met)
         _log(f"RESULT: max_z={met.max_z:.4f}  final_z={met.final_z:.4f}  "
              f"lifted={'YES' if met.lifted else 'NO'}  held={'YES' if met.held else 'NO'}")
@@ -960,6 +1008,10 @@ class Example:
                             help="Override CSLC contact fraction for kc recalibration.")
         parser.add_argument("--kh", type=float, default=None,
                             help="Override hydroelastic modulus [Pa].")
+        parser.add_argument("--h2", action="store_true",
+                            help="Enable H2 SAP-R damping emission (Castro 2022 eq 19).")
+        parser.add_argument("--h3", action="store_true",
+                            help="Enable H3 direct body-force Coulomb friction on sphere.")
         return parser
 
 
@@ -991,7 +1043,10 @@ def main():
             scene_kwargs["cslc_contact_fraction"] = float(args.cslc_contact_fraction)
         if getattr(args, "kh", None) is not None:
             scene_kwargs["kh"] = float(args.kh)
-        test_headless(SceneParams(**scene_kwargs), sn, contact_models=cm_list)
+        _sim_dt = SceneParams(**scene_kwargs).dt if getattr(args, "h2", False) else 0.0
+        _h3 = getattr(args, "h3", False)
+        test_headless(SceneParams(**scene_kwargs), sn, contact_models=cm_list,
+                      sim_dt=_sim_dt, h3=_h3)
 
 
 if __name__ == "__main__":
