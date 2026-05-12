@@ -576,6 +576,26 @@ where neighboring normals diverge significantly, the full vector formulation
 $\boldsymbol{\delta}_i \in \mathbb{R}^3$ would capture cross-normal shear
 coupling at the cost of tripling the solver dimension.
 
+A direct consequence of the scalar normal-projection is that, at the
+operating points tested in this paper, CSLC produces a
+\emph{Winkler-foundation} pressure response (each sphere behaves as an
+independent spring scaled by~$k_{\text{eff}}$) rather than the
+half-elliptical Hertzian pressure distribution observed in a
+continuum elastic half-space.  The graph-Laplacian lateral coupling
+$k_\ell\,L$ redistributes the displacement field~$\boldsymbol{\delta}$
+within the patch, but because the contact-active gate ties each
+per-sphere force to local geometric overlap (\cref{eq:pen}), the
+\emph{shape} of the emitted pressure profile remains controlled by
+$\phi_{ij}^{\text{rest}}$ rather than by the lateral redistribution.
+Recovering Hertzian behaviour requires either (i) the full vector
+formulation~$\boldsymbol{\delta}_i \in \mathbb{R}^3$ noted above,
+which introduces tangential elasticity through cross-component
+coupling, or (ii) a continuum Galerkin discretisation of the
+elastic-skin partial differential equation in place of the
+graph-Laplacian~$\mathbf{K}$.  Both are deferred to future work; the
+present paper's claims rest on the distributed, smoothly-gated,
+differentiable contact patch~$\boldsymbol{\delta}(\mathbf{x})$ rather
+than on matching half-elliptical pressure profiles.
 
 Resolution changes require rescaling contact stiffness and calibrating $k_\ell/k_a$ to measured material properties \cite{kumar2015viscoelastic}. Finally, the quasistatic solver is valid only when lattice relaxation is fast relative to rigid-body motion, breaking down during high-speed impacts.
 

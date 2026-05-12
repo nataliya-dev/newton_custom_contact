@@ -981,6 +981,73 @@ have one to leak from. The MuJoCo creep floor is a known limitation; the
 paper should acknowledge it explicitly.
 
 
+### 3.2 CSLC's pressure-distribution regime — Winkler-foundation, not Hertzian half-space
+
+Empirically (Findings A, H, L, M in `validation/FINDINGS.md`), at every
+parameter regime tested — including fine spacing (1 mm), strong lateral
+coupling ($k_\ell/k_a$ up to 4, $\ell_c$ up to 2 lattice spacings),
+both closed-form `lattice_solve_equilibrium` and iterative
+`jacobi_step` solver paths, and the anchor-reaction emission variant
+`F = k_a \cdot \delta_i` — the per-sphere pressure profile is
+controlled by the geometric overlap $\phi^{\text{rest}}_i$ between
+each lattice sphere and the indenter, not by the lateral coupling.
+The 200× $k_\ell$ sweep at fine spacing produces a 0.04% change in
+aggregate force and a 1×10⁻⁴ RMS change in the normalised profile;
+the iterative gated path produces a 1×10⁻³ RMS change.  CSLC's
+distributed contact is therefore a **Winkler foundation on sphere
+primitives** — each sphere acts as an independent spring scaled by
+$k_{\text{eff}}$ — not a discrete elastic half-space.
+
+**Why this is structural, not a parameter-tuning issue.**  The
+balance equation at lattice equilibrium gives
+$k_c(\phi^{\text{rest}}_i - \delta_i) = k_a \delta_i + k_\ell(L\delta)_i$,
+so the contact-penalty force the kernel emits is mathematically
+equal to the elastic-skin response (anchor + lateral) at equilibrium.
+Switching the emission rule from $k_c(\phi-\delta)$ to $k_a\delta$
+produces numerically identical output (verified by direct kernel
+swap, 2026-05-12 — see Track 1 Option B in the conversation log).
+The reason: in the scalar normal-projection formulation, $L\delta$ is
+small in both the weak-$k_\ell$ limit (isolated spheres, $L \to 0$)
+and the strong-$k_\ell$ limit (uniform $\delta$, $L\delta \to 0$),
+so neither emission form propagates the lateral effect to the
+contact partner.  The genuine Hertzian profile shape — flat top,
+sharp half-elliptical falloff at the contact-area boundary — emerges
+from tangential incompressibility of a 3D elastic skin, which the
+scalar formulation cannot represent (no tangential degrees of
+freedom).
+
+**What this means for the paper.**
+
+- The paper's existing §V limitation paragraph ("for highly curved
+  surfaces … the full vector formulation $\delta_i \in \mathbb{R}^3$
+  would capture cross-normal shear coupling at the cost of tripling
+  the solver dimension") has been extended (2026-05-12) with a
+  sentence explicitly stating that scalar normal-projection yields
+  Winkler-foundation pressure response, not Hertzian.
+- The CSLC contributions (distributed contact patch, graceful
+  degradation under disturbance, end-to-end differentiability,
+  native tactile field) do not depend on a Hertzian profile and
+  remain valid under the Winkler framing.
+- The "lateral coupling spreads load like an elastic skin" reading
+  of §III.B should be tightened: $k_\ell$ redistributes
+  $\boldsymbol{\delta}$ within the lattice but the emitted contact
+  pressure profile is determined by per-sphere geometric overlap.
+- Genuine elastic-skin (Hertzian) behaviour is reserved for future
+  work via either the vector formulation
+  $\boldsymbol{\delta}_i \in \mathbb{R}^3$ (Option E, ~3 weeks) or a
+  Galerkin FEM stiffness matrix (Option F, ~2 weeks), both noted as
+  journal-version scope.
+
+**Implications for the disturbance results.**  CSLC's
+zero-catastrophic-ejection result across 63 disturbance magnitudes
+(§1 "Disturbance magnitude sweep") is *not* about elastic-skin
+diffusion.  It is about distributing the contact load across many
+spheres so that no single sphere saturates the friction cone, and
+about the discrete-shell active-cell schedule that engages new shells
+as penetration grows.  Both effects are properties of distributed
+Winkler-on-spheres and survive the Winkler reframing intact.
+
+
 ---
 
 ## 4. Bugs fixed (invariants — do not revert)

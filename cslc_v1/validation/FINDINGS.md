@@ -596,6 +596,58 @@ based pad geometries where spacing varies across the pad.
 
 ---
 
+## Finding M.  Iterative jacobi_step path does not recover kl-dependence either — the emission rule is the structural barrier, not the closed-form
+
+**Source.** Fix 1.2 + Fix 2 follow-up.  Script:
+`t2_fine_grid_jacobi.py`.  Compares the same fine-grid scene as
+Finding L but disables `A_inv` post-construction to force the iterative
+gated-jacobi path, with `n_iter = 500` to rule out under-convergence
+(spectral-radius estimate gives ~1.5e-8 residual at that count).
+
+**What we found.**  Hypothesis from prior analysis: Finding D's claim
+that the closed-form solve is unfit at partial contact + strong kl
+might mean the closed-form is washing out a real elastic-skin signal
+that the gated iterative path would preserve.  Direct test:
+
+| Path | Regime | F (N) | n_active | r10/a | FWHM/a | RMS profile diff |
+|---|---|---|---|---|---|---|
+| Closed-form (Finding L) | weak  kl | 25.231 | 221 | 1.261 | 0.862 | 1·10⁻⁴ |
+| Closed-form (Finding L) | strong kl | 25.240 | 221 | 1.261 | 0.862 | (vs weak) |
+| **Iterative (this finding)** | weak kl | 25.163 | 213 | 1.267 | 0.862 | **1.7·10⁻³** |
+| **Iterative (this finding)** | strong kl | 24.899 | 213 | 1.261 | 0.859 | (vs weak) |
+
+The iterative path produces an order of magnitude *more* kl-sensitivity
+than the closed-form (RMS 1.7·10⁻³ vs 1·10⁻⁴), but still **0.17% in
+RMS and 0.5% in max** — far below the Hertzian-vs-Winkler signature
+the elastic-skin claim needs.  Aggregate force shifts by ~1% across a
+200× kl change; profile shape barely moves.
+
+**Why it matters for the paper.**
+- Finding D's closed-form-degeneracy hypothesis is **REFUTED** as the
+  root cause of kl-invariance.  The iterative path, even with
+  per-sphere gating and converged residuals, behaves the same way to
+  within 1%.
+- The kl-invariance is **emission-rule structural**, not solver-path
+  artifact.  Per-sphere force `f_i = kc·(φ_rest_i − δ_i) · gate_i`
+  binds the emitted force to per-sphere geometric overlap regardless
+  of how well δ is spread internally.  The lattice math redistributes
+  δ; the emission rule samples the lattice only where there is direct
+  contact.
+- There is no plausible parameter-scope, solver-path, or convergence
+  fix.  Recovering elastic-skin behaviour from CSLC requires a
+  structural emission change — specifically, replacing
+  `kc·(φ_rest_i − δ_i)` with `ka·δ_i` (anchor-reaction emission) so the
+  spread δ field directly drives the per-sphere force.  See "Alt 1"
+  in the prior planning conversation; this finding closes the case
+  that no simpler fix exists.
+
+**Suggested paper edit.**  Replace the elastic-skin / lateral-spreading
+narrative entirely if shipping with the current kernel.  If the
+emission-rule change is in scope, defer the elastic-skin claims to
+after that fix is validated by re-running this very experiment.
+
+---
+
 ## End-of-validation summary
 
 Completed tiers: T0 (modal math), T1 (kernel sanity), T2 stages 1+3+4
