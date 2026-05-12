@@ -633,6 +633,7 @@ class TestKernel3WriteCullGap(unittest.TestCase):
         self.r_target = 0.010
         self.eps = 1e-5
         self.kc = 500.0
+        self.target_ke = 1e9  # rigid-target limit: kc_series ≈ kc
         self.dc = 0.0
 
     def _write_contact(self, target_x):
@@ -683,7 +684,7 @@ class TestKernel3WriteCullGap(unittest.TestCase):
                 out_offset0, out_offset1, out_normal,
                 out_margin0, out_margin1, out_tids,
                 wp.array([0.5], dtype=wp.float32, device=d),  # mu (unused)
-                self.kc, self.dc, self.eps,
+                self.kc, self.target_ke, self.dc, self.eps,
                 out_stiffness, out_damping, out_friction, debug_reason,
                 0,                                      # diag_offset
                 dbg[0], dbg[1], dbg[2], dbg[3], dbg[4],
