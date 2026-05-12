@@ -397,6 +397,7 @@ class CSLCData:
         cls, pads: list[CSLCPad], *, ka: float, kl: float, kc: float,
         dc: float, smoothing_eps: float = 1.0e-5,
         build_A_inv: bool = False,
+        kl_physical: float | None = None,
         device: Devicelike | None = None,
     ) -> CSLCData:
         """Merge CSLCPads into GPU-resident CSLCData with global indexing.
@@ -410,7 +411,37 @@ class CSLCData:
                 for use by the tape-compatible
                 `lattice_solve_equilibrium` kernel.  Default False —
                 production tests (squeeze, lift) don't need it.
+            kl_physical: optional resolution-independent lateral stiffness
+                in continuous-PDE units [N·m].  When provided, the kernel-
+                level ``kl`` is replaced with ``kl_physical / spacing²``
+                so the discrete Helmholtz operator
+                ``ka·I − (kl_physical/h²)·L_graph``  approximates the
+                continuous operator ``ka·I − kl_physical·∇²`` consistently
+                across refinement.  The induced lateral correlation length
+                in physical units is ``ℓ_c = √(kl_physical / ka)``,
+                invariant to grid spacing.  When ``None`` (legacy default),
+                ``kl`` is used directly and the correlation length in
+                lattice-spacing units is ``√(kl/ka)``, which shrinks under
+                refinement — see Finding A in
+                ``cslc_v1/validation/FINDINGS.md``.  Assumes uniform
+                spacing across all pads (uses ``pads[0].spacing``); a
+                future per-pad extension would index by pad.
         """
+        # Resolution-independent lateral coupling (Fix 1.1).  When
+        # ``kl_physical`` is provided, override the kernel-facing ``kl``
+        # so that the same continuous PDE is consistently discretised at
+        # any spacing.
+        if kl_physical is not None:
+            if not pads:
+                raise ValueError(
+                    "kl_physical requires at least one pad to read spacing from"
+                )
+            spacing = float(pads[0].spacing)
+            if spacing <= 0.0:
+                raise ValueError(
+                    f"kl_physical requires positive spacing; got {spacing}"
+                )
+            kl = float(kl_physical) / (spacing * spacing)
         if device is None:
             device = wp.get_device()
 

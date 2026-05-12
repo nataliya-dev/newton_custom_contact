@@ -520,6 +520,82 @@ lambda_1 << ka, so the formula collapses to `K_bend = ka * L^2 * N`.
 
 ---
 
+## Finding L.  Fine grid + strong lateral coupling still does not change CSLC pressure-profile shape — Finding H confirmed structurally, not by under-resolution
+
+**Source.**  Fix 1.2 + Fix 2 decisive experiment, 2026-05-11.  Script:
+`t2_fine_grid_kl_sweep.py`.  Figures:
+`figures/t2_stage3_profile_d40_finegrid_{A_weak,B_strong}.png`.
+
+**What we found.**  Finding H attributed CSLC's invariant pressure
+profile to two confounds: (i) at spacing = 5 mm only ~5 cells engage
+geometrically inside the indenter footprint at δ=4 mm — too few to
+resolve a profile-shape difference, (ii) lattice-spacing-unit
+correlation lengths in both tested regimes (0.18 and 1.0 spacings) were
+below the threshold where elastic-skin diffusion would observably
+redistribute load.  We controlled for both confounds with a 1 mm
+spacing pad (~221 active cells at δ=4 mm) and a 200× kl bump from 500
+→ 100 000 (`ℓ_c` from 0.14 → 2.0 spacings in *physical* units, via
+Fix 1.1's resolution-independent scaling).
+
+The result is unambiguous:
+
+| Regime | ka | kl_kernel | ℓ_c (mm) | F (N) | r10/a_indent | FWHM/a_indent |
+|---|---|---|---|---|---|---|
+| Weak (sub-grid) | 25 000 | 500 | 0.14 | 25.231 | 1.261 | 0.862 |
+| Strong (ℓ_c=2 spacings) | 25 000 | 100 000 | 2.00 | 25.240 | 1.261 | 0.862 |
+
+Aggregate force differs by **0.04 % (9 mN out of 25 N)**.  Pointwise
+normalised profile RMS difference is **1·10⁻⁴**; max difference
+3·10⁻⁴.  **The two profiles are identical to four decimal places.**
+The same number of cells engage (221), the same active set, the same
+shape.
+
+**Why it matters for the paper.**
+- Finding H's negative result is **structural**, not a consequence of
+  under-resolution or weak coupling.  At any (ka, kl_kernel, spacing)
+  in the paper's calibration regime, the pressure profile is dictated
+  by **which lattice spheres geometrically overlap the indenter**, not
+  by lateral-coupling-mediated diffusion.
+- The mechanism (confirmed across Findings A, H, L): the per-sphere
+  contact force emitted to the rigid-body solver is
+  `kc_series · pen_3d_i = kc_series · (phi_rest_i - δ_i)`.  Even when
+  strong kl redistributes the `δ_i` field, the per-sphere `phi_rest_i`
+  is set by indenter geometry alone, and the contact gate
+  `Σ_ε(pen_3d_i)` is dominated by `phi_rest_i` at any kl in the tested
+  range.  Lateral spring redistribution alters δ but the emitted force
+  is largely insensitive to that redistribution.
+- The elastic-skin-diffusion narrative is now **definitively dead** for
+  this paper.  No parameter-scope adjustment recovers it within the
+  current kernel architecture.  A genuine elastic-skin reframe would
+  require either (a) replacing the graph Laplacian with proper
+  Galerkin FEM (the Fix 3 from the prior planning conversation), (b)
+  decoupling the contact gate from per-sphere `phi_rest` so neighbour-
+  pulled δ can transmit force at non-overlapping spheres (changes the
+  physics), or (c) emitting per-sphere force based on the anchor
+  reaction `ka·δ_i` instead of the contact penalty
+  `kc_series·pen_3d_i` (also changes the physics).
+
+**Suggested paper edit.**  Replace any "elastic-skin diffusion" or
+"lateral spreading" language in §III and §IV.B with the actually-
+supported claim: **CSLC produces a distributed pressure profile over
+the geometric contact patch, with the per-sphere force determined by
+the discrete sphere-indenter overlap geometry and the kc/ka/ke_target
+series-spring composition.**  This is a weaker but defensible
+statement that matches the implementation, Finding H, and now Finding
+L.  The kl parameter remains in the model as a numerical regulariser
+of the K matrix's spectrum; it does not produce observable elastic-
+skin effects at the paper's operating point.
+
+**Implementation note.**  Fix 1.1's `kl_physical` parameter (in
+`CSLCData.from_pads`) is implemented and works — the strong-regime
+ℓ_c value in this experiment was set via `kl_physical = ka · (2·h)² =
+0.1 N·m`.  The Fix is retained because resolution-independent kl
+scaling is the *correct* discretisation regardless of whether
+elastic-skin effects manifest, and may matter for future MorphIt-
+based pad geometries where spacing varies across the pad.
+
+---
+
 ## End-of-validation summary
 
 Completed tiers: T0 (modal math), T1 (kernel sanity), T2 stages 1+3+4
