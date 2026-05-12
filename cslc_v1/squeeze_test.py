@@ -185,10 +185,15 @@ class SceneParams:
 
     # ── CSLC tuning (matched to lift_test.py fair calibration) ──
     cslc_spacing: float = 0.005
-    cslc_ka: float = 15000.0  # fair-cal target: N·ka > ke_bulk so the
-                              # exact branch of recalibrate_cslc_kc_per_pad
-                              # solves for kc instead of falling back to
-                              # the kc = ke/N approximation.
+    cslc_ka: float = 25000.0  # H1-aware fair-cal: with the three-spring
+                              # chain 1/keff = 1/ka + 1/kc + 1/ke_target,
+                              # ka must exceed ke_bulk/(N - ke_bulk/ke_target)
+                              # for `recalibrate_cslc_kc_per_pad` to find
+                              # a positive kc instead of falling back to
+                              # kc = ke_bulk/N.  At ke_bulk=5e4, ke_target=5e4,
+                              # N=4: ka_min ≈ 16667; ka=25000 leaves a
+                              # comfortable margin and solves to kc=50000,
+                              # keff=12500, agg=50000 ✓.
     cslc_kl: float = 500.0
     cslc_dc: float = 2.0
     cslc_n_iter: int = 20
@@ -196,20 +201,30 @@ class SceneParams:
     # Contact fraction used for per-pad kc calibration (see
     # `recalibrate_cslc_kc_per_pad`).  At 1 mm face_pen on this pad
     # geometry only ~5 of 189 surface spheres per pad lie inside the
-    # active patch — cf=0.025 reflects that.  With ka=15000 and
-    # ke_bulk=5e4 the calibration solves to kc=75000, keff=12500,
-    # aggregate per pad = 50000 N/m = ke_bulk ✓.  See §2 in
+    # active patch — cf=0.025 reflects that.  With ka=25000 and
+    # ke_bulk=ke_target=5e4 the H1-aware calibration solves to kc=50000,
+    # keff=12500, aggregate per pad = 50000 N/m = ke_bulk ✓.  See §2 in
     # cslc_v1/summary.md for the full derivation.
     # Use None to keep the built-in default from `calibrate_kc` (0.15).
     cslc_contact_fraction: float | None = 0.025
 
     # ── hydroelastic (for optional comparison) ──
-    # kh = hydroelastic modulus [Pa], fair-calibrated so that
-    # kh · A_patch(1 mm pen) = ke_bulk.  At r=30 mm the patch area
-    # A_patch = π·(2·r·pen) ≈ 188 mm², so kh = 5e4 / 1.88e-4 = 2.65e8 Pa.
-    # See §2 in cslc_v1/summary.md.  At kh=1e10 the solver ejects the
+    # kh = hydroelastic modulus [Pa], fair-calibrated so that the
+    # harmonic-mean composition kh_eff = kh_pad·kh_sphere/(kh_pad+kh_sphere)
+    # (Newton paper §II-A, get_effective_stiffness in sdf_hydroelastic.py)
+    # times the contact patch area equals ke_bulk:
+    #
+    #     kh_eff · A_patch = ke_bulk
+    #
+    # With both bodies hydroelastic at the same modulus, kh_eff = kh/2, so
+    #
+    #     kh = 2 · ke_bulk / A_patch
+    #
+    # At r=30 mm the patch area A_patch = π·(2·r·pen) ≈ 188 mm²,
+    # so kh = 2·5e4 / 1.88e-4 = 5.3e8 Pa.  See §2 in cslc_v1/summary.md.
+    # At kh=1e10 the solver ejects the
     # sphere; the §1 stability sweep documents the safe range.
-    kh: float = 2.65e8
+    kh: float = 5.3e8
     sdf_resolution: int = 64
 
     # ── integration ──
@@ -1100,7 +1115,10 @@ class Example:
             self.p.pad_gap_initial = 2.0 * (self.p.book_hx - 0.0015)
             self.p.cslc_contact_fraction = 1.0
             pad_face_area = (2.0 * self.p.pad_hy) * (2.0 * self.p.pad_hz)
-            self.p.kh = self.p.ke / pad_face_area
+            # H1-style fair calibration: kh_eff = kh/2 when both bodies are
+            # hydroelastic at the same modulus, so kh = 2 · ke_bulk / A_patch
+            # to land the post-composition aggregate on ke_bulk.
+            self.p.kh = 2.0 * self.p.ke / pad_face_area
         if getattr(args, "external_force", None):
             self.p.external_force = _parse_xyz(
                 args.external_force, "external-force")
@@ -1405,15 +1423,18 @@ def main():
         # becomes 47× ke_bulk and MuJoCo ejects the book.
         p.cslc_contact_fraction = 1.0
         # ── kh: hydroelastic-modulus override ──
-        # Same fair-calibration principle as CSLC: kh · A_patch =
-        # ke_bulk.  Sphere target's patch area is the Hertzian
-        # contact (≈π·2r·pen = 188 mm² @ 1 mm pen) → kh = 2.65e8 Pa.
-        # Book target's patch area is the pad face fully inside the
-        # book (≈ 2hy · 2hz = 4000 mm²) → kh ≈ 1.25e7 Pa, 21× softer.
-        # Without this override hydro is 21× too stiff for the book
-        # and the body is ejected the same way as miscalibrated CSLC.
+        # Fair-calibration principle: with both bodies hydroelastic at
+        # the same modulus, the harmonic-mean composition halves the
+        # effective stiffness at the isosurface (Newton paper §II-A),
+        # so kh = 2 · ke_bulk / A_patch lands the post-composition
+        # aggregate on ke_bulk.  Sphere target's patch area is the
+        # Hertzian contact (≈π·2r·pen = 188 mm² @ 1 mm pen) →
+        # kh = 5.3e8 Pa.  Book target's patch area is the pad face
+        # fully inside the book (≈ 2hy · 2hz = 4000 mm²) →
+        # kh ≈ 2.5e7 Pa.  Without this override hydro is twice as
+        # stiff as the matched aggregate, breaking the fair calibration.
         pad_face_area = (2.0 * p.pad_hy) * (2.0 * p.pad_hz)
-        p.kh = p.ke / pad_face_area
+        p.kh = 2.0 * p.ke / pad_face_area
         # Optional: override book mass via CLI for stability sweeps.
         if getattr(args, "book_mass", None) is not None:
             book_volume = 8.0 * p.book_hx * p.book_hy * p.book_hz

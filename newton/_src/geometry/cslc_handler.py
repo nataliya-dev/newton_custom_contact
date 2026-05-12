@@ -59,6 +59,11 @@ class CSLCShapePair:
     other_geo_type: int
     # Cached at construction — avoids GPU→CPU sync per step (Bug 3)
     other_body: int = 0
+    # H1: target body's material stiffness [N/m], cached at construction
+    # from model.shape_material_ke.  Used in the kernel for harmonic-
+    # mean composition kc_series = kc·ke / (kc+ke+eps²).  Default 1e9
+    # recovers the rigid-target limit (kc_series → kc) automatically.
+    other_ke: float = 1.0e9
     # Sphere-target fields:
     other_local_pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
     other_radius: float = 0.0
@@ -317,6 +322,12 @@ class CSLCHandler:
         shape_body_np = model.shape_body.numpy()
         shape_transform_np = model.shape_transform.numpy()
         for pair in shape_pairs:
+            # H1: cache the target's material stiffness for harmonic-mean
+            # composition in the kernel.  Zero-valued materials would yield
+            # zero contact force; clamp to a large rigid-ish default so the
+            # kernel's harmonic mean recovers kc_lattice in that limit.
+            ke_raw = float(shape_ke[pair.other_shape])
+            pair.other_ke = ke_raw if ke_raw > 0.0 else 1.0e9
             if pair.other_geo_type == _GEOTYPE_SPHERE:
                 pair.other_body = int(shape_body_np[pair.other_shape])
                 xform = shape_transform_np[pair.other_shape]
@@ -565,6 +576,7 @@ class CSLCHandler:
                     # Per-contact material properties
                     model.shape_material_mu,
                     data.kc,
+                    pair.other_ke,  # H1: target stiffness for harmonic-mean composition
                     data.dc,
                     eps,
                     contacts.rigid_contact_stiffness,
@@ -699,6 +711,7 @@ class CSLCHandler:
                 contacts.rigid_contact_margin1,
                 contacts.rigid_contact_tids,
                 data.kc,
+                pair.other_ke,  # H1: target stiffness for harmonic-mean composition
                 data.dc,
                 eps,
                 contacts.rigid_contact_stiffness,

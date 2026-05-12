@@ -118,13 +118,23 @@ def read_cslc_state(model) -> dict | None:
 def recalibrate_cslc_kc_per_pad(model, contact_fraction: float):
     """Override per-sphere kc so each pad's aggregate stiffness equals ke_bulk.
 
-    Reads ke from the FIRST CSLC-flagged shape (so we don't read the ground
-    plane's ke when shape 0 happens to be a plane in lift_test) and applies
-    the §2 fair-calibration derivation:
+    H1-aware: includes the target body's contact stiffness ``ke_target``
+    in the series chain when the handler exposes it.  The fair-
+    calibration identity then composes three springs per sphere:
 
-        N_contact_per_pad · kc·ka/(ka+kc) = ke_bulk
-        ⇒ kc = ke_bulk · ka / (N · ka − ke_bulk)        (if N·ka > ke_bulk)
-        ⇒ kc = ke_bulk / N                              (fallback)
+        1/keff_per_sphere = 1/ka + 1/kc + 1/ke_target
+        N_contact_per_pad · keff_per_sphere = ke_bulk
+
+    Solving for ``kc``:
+
+        1/kc = N_contact/ke_bulk - 1/ka - 1/ke_target          (exact)
+        ⇒ kc = ke_bulk / N_contact                             (fallback when 1/kc ≤ 0)
+
+    Reading ``ke_target`` from the first CSLC pair's cached ``other_ke``
+    field keeps the recalibration consistent with what the H1 kernel
+    emits at runtime (cslc_kernels.py harmonic-mean composition).  When
+    no pair has been bound yet (e.g. CSLC handler with zero pairs), the
+    legacy two-spring chain (``ke_target=None``) is used.
 
     Returns the new kc value, or None if no CSLC handler is attached.
     """
@@ -141,6 +151,14 @@ def recalibrate_cslc_kc_per_pad(model, contact_fraction: float):
     )
     ke_bulk = float(model.shape_material_ke.numpy()[cslc_shape_idx])
 
+    # Pick up ke_target from the first cached shape pair if available
+    # (matches the H1 harmonic-mean composition in cslc_kernels.py).
+    ke_target = None
+    if hasattr(handler, "shape_pairs") and handler.shape_pairs:
+        ke_target = float(handler.shape_pairs[0].other_ke)
+        if ke_target <= 0.0:
+            ke_target = None
+
     shape_ids = d.sphere_shape.numpy()
     is_surface = d.is_surface.numpy()
     n_pads = int(len(np.unique(shape_ids)))
@@ -148,22 +166,34 @@ def recalibrate_cslc_kc_per_pad(model, contact_fraction: float):
     n_contact_per_pad = max(int(n_surface_per_pad * contact_fraction), 1)
 
     ka = float(d.ka)
-    denom = n_contact_per_pad * ka - ke_bulk
-    if denom <= 0.0:
+    inv_keff_target = float(n_contact_per_pad) / ke_bulk
+    inv_kc = inv_keff_target - 1.0 / ka
+    if ke_target is not None:
+        inv_kc -= 1.0 / ke_target
+
+    if inv_kc <= 0.0:
         new_kc = ke_bulk / max(n_contact_per_pad, 1)
-        derivation = "fallback (denom<=0): kc = ke/N"
+        derivation = "fallback (inv_kc<=0): kc = ke/N"
     else:
-        new_kc = ke_bulk * ka / denom
-        derivation = "exact: kc = ke*ka/(N*ka - ke)"
+        new_kc = 1.0 / inv_kc
+        if ke_target is None:
+            derivation = "two-spring (ka,kc rigid target): 1/kc = N/ke - 1/ka"
+        else:
+            derivation = "three-spring (ka,kc,ke_target H1): 1/kc = N/ke - 1/ka - 1/ke_target"
 
     old_kc = float(d.kc)
     d.kc = new_kc
-    keff = new_kc * ka / (ka + new_kc)
+    # Effective per-sphere stiffness under the chain that's actually active.
+    if ke_target is None:
+        keff = new_kc * ka / (ka + new_kc)
+    else:
+        keff = 1.0 / (1.0 / ka + 1.0 / new_kc + 1.0 / ke_target)
     aggregate_per_pad = n_contact_per_pad * keff
     _log(f"CSLC RECAL: pads={n_pads}  surface/pad={n_surface_per_pad}  "
          f"N_contact_per_pad={n_contact_per_pad}  ({derivation})")
+    ke_str = f"  ke_target={ke_target:.0f}" if ke_target is not None else "  ke_target=rigid"
     _log(f"            kc: {old_kc:.1f}  →  {new_kc:.1f} N/m  "
-         f"keff={keff:.1f}  agg/pad={aggregate_per_pad:.0f} (target={ke_bulk:.0f})")
+         f"keff={keff:.1f}  agg/pad={aggregate_per_pad:.0f} (target={ke_bulk:.0f}){ke_str}")
     return new_kc
 
 

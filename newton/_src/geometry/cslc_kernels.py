@@ -331,6 +331,7 @@ def write_cslc_contacts(
     # remove it from both here and cslc_handler.py in a future cleanup.
     shape_material_mu: wp.array(dtype=wp.float32),
     cslc_kc: float,
+    target_ke: float,
     cslc_dc: float,
     eps: float,
     out_stiffness: wp.array(dtype=wp.float32),
@@ -524,12 +525,19 @@ def write_cslc_contacts(
     out_margin1[buf_idx]   = target_radius
     out_tids[buf_idx]      = 0
 
+    # H1: harmonic-mean (series-spring) composition of lattice stiffness
+    # cslc_kc and target material stiffness target_ke.  Recovers cslc_kc
+    # in the rigid-target limit (target_ke ≫ cslc_kc); the eps² floor
+    # guards against 0/0 when both stiffnesses are zero.  See
+    # cslc_v1/test_h1_compliance.py for the math contract.
+    kc_series = (cslc_kc * target_ke) / (cslc_kc + target_ke + eps * eps)
+
     # Gated stiffness with a smooth lower floor so MuJoCo's
     # timeconst = sqrt(imp / ke) stays finite when the gate drives ke → 0.
     # For fully active contacts (gate ≈ 1), the floor is invisible and the
-    # stiffness recovers `cslc_kc · pen_scale` exactly.
+    # stiffness recovers `kc_series · pen_scale` exactly.
     out_stiffness[buf_idx] = smooth_relu(
-        cslc_kc * pen_scale * contact_gate, 1.0e-9)
+        kc_series * pen_scale * contact_gate, 1.0e-9)
     # DAMPING BUG (2026-04-19):
     # cslc_dc=2.0 N·s/m is calibrated for Newton's semi-implicit solver.
     # In the MuJoCo conversion kernel, kd>0 triggers timeconst = 2/kd = 1.0s,
@@ -759,6 +767,7 @@ def write_cslc_contacts_box(
     out_margin1: wp.array(dtype=wp.float32),
     out_tids: wp.array(dtype=wp.int32),
     cslc_kc: float,
+    target_ke: float,
     cslc_dc: float,
     eps: float,
     out_stiffness: wp.array(dtype=wp.float32),
@@ -932,8 +941,13 @@ def write_cslc_contacts_box(
     out_margin1[buf_idx] = 0.0
     out_tids[buf_idx] = 0
 
+    # H1: harmonic-mean (series-spring) composition of lattice and target
+    # stiffness; recovers cslc_kc when target_ke ≫ cslc_kc.  See
+    # cslc_v1/test_h1_compliance.py for the math contract.
+    kc_series = (cslc_kc * target_ke) / (cslc_kc + target_ke + eps * eps)
+
     out_stiffness[buf_idx] = smooth_relu(
-        cslc_kc * pen_scale * contact_gate, 1.0e-9)
+        kc_series * pen_scale * contact_gate, 1.0e-9)
     out_damping[buf_idx] = 0.0
     out_friction[buf_idx] = 1.0
 

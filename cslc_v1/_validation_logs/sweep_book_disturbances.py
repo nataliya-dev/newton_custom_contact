@@ -63,7 +63,9 @@ def make_p(book_as_mesh=False):
     p.pad_gap_initial = 2.0 * (p.book_hx - 0.0015)
     p.cslc_contact_fraction = 1.0          # full pad-on-cover overlap
     pad_face_area = (2.0 * p.pad_hy) * (2.0 * p.pad_hz)
-    p.kh = p.ke / pad_face_area            # patch-area-matched hydro
+    # H1-style fair calibration: kh_eff = kh/2 (both bodies hydroelastic
+    # at the same modulus → harmonic mean), so kh = 2·ke/A_patch.
+    p.kh = 2.0 * p.ke / pad_face_area
     return p
 
 disturbances = [

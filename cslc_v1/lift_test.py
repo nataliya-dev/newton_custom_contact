@@ -154,12 +154,14 @@ class SceneParams:
     drive_kd: float = 1.0e3
 
     # CSLC tuning — matched to squeeze_test.py and the fair-calibration
-    # derivation in §2 of cslc_v1/summary.md.  ka=15000 is the fair-cal
-    # target: with N=4 active spheres at 1 mm face_pen the recalibration
-    # `kc = ke·ka/(N·ka − ke)` solves to kc=75000 → keff=12500 →
-    # aggregate per pad = 50000 N/m = ke_bulk ✓.
+    # derivation in §2 of cslc_v1/summary.md.  Under the H1 three-spring
+    # series (anchor, contact, target), the recalibration formula
+    # `1/kc = N/ke_bulk − 1/ka − 1/ke_target` requires ka above the
+    # threshold ke_bulk/(N − ke_bulk/ke_target) ≈ 16667 to admit a
+    # positive kc.  ka=25000 leaves a comfortable margin and solves to
+    # kc=50000 → keff=12500 → aggregate per pad = 50000 N/m = ke_bulk ✓.
     cslc_spacing: float = 0.005
-    cslc_ka: float = 15000.0
+    cslc_ka: float = 25000.0
     cslc_kl: float = 500.0
     cslc_dc: float = 2.0
     cslc_n_iter: int = 20
@@ -175,10 +177,14 @@ class SceneParams:
     cslc_contact_fraction: float | None = 0.025
 
     # Hydroelastic modulus [Pa] for the hydro contact model.
-    # Fair-calibrated default: kh · A_patch(1 mm pen) = ke_bulk.
+    # Fair-calibrated default: kh_eff · A_patch(1 mm pen) = ke_bulk,
+    # where kh_eff = kh_pad·kh_sphere/(kh_pad+kh_sphere) is the harmonic-
+    # mean composition of pad and sphere moduli (Newton paper §II-A,
+    # get_effective_stiffness in sdf_hydroelastic.py).  With both bodies
+    # at the same kh, kh_eff = kh/2, so kh = 2·ke_bulk/A_patch.
     # At r=30 mm sphere on flat pad, A_patch ≈ π·(2·r·pen) = 188 mm²,
-    # so kh = 5e4 / 1.88e-4 = 2.65e8 Pa.  See §2 in cslc_v1/summary.md.
-    kh: float = 2.65e8
+    # so kh = 2·5e4 / 1.88e-4 = 5.3e8 Pa.  See §2 in cslc_v1/summary.md.
+    kh: float = 5.3e8
     sdf_resolution: int = 64
 
     # Integration

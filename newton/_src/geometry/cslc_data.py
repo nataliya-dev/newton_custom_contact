@@ -277,24 +277,45 @@ def calibrate_kc(
     ka: float,
     contact_fraction: float = 0.3,
     per_pad: bool = True,
+    ke_target: float | None = None,
 ) -> float:
     """Derive per-sphere contact stiffness kc from bulk ke.
 
-    At quasistatic equilibrium for uniform flat contact, the Laplacian
-    vanishes (all delta equal), so per-sphere: kc*(pen-delta) = ka*delta,
-    giving effective stiffness per sphere = kc*ka/(ka+kc).
+    The fair invariant is the per-pad aggregate normal stiffness at the
+    operating penetration, composed across all springs in series:
 
-    With per_pad=True (default), each pad's aggregate stiffness at uniform
-    contact equals ke_bulk:
-        N_contact_per_pad * kc*ka/(ka+kc) = ke_bulk
-    This is the fair multi-pad analogue of a single point contact at
-    ke_bulk per pad. With per_pad=False, the calibration sums N across
-    all pads and matches one ke_bulk to that total — appropriate only
-    when ke_bulk is a global "system" stiffness rather than a per-pad
-    material property.
+    - **Two-spring chain (rigid target, ``ke_target=None``):** anchor
+      ``ka`` in series with contact ``kc``.  Per-sphere effective
+      stiffness ``keff = ka*kc/(ka+kc)``.  Inverting the aggregate
+      identity ``N_contact * keff = ke_bulk`` for ``kc`` gives
+      ``kc = ke_bulk * ka / (N_contact * ka - ke_bulk)``.
 
-    Solving for kc:
-        kc = ke_bulk * ka / (N_contact * ka - ke_bulk)
+    - **Three-spring chain (compliant target, ``ke_target`` provided):**
+      anchor ``ka`` in series with contact ``kc`` in series with target
+      modulus ``ke_target``.  The harmonic-mean composition of contact
+      and target moduli is exactly the series-spring law (Masterjohn
+      et al. 2021, PFC-V eq. 23; Castro et al. 2022, SAP) that the
+      ``write_cslc_contacts`` kernel emits as ``k_series``.  Per-sphere
+      effective stiffness becomes ``1/keff = 1/ka + 1/kc + 1/ke_target``.
+      Solving for ``kc`` against the same aggregate identity:
+      ``1/kc = N_contact/ke_bulk - 1/ka - 1/ke_target``.
+
+    Args:
+        ke_bulk: target per-pad aggregate stiffness [N/m].
+        pads: list of CSLCPads (used to count surface spheres).
+        ka: anchor stiffness [N/m].
+        contact_fraction: estimated active-contact fraction.
+        per_pad: if True, each pad must independently aggregate to
+            ke_bulk; if False, the calibration matches the sum across
+            pads.
+        ke_target: if provided, include the target body's contact
+            stiffness in the series chain.  Use ``None`` (default) for
+            the legacy rigid-target calibration.
+
+    Returns:
+        Per-sphere contact stiffness ``kc`` [N/m].  Falls back to
+        ``ke_bulk / N_contact`` when the analytic formula has no
+        positive solution (under-stiff anchor or under-stiff target).
     """
     if per_pad:
         # Average n_surface across pads — assumes pads are roughly uniform
@@ -304,10 +325,22 @@ def calibrate_kc(
     else:
         n_surface = sum(p.n_surface for p in pads)
     n_contact = max(int(n_surface * contact_fraction), 1)
-    denom = n_contact * ka - ke_bulk
-    if denom <= 0.0:
+
+    # Per-sphere effective stiffness target.
+    inv_keff_target = float(n_contact) / ke_bulk
+
+    # Subtract the anchor's contribution (1/ka) and, if provided, the
+    # target's contribution (1/ke_target). Remaining budget is 1/kc.
+    inv_kc = inv_keff_target - 1.0 / ka
+    if ke_target is not None and ke_target > 0.0:
+        inv_kc -= 1.0 / ke_target
+
+    if inv_kc <= 0.0:
+        # The anchor (and/or target) alone is too soft to reach the
+        # per-sphere effective stiffness with any kc; fall back to a
+        # conservative per-sphere stiffness.
         return ke_bulk / max(n_contact, 1)
-    return ke_bulk * ka / denom
+    return 1.0 / inv_kc
 
 
 # ═══════════════════════════════════════════════════════════════════════════

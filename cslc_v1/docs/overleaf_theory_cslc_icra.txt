@@ -244,6 +244,42 @@ Finally, we calculate tangential friction using a regularized Coulomb model \cit
 \end{equation}
 where $\mu$ is the friction coefficient and $\varepsilon > 0$ prevents sudden jumps when the slipping stops.
 
+\subsubsection{Two-Body Compliance Composition}
+\label{sec:series}
+
+The contact force in~\cref{eq:normal} assumes the target body is rigid,
+so the entire approach distance compresses the lattice skin.  For
+compliant-vs-compliant contact between two bodies with per-sphere
+contact stiffness $k_c$ (lattice) and material modulus $k_e$
+(target), the approach distance splits between the two skins, and the
+force transmitted through both springs in series is governed by the
+harmonic-mean composition~\cite{masterjohn2022velocity, Cas21}:
+\begin{equation}
+    k_{\text{series}}
+        = \frac{k_c\,k_e}{k_c + k_e + \varepsilon^{2}},
+    \label{eq:series}
+\end{equation}
+where the $\varepsilon^{2}$ floor in the denominator regularises the
+$k_c, k_e \to 0$ limit and shares the smoothing width of the
+$C^\infty$ surrogates introduced in~\cref{sec:smoothing}.  The contact
+force emitted to the rigid-body solver becomes
+\begin{equation}
+    f_{n,ij}^{\text{series}}
+        = k_{\text{series}}\,\phi_{ij}\,
+          \Sigma_\varepsilon(d_{ij}^{\text{proj}}),
+    \label{eq:fn_series}
+\end{equation}
+rather than the rigid-target form of~\cref{eq:normal}.  This recovers
+the rigid-target limit when $k_e \gg k_c$ (since $k_{\text{series}}
+\to k_c$), splits compression evenly between equal-stiffness bodies
+($k_{\text{series}} = k_c / 2$ when $k_e = k_c$), and vanishes
+correctly for a fluid-like target ($k_{\text{series}} \to 0$ as $k_e
+\to 0$).  Because the composition is smooth in both moduli, the
+differentiability of~\cref{sec:smoothing} extends to scenarios in
+which the target material parameters are themselves optimisation
+variables, enabling gradient-based system identification of contact
+stiffness directly from measured forces.
+
 \subsection{Lattice Stiffness Matrix}
 
 We combine the anchor and lateral spring forces into a single internal restoring force.
@@ -544,7 +580,35 @@ coupling at the cost of tripling the solver dimension.
 Resolution changes require rescaling contact stiffness and calibrating $k_\ell/k_a$ to measured material properties \cite{kumar2015viscoelastic}. Finally, the quasistatic solver is valid only when lattice relaxation is fast relative to rigid-body motion, breaking down during high-speed impacts.
 
 \section{Future Work \& Conclusion}
-Immediate next steps include implementing a GPU-parallel solver, integrating the model into a model predictive control (MPC) loop, and enabling end-to-end differentiability via JAX or PyTorch for gradient-based trajectory optimization and policy learning. We plan to integrate CSLC into modern simulators such as Drake to directly benchmark against the hydroelastic contact model. Additionally, we aim to incorporate CSLC into Newton to leverage hardware acceleration; this will facilitate principled comparisons against existing models and provide open, user-friendly access for the broader research community. Accurately modeling the gripper–object interface is essential for dexterous manipulation and for data-driven policies that rely on the physical fidelity of their underlying simulators. Ultimately, CSLC represents a principled step toward a contact model that is simultaneously fast, differentiable, and physically informative.
+CSLC is implemented as a GPU-parallel solver inside the Newton physics
+simulator, with the per-sphere displacement field~$\boldsymbol{\delta}$
+solved each timestep via damped Jacobi iteration or, equivalently, a
+single dense matvec against the precomputed
+$(\mathbf{K}+k_c\mathbf{I})^{-1}$ in the saturated-active-contact
+limit~(\cref{sec:solver}).  All contact-active gates and the two-body
+compliance composition~\cref{eq:series} are realised via the
+$C^\infty$ surrogates of~\cref{sec:smoothing}, so end-to-end gradients
+from contact wrench back to rigid-body pose flow through reverse-mode
+automatic differentiation without ad-hoc smoothing of solver
+discontinuities.  Building on this foundation, immediate next steps
+include (i) extending CSLC to non-primitive geometries through uniform
+surface sampling on the mesh, so that the model is no longer
+restricted to box- and sphere-shaped targets; (ii) deploying CSLC
+inside a differentiable model-predictive-control loop to exploit the
+gradient pathway for trajectory optimisation through contact; (iii)
+closing the sim-to-real loop with hardware tactile sensors whose
+per-pixel readouts share a data structure with the per-sphere
+displacement field; and (iv) direct head-to-head benchmarking against
+the GPU-accelerated hydroelastic contact model on contact-rich
+manipulation tasks where lateral coupling between adjacent contact
+points is expected to dominate the response, such as twist resistance
+under offset grasps and incipient-slip detection during dynamic
+loading.  Accurately modeling the gripper--object interface is
+essential for dexterous manipulation and for data-driven policies that
+rely on the physical fidelity of their underlying simulators.
+Ultimately, CSLC represents a principled step toward a contact model
+that is simultaneously fast, differentiable, and physically
+informative.
 
 
 %\addtolength{\textheight}{-12cm}   % This command serves to balance the column lengths
