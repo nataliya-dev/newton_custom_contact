@@ -22,10 +22,13 @@
 # Command: uv run -m newton.examples spherical_volume
 # if having issues with OpenGL on WSL2, try setting the environment variable PYOPENGL_PLATFORM=glx
 ###########################################################################
+import math
+
+import numpy as np
 import warp as wp
+
 import newton
 import newton.examples
-import math
 
 
 class Example:
@@ -64,24 +67,31 @@ class Example:
             total_mass=total_mass
         )
 
-        urdf_path = 'assets/hiro/urdfs/bunny/bunny.urdf'
-        builder.add_urdf(urdf_path,
-                         xform=wp.transform(
-                             p=wp.vec3(0.0, 0.0, 1.0),
-                             q=wp.quat_from_axis_angle(
-                                 wp.vec3(1.0, 0.0, 0.0), math.pi / 2.0)
-                         ),
-                         floating=True,
-                         ignore_inertial_definitions=True,
-                         scale=1.0)
-        
-        mesh_addr = 'assets/hiro/urdfs/bunny/bunny.obj'
-        builder.manual_sphere_packing(mesh_addr, radius=0.005, spacing=0.010,
-                                      total_mass=total_mass,
-                                      pos=wp.vec3(0.0, 0.0, 2.0),
-                                      rot=wp.quat_from_axis_angle(
-                                          wp.vec3(1.0, 0.0, 0.0), math.pi / 2.0)
-                                      )
+        # Second body: the bunny mesh as a single rigid body. The upstream variant loaded a
+        # bunny URDF that isn't shipped in this repo; load the .obj directly instead.
+        import trimesh as _trimesh
+        _bunny_obj = "assets/bunny-lowpoly/Bunny-LowPoly-ws.obj"
+        _tm = _trimesh.load(_bunny_obj, force="mesh")
+        bunny_mesh = newton.Mesh(
+            np.asarray(_tm.vertices, dtype=np.float32),
+            np.asarray(_tm.faces, dtype=np.int32).flatten(),
+        )
+        _bunny_xform = wp.transform(
+            p=wp.vec3(0.0, 0.0, 1.0),
+            q=wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), math.pi / 2.0),
+        )
+        _bunny_body = builder.add_body(xform=_bunny_xform)
+        builder.add_shape_mesh(_bunny_body, mesh=bunny_mesh)
+
+        # Third body: same bunny mesh, sphere-packed for the SRXPBD solver.
+        builder.manual_sphere_packing(
+            _bunny_obj,
+            radius=0.005,
+            spacing=0.010,
+            total_mass=total_mass,
+            pos=wp.vec3(0.0, 0.0, 2.0),
+            rot=wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), math.pi / 2.0),
+        )
 
         self.model = builder.finalize()
 

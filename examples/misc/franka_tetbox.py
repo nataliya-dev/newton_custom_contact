@@ -29,7 +29,7 @@ class Example:
         body_box = scene.add_body(
             mass=mass,
             xform=wp.transform(p=box_center, q=wp.quat_identity()),
-            key="box",
+            label="box",
         )
 
         scene.add_shape_box(

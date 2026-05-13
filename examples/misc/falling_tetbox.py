@@ -52,7 +52,7 @@ class Example:
         self.box_pos = wp.vec3(0.0, 2.0, drop_z)
 
         rot = wp.quat(0.1830127, 0.1830127, 0.6830127, 0.6830127)
-        body_box = builder.add_body(mass=mass, xform=wp.transform(p=self.box_pos, q=rot), key="box")
+        body_box = builder.add_body(mass=mass, xform=wp.transform(p=self.box_pos, q=rot), label="box")
         builder.add_shape_box(body_box, hx=half_extents.x, hy=half_extents.y, hz=half_extents.z)
 
         self.model = builder.finalize()

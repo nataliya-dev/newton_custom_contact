@@ -25,7 +25,7 @@
 import warp as wp
 import newton
 import numpy as np
-from newton.examples.hiro.example_poc import Example
+from examples.misc.falling_box_exps import Example
 
 
 def collect_trajectories(parser, render=True):
@@ -78,13 +78,17 @@ def compare_trajectories(trajectories, baseline='gt'):
     of freedom between each experiment and the baseline.
     """
 
+    import os
+    out_dir = "outputs/falling_box_traj"
+    os.makedirs(out_dir, exist_ok=True)
+
     base = trajectories[baseline]
     print('\nTrajectory comparison report:')
     for exp, traj in trajectories.items():
         # align lengths if needed
         m = min(base.shape[0], traj.shape[0])
         diff = traj[:m] - base[:m]
-        np.savetxt(f"newton/examples/hiro/traj_diff_{exp}_vs_{baseline}.txt", diff)
+        np.savetxt(f"{out_dir}/traj_diff_{exp}_vs_{baseline}.txt", diff)
         l1 = np.mean(np.abs(diff))
         l2 = np.sqrt(np.mean(diff ** 2))
         print(f"  {exp:6s} vs {baseline}: mean L1={l1:.6f}, RMS L2={l2:.6f}")

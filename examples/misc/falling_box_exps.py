@@ -32,37 +32,45 @@ class Box:
     pos = wp.vec3(0.0, 2.0, 1.0)
     rot = wp.quat(0.1830127, 0.1830127, 0.6830127, 0.6830127)
 
+    # Geometry/mass constants matching get_default_spheres (L = 0.0762 * 3.0 = 0.2286 m edge,
+    # mass 11.94 kg). The original variant loaded these from a pink_box URDF that isn't shipped
+    # in this repo; the rigid representation below produces an equivalent body.
+    EDGE = 0.0762 * 3.0
+    HALF_EXTENT = EDGE * 0.5
+    MASS = 11.94
+
     @staticmethod
     def get_tr_urdf(builder):
-        urdf_path = 'assets/hiro/pink_box/pink_box.urdf'
-        shape_idx_start = len(builder.shape_type)
-        try:
-            builder.add_urdf(urdf_path, xform=wp.transform(p=Box.pos, q=Box.rot),
-                            floating=True,
-                            ignore_inertial_definitions=True,
-                            scale=3.0)  # Adds two mesh: visual + collision
-        except:
-            raise FileNotFoundError(f"URDF not found or invalid: {urdf_path}")
-        shape_idx_end = len(builder.shape_type)
-        for shape_idx in range(shape_idx_start, shape_idx_end):
-            # contact normal stiffness
-            builder.shape_material_ke[shape_idx] = 1e6
-            builder.shape_material_kd[shape_idx] = 1e3   # contact damping
-            builder.shape_material_kf[shape_idx] = 1e2   # frictional stiffness
-            builder.shape_material_mu[shape_idx] = 0.8   # friction coefficient
+        # Rigid box equivalent to the upstream pink_box URDF (same edge length, same mass).
+        density = Box.MASS / (Box.EDGE ** 3)
+        cfg = newton.ModelBuilder.ShapeConfig(
+            density=density,
+            mu=0.8,
+            ke=1e6,
+            kd=1e3,
+            kf=1e2,
+        )
+        body_idx = builder.add_body(xform=wp.transform(p=Box.pos, q=Box.rot))
+        builder.add_shape_box(
+            body_idx,
+            hx=Box.HALF_EXTENT,
+            hy=Box.HALF_EXTENT,
+            hz=Box.HALF_EXTENT,
+            cfg=cfg,
+        )
         return builder
 
     @staticmethod
     def get_MorphIt_spheres(builder):
-        raise NotImplementedError
-        # TODO: Need better MorphIt spheres
-        sp = f"/home/ava/Research/Codes/MorphIt-1/src/results/output/pink_10.json"
+        # Uses the local box morphit packing in assets/. The packing is roughly cube-shaped
+        # but at a different scale than Box.EDGE; total_mass is preserved.
+        sp = "assets/box/morphit_results.json"
         builder.add_particle_volume(
             volume_data=sp,
             pos=Box.pos,
             rot=Box.rot,
             vel=wp.vec3(0.0),
-            total_mass=11.94,
+            total_mass=Box.MASS,
         )
         return builder
 
