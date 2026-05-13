@@ -13,6 +13,9 @@ class ParticleFlags(IntEnum):
     ACTIVE = 1 << 0
     """Indicates that the particle is active."""
 
+    INTEGRATE_ONLY = 1 << 1
+    """Indicates that the particle is only integrated (used by rigid-body shape-matching solvers such as :class:`~newton.solvers.SolverSRXPBD` for particles that participate in integration but skip contact resolution; used e.g. by the rod example)."""
+
 
 # Shape flags
 class ShapeFlags(IntEnum):

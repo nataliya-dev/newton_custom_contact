@@ -169,6 +169,12 @@ class Model:
         """Maximum particle velocity [m/s] (to prevent instability)."""
         self.particle_world: wp.array[wp.int32] | None = None
         """World index for each particle, shape [particle_count], int. -1 for global."""
+        self.particle_group: wp.array[wp.int32] | None = None
+        """Group ID for each particle (-1 for ungrouped), shape [particle_count], int. Used by rigid-body shape-matching solvers (e.g. :class:`~newton.solvers.SolverSRXPBD`) to identify which particles belong to the same rigid body."""
+        self.particle_groups: dict[int, wp.array[wp.int32]] = {}
+        """Mapping from group_id -> Warp array of particle indices in that group."""
+        self.particle_group_count: int = 0
+        """Total number of particle groups."""
         self.particle_world_start: wp.array[wp.int32] | None = None
         """Start index of the first particle per world, shape [world_count + 2], int.
 
