@@ -12,6 +12,13 @@ import warp as wp
 
 from ...sim import Contacts, Control, Model, State
 from ..solver import SolverBase
+from ..srxpbd.kernels import (
+    apply_particle_deltas as srxpbd_apply_particle_deltas,
+)
+from ..srxpbd.kernels import (
+    enforce_momemntum_conservation_tiled,
+    solve_shape_matching_batch_tiled,
+)
 from ..xpbd.kernels import (
     apply_body_deltas,
     apply_joint_forces,
@@ -152,10 +159,10 @@ class SolverUXPBD(SolverBase):
                 self.integrate_bodies(model, state_in, state_out, dt)
                 state_in.body_f = body_f_prev
 
-        # Copy any non-lattice particles forward (Phase 1 has none, but keep API consistent).
+        # Predict SM-rigid particle positions under gravity (lattice particles get
+        # overwritten by update_lattice_world_positions below).
         if model.particle_count:
-            state_out.particle_q.assign(state_in.particle_q)
-            state_out.particle_qd.assign(state_in.particle_qd)
+            self.integrate_particles(model, state_in, state_out, dt)
 
         # 2. Project body_q onto lattice particles.
         self.update_lattice_world_positions(state_out)
@@ -299,6 +306,77 @@ class SolverUXPBD(SolverBase):
                 )
                 _apply_deltas_flip()
                 self.update_lattice_world_positions(state_out)
+
+            # SM-rigid groups: shape matching + momentum-conservation post-pass.
+            if self._num_dynamic_groups > 0 and model.particle_count > 0:
+                particle_deltas = wp.zeros(model.particle_count, dtype=wp.vec3, device=model.device)
+                P_b4 = wp.zeros(self._num_dynamic_groups, dtype=wp.vec3, device=model.device)
+                L_b4 = wp.zeros(self._num_dynamic_groups, dtype=wp.vec3, device=model.device)
+                bd = self._shape_match_block_dim
+
+                wp.launch(
+                    kernel=solve_shape_matching_batch_tiled,
+                    dim=(self._num_dynamic_groups, bd),
+                    inputs=[
+                        state_out.particle_q,
+                        self.particle_q_rest,
+                        state_out.particle_qd,
+                        self.total_group_mass,
+                        model.particle_mass,
+                        self._group_particle_start,
+                        self._group_particle_count,
+                        self._group_particles_flat,
+                    ],
+                    outputs=[particle_deltas, P_b4, L_b4],
+                    block_dim=bd,
+                    device=model.device,
+                )
+
+                new_q = wp.empty_like(state_out.particle_q)
+                new_qd = wp.empty_like(state_out.particle_qd)
+                wp.launch(
+                    kernel=srxpbd_apply_particle_deltas,
+                    dim=model.particle_count,
+                    inputs=[
+                        self.particle_q_rest,
+                        state_out.particle_q,
+                        state_out.particle_qd,
+                        model.particle_flags,
+                        model.particle_mass,
+                        particle_deltas,
+                        dt,
+                        model.particle_max_velocity,
+                    ],
+                    outputs=[new_q, new_qd],
+                    device=model.device,
+                )
+                state_out.particle_q = new_q
+                state_out.particle_qd = new_qd
+
+                # Momentum conservation post-pass.
+                final_q = wp.empty_like(state_out.particle_q)
+                final_qd = wp.empty_like(state_out.particle_qd)
+                wp.launch(
+                    kernel=enforce_momemntum_conservation_tiled,
+                    dim=(self._num_dynamic_groups, bd),
+                    inputs=[
+                        state_out.particle_q,
+                        state_out.particle_qd,
+                        self.total_group_mass,
+                        model.particle_mass,
+                        P_b4,
+                        L_b4,
+                        dt,
+                        self._group_particle_start,
+                        self._group_particle_count,
+                        self._group_particles_flat,
+                    ],
+                    outputs=[final_q, final_qd],
+                    block_dim=bd,
+                    device=model.device,
+                )
+                state_out.particle_q = final_q
+                state_out.particle_qd = final_qd
 
         # 5. Populate state_out.body_parent_f from joint_impulse (XPBD convention).
         if state_out.body_parent_f is not None:

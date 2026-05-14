@@ -286,6 +286,7 @@ reportUnusedCallResult = false
 files.extend-exclude = ["/examples/assets", "*.urdf", "*.usd", "*.usda", "*.mjcf", "*.js"]
 
 [tool.typos.default.extend-words]
+momemntum = "momemntum"
 arange = "arange"
 ba = "ba"
 ix = "ix"

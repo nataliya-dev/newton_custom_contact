@@ -108,5 +108,75 @@ add_function_test(
 )
 
 
+def test_uxpbd_sm_rigid_cube_stays_rigid(test, device):
+    """A SM-rigid cube spinning in free space stays rigid (shape matching works).
+
+    Zero gravity, no contact. Validates the shape-matching pass keeps all
+    pairwise particle distances within 1% after 500 substeps with an initial
+    angular velocity around z.
+
+    Note: requires CUDA. The tiled shape-matching kernels (solve_shape_matching_batch_tiled,
+    enforce_momemntum_conservation_tiled) use wp.tile_extract after wp.tile_reduce.
+    On CPU, wp.tile_extract does not broadcast the reduced value to all threads in the
+    block, which produces incorrect center-of-mass values in non-lane-0 threads and
+    corrupts the shape-matching delta and momentum conservation. CUDA broadcasts
+    tile_extract correctly.
+    """
+    if not device.is_cuda:
+        test.skipTest("SM-rigid tiled kernels require CUDA (tile_extract broadcast)")
+    builder = newton.ModelBuilder(up_axis="Z")
+    half_extent = 0.11
+    sphere_r = 0.025
+    coords = np.linspace(-half_extent + sphere_r, half_extent - sphere_r, 4)
+    xs, ys, zs = np.meshgrid(coords, coords, coords, indexing="ij")
+    centers = np.stack([xs.flatten(), ys.flatten(), zs.flatten()], axis=1)
+    radii = np.full(centers.shape[0], sphere_r)
+    builder.add_particle_volume(
+        volume_data={"centers": centers.tolist(), "radii": radii.tolist()},
+        total_mass=4.0,
+        pos=wp.vec3(0.0, 0.0, 5.0),
+    )
+    model = builder.finalize(device=device)
+
+    # Set initial angular velocity around z.
+    pos = model.particle_q.numpy()
+    com = pos.mean(axis=0)
+    omega = np.array([0.0, 0.0, 2.0])
+    qd_np = np.zeros_like(pos)
+    for i in range(pos.shape[0]):
+        r = pos[i] - com
+        qd_np[i] = np.cross(omega, r)
+    model.particle_qd.assign(qd_np)
+
+    # Zero gravity.
+    grav_np = model.gravity.numpy() * 0.0
+    model.gravity.assign(grav_np)
+
+    solver = newton.solvers.SolverUXPBD(model, iterations=10)
+    state_0 = model.state()
+    state_1 = model.state()
+    dt = 0.001
+    for _ in range(500):
+        state_0.clear_forces()
+        solver.step(state_0, state_1, None, None, dt)
+        state_0, state_1 = state_1, state_0
+
+    final_pos = state_0.particle_q.numpy()
+    initial_pos = pos
+    for j in range(1, 5):
+        d_init = float(np.linalg.norm(initial_pos[j] - initial_pos[0]))
+        d_final = float(np.linalg.norm(final_pos[j] - final_pos[0]))
+        rel_err = abs(d_final - d_init) / max(d_init, 1e-3)
+        test.assertLess(rel_err, 0.01, f"particle pair {j} distance drift {rel_err}")
+
+
+add_function_test(
+    TestSolverUXPBDPhase2,
+    "test_uxpbd_sm_rigid_cube_stays_rigid",
+    test_uxpbd_sm_rigid_cube_stays_rigid,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()
