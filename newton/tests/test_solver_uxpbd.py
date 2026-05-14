@@ -6,6 +6,9 @@
 import os
 import unittest
 
+import numpy as np
+import warp as wp
+
 import newton
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -104,6 +107,87 @@ add_function_test(
     TestSolverUXPBD,
     "test_uxpbd_add_lattice_populates_arrays",
     test_uxpbd_add_lattice_populates_arrays,
+    devices=get_test_devices(),
+)
+
+
+def test_uxpbd_update_lattice_projects_body_q(test, device):
+    """Lattice particle world positions match body_q x p_rest analytically."""
+    builder = newton.ModelBuilder()
+    link = builder.add_body()  # add_body auto-creates a free joint
+
+    # One sphere at body-frame offset (0.1, 0.0, 0.0)
+    builder.add_lattice(
+        link=link,
+        morphit_json=os.path.join(_ASSET_DIR, "tiny_lattice.json"),
+        total_mass=1.0,
+    )
+    model = builder.finalize(device=device)
+
+    state = model.state()
+    # Set body_q to translation (1.0, 2.0, 3.0), rotation identity.
+    body_q_np = np.array([[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0]], dtype=np.float32)
+    state.body_q.assign(body_q_np)
+    state.body_qd.zero_()
+
+    solver = newton.solvers.SolverUXPBD(model)
+    solver.update_lattice_world_positions(state)
+
+    expected = np.array(
+        [
+            [1.0, 2.0, 3.0],  # (0,0,0)   shifted by (1,2,3)
+            [1.1, 2.0, 3.0],  # (0.1,0,0) shifted
+            [1.0, 2.1, 3.0],  # (0,0.1,0) shifted
+            [1.0, 2.0, 3.1],  # (0,0,0.1) shifted
+            [0.9, 2.0, 3.0],  # (-0.1,0,0) shifted
+        ],
+        dtype=np.float32,
+    )
+    got = state.particle_q.numpy()
+    np.testing.assert_allclose(got, expected, atol=1e-5)
+
+
+add_function_test(
+    TestSolverUXPBD,
+    "test_uxpbd_update_lattice_projects_body_q",
+    test_uxpbd_update_lattice_projects_body_q,
+    devices=get_test_devices(),
+)
+
+
+def test_uxpbd_update_lattice_handles_rotation(test, device):
+    """Lattice projection respects body rotation."""
+    builder = newton.ModelBuilder()
+    link = builder.add_body()  # add_body auto-creates a free joint
+    builder.add_lattice(
+        link=link,
+        morphit_json=os.path.join(_ASSET_DIR, "tiny_lattice.json"),
+        total_mass=1.0,
+    )
+    model = builder.finalize(device=device)
+
+    state = model.state()
+    # 90 degree rotation around Z. The sphere at (+0.1, 0, 0) body frame
+    # should project to (0, +0.1, 0) in world frame.
+    rot = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.5 * np.pi)
+    body_q_np = np.array([[0.0, 0.0, 0.0, rot[0], rot[1], rot[2], rot[3]]], dtype=np.float32)
+    state.body_q.assign(body_q_np)
+    state.body_qd.zero_()
+
+    solver = newton.solvers.SolverUXPBD(model)
+    solver.update_lattice_world_positions(state)
+
+    got = state.particle_q.numpy()
+    # Sphere at body-frame (+0.1, 0, 0) lands at world (0, +0.1, 0)
+    np.testing.assert_allclose(got[1], [0.0, 0.1, 0.0], atol=1e-5)
+    # Sphere at body-frame (0, +0.1, 0) lands at world (-0.1, 0, 0)
+    np.testing.assert_allclose(got[2], [-0.1, 0.0, 0.0], atol=1e-5)
+
+
+add_function_test(
+    TestSolverUXPBD,
+    "test_uxpbd_update_lattice_handles_rotation",
+    test_uxpbd_update_lattice_handles_rotation,
     devices=get_test_devices(),
 )
 

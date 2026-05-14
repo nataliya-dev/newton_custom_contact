@@ -8,8 +8,11 @@ lattice that contacts analytical static shapes through the particle pipeline.
 See ``docs/superpowers/specs/2026-05-13-uxpbd-design.md`` for the full design.
 """
 
+import warp as wp
+
 from ...sim import Contacts, Control, Model, State
 from ..solver import SolverBase
+from .kernels import update_lattice_world_positions as update_lattice_world_positions_kernel
 
 
 class SolverUXPBD(SolverBase):
@@ -64,6 +67,41 @@ class SolverUXPBD(SolverBase):
             NotImplementedError: Always, until Task 6 wires up the iteration loop.
         """
         raise NotImplementedError("SolverUXPBD.step() is implemented in Task 6.")
+
+    def update_lattice_world_positions(self, state: State) -> None:
+        """Project ``body_q``/``body_qd`` onto every lattice particle.
+
+        Updates ``state.particle_q``, ``state.particle_qd``, and
+        ``model.particle_radius`` in place for all lattice particles. Non-lattice
+        particles are left untouched.
+
+        Args:
+            state: The :class:`~newton.State` whose body_q drives the projection
+                and whose particle_q is written.
+        """
+        model = self.model
+        if model.lattice_sphere_count == 0:
+            return
+        wp.launch(
+            kernel=update_lattice_world_positions_kernel,
+            dim=model.lattice_sphere_count,
+            inputs=[
+                state.body_q,
+                state.body_qd,
+                model.body_com,
+                model.lattice_link,
+                model.lattice_p_rest,
+                model.lattice_delta,
+                model.lattice_r,
+                model.lattice_particle_index,
+            ],
+            outputs=[
+                state.particle_q,
+                state.particle_qd,
+                model.particle_radius,
+            ],
+            device=model.device,
+        )
 
     def compute_compliant_contact_response(
         self,
