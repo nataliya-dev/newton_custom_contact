@@ -45,6 +45,7 @@
 - Add Kamino-specific simulation examples in `newton/examples/kamino`
 - Add per-mesh `color` override to `ViewerBase.log_mesh()` for tinting individual meshes without authoring per-vertex colors
 - Add per-mesh `roughness` and `metallic` PBR overrides to `ViewerBase.log_mesh()`
+- Add `SolverUXPBD` Phase 1: articulated rigid bodies with a MorphIt-generated kinematic lattice for particle-based contact against analytical static shapes. Reserves architectural seams for CSLC v2.
 
 ### Changed
 
