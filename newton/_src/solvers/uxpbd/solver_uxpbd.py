@@ -301,8 +301,25 @@ class SolverUXPBD(SolverBase):
 
             # Particle-shape contacts: dispatches on particle_substrate.
             # Lattice particles (substrate=0) route deltas into body_deltas.
-            # SM-rigid particles (substrate=1) route into particle_deltas_contact.
-            if contacts is not None and body_deltas is not None:
+            # SM-rigid particles (substrate=1) and fluid particles (substrate=3)
+            # route into particle_deltas_contact via the ELSE branch.
+            # Runs even when body_count==0 (e.g. fluid-only + static ground plane).
+            if contacts is not None and model.particle_count > 0:
+                _body_deltas_ps = (
+                    body_deltas
+                    if body_deltas is not None
+                    else wp.zeros(0, dtype=wp.spatial_vector, device=model.device)
+                )
+                _body_q_ps = (
+                    state_out.body_q
+                    if state_out.body_q is not None
+                    else wp.zeros(0, dtype=wp.transform, device=model.device)
+                )
+                _body_qd_ps = (
+                    state_out.body_qd
+                    if state_out.body_qd is not None
+                    else wp.zeros(0, dtype=wp.spatial_vector, device=model.device)
+                )
                 particle_deltas_contact = wp.zeros(model.particle_count, dtype=wp.vec3, device=model.device)
                 wp.launch(
                     kernel=solve_particle_shape_contacts_uxpbd,
@@ -316,8 +333,8 @@ class SolverUXPBD(SolverBase):
                         model.particle_substrate,
                         model.particle_to_lattice,
                         model.lattice_link,
-                        state_out.body_q,
-                        state_out.body_qd,
+                        _body_q_ps,
+                        _body_qd_ps,
                         model.body_com,
                         self.body_inv_mass_effective,
                         self.body_inv_inertia_effective,
@@ -335,11 +352,12 @@ class SolverUXPBD(SolverBase):
                         dt,
                         self.soft_contact_relaxation,
                     ],
-                    outputs=[body_deltas, particle_deltas_contact],
+                    outputs=[_body_deltas_ps, particle_deltas_contact],
                     device=model.device,
                 )
 
-                _apply_deltas_flip()
+                if body_deltas is not None:
+                    _apply_deltas_flip()
 
                 # Re-sync lattice after body update so next iter sees consistent state.
                 self.update_lattice_world_positions(state_out)

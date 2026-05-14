@@ -277,6 +277,9 @@ def solve_particle_particle_contacts_uxpbd(
         # Same particle group -> skip (handled by shape matching).
         if particle_group[i] >= 0 and particle_group[i] == particle_group[index]:
             continue
+        # Skip fluid-fluid pairs (handled by PBF density constraint in step()).
+        if particle_substrate[i] == wp.uint8(3) and particle_substrate[index] == wp.uint8(3):
+            continue
         sub_j = particle_substrate[index]
         is_lat_j = sub_j == wp.uint8(0)
         # Same lattice host -> skip.

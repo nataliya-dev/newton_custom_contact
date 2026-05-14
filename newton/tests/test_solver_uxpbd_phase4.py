@@ -447,5 +447,52 @@ add_function_test(
 )
 
 
+def test_uxpbd_fluid_on_ground_no_penetration(test, device):
+    """A 3x3x3 fluid block settles on the ground plane without falling through."""
+    builder = newton.ModelBuilder(up_axis="Z")
+    builder.add_ground_plane()
+    builder.add_fluid_grid(
+        pos=wp.vec3(0.0, 0.0, 0.1),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0, 0.0, 0.0),
+        dim_x=3,
+        dim_y=3,
+        dim_z=3,
+        cell_x=0.012,
+        cell_y=0.012,
+        cell_z=0.012,
+        particle_radius=0.006,
+        rest_density=1000.0,
+        viscosity=0.05,
+        cohesion=0.01,
+    )
+    model = builder.finalize(device=device)
+    model.particle_mu = 0.0
+    model.soft_contact_mu = 0.0
+    solver = newton.solvers.SolverUXPBD(model, iterations=4, fluid_iterations=4)
+    state_0 = model.state()
+    state_1 = model.state()
+    contacts = model.contacts()
+    dt = 0.001
+
+    for _ in range(500):
+        state_0.clear_forces()
+        model.collide(state_0, contacts)
+        solver.step(state_0, state_1, None, contacts, dt)
+        state_0, state_1 = state_1, state_0
+
+    pos = state_0.particle_q.numpy()
+    z_min = float(pos[:, 2].min())
+    test.assertGreater(z_min, -0.01, f"fluid penetrated ground: z_min={z_min}")
+
+
+add_function_test(
+    TestSolverUXPBDPhase4,
+    "test_uxpbd_fluid_on_ground_no_penetration",
+    test_uxpbd_fluid_on_ground_no_penetration,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()
