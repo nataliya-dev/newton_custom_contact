@@ -3,10 +3,13 @@
 
 """Tests for the UXPBD solver (Phase 1: articulated rigid + lattice + static contact)."""
 
+import os
 import unittest
 
 import newton
 from newton.tests.unittest_utils import add_function_test, get_test_devices
+
+_ASSET_DIR = os.path.join(os.path.dirname(__file__), "assets", "uxpbd")
 
 
 def test_uxpbd_solver_rejects_enable_cslc(test, device):
@@ -65,6 +68,42 @@ add_function_test(
     TestSolverUXPBD,
     "test_uxpbd_empty_model_has_zero_lattice",
     test_uxpbd_empty_model_has_zero_lattice,
+    devices=get_test_devices(),
+)
+
+
+def test_uxpbd_add_lattice_populates_arrays(test, device):
+    """builder.add_lattice loads MorphIt JSON, creates lattice + particle entries."""
+    builder = newton.ModelBuilder()
+    link = builder.add_body()  # one floating body (add_body auto-creates a free joint)
+
+    json_path = os.path.join(_ASSET_DIR, "tiny_lattice.json")
+    builder.add_lattice(link=link, morphit_json=json_path, total_mass=1.0)
+
+    test.assertEqual(len(builder.lattice_p_rest), 5)
+    test.assertEqual(len(builder.lattice_r), 5)
+    test.assertEqual(len(builder.lattice_link), 5)
+    test.assertEqual(builder.lattice_link[0], link)
+    test.assertEqual(builder.lattice_link[4], link)
+    test.assertAlmostEqual(builder.lattice_r[0], 0.05, places=6)
+    test.assertAlmostEqual(builder.lattice_r[1], 0.04, places=6)
+
+    # Particles were added to the builder
+    test.assertEqual(len(builder.particle_q), 5)
+
+    # Each lattice sphere's lattice_particle_index points to the matching slot
+    test.assertEqual(list(builder.lattice_particle_index), [0, 1, 2, 3, 4])
+
+    # Finalize produces non-empty model arrays
+    model = builder.finalize(device=device)
+    test.assertEqual(model.lattice_sphere_count, 5)
+    test.assertEqual(model.lattice_link.shape[0], 5)
+
+
+add_function_test(
+    TestSolverUXPBD,
+    "test_uxpbd_add_lattice_populates_arrays",
+    test_uxpbd_add_lattice_populates_arrays,
     devices=get_test_devices(),
 )
 

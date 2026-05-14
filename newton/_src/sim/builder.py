@@ -14,6 +14,7 @@ import warnings
 from collections import Counter, deque
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import numpy as np
@@ -7524,6 +7525,64 @@ class ModelBuilder:
         particle_end_idx = len(self.particle_q)
         self.particle_groups[group_id] = list(range(particle_start_idx, particle_end_idx))
         return group_id
+
+    def add_lattice(
+        self,
+        link: int,
+        morphit_json: str | Path | dict[str, Any],
+        total_mass: float = 0.0,
+        pos: Any = None,
+        rot: Any = None,
+        k_anchor: float = 1.0e3,
+        k_lateral: float = 5.0e2,
+        k_bulk: float = 1.0e5,
+        damping: float = 2.0,
+    ) -> int:
+        """Attach a MorphIt-generated kinematic lattice to an articulated link.
+
+        The lattice is a collection of variable-radius spheres bound to the
+        link's body frame. Lattice spheres are added as particles in the model's
+        unified particle pool and tagged with metadata identifying them as
+        substrate 0 (lattice) particles hosted by ``link``. The lattice's role
+        is to project the link into the particle world so it can participate in
+        particle-based contact; the lattice does not carry the link's dynamics.
+
+        See ``docs/superpowers/specs/2026-05-13-uxpbd-design.md`` section 5 for
+        the full data model and v2 CSLC extension hooks.
+
+        Args:
+            link: The articulated link (``body_index``) that hosts this lattice.
+            morphit_json: Path to a MorphIt JSON file, or an already-parsed dict with the same shape.
+            total_mass: Total mass distributed across lattice spheres [kg].
+                Lattice mass is metadata; the host body's inertia is unchanged.
+                Defaults to 0.0 (lattice particles act as massless probes).
+            pos: World-space offset applied to lattice positions. Defaults to the
+                origin. Pass the link's resting position so the lattice aligns
+                with the rendered link at t=0.
+            rot: Rotation applied to lattice positions. Defaults to identity.
+            k_anchor: Anchor spring stiffness for v2 CSLC [N/m]. Stored in
+                ``model.lattice_k_anchor``; not read in Phase 1.
+            k_lateral: Lateral coupling stiffness for v2 CSLC [N/m]. Stored.
+            k_bulk: Bulk material stiffness for v2 CSLC [N/m]. Stored.
+            damping: Hunt-Crossley damping coefficient for v2 CSLC [s/m]. Stored.
+
+        Returns:
+            The starting index in the lattice arrays for this link's lattice.
+        """
+        from ..solvers.uxpbd.lattice import add_lattice_to_builder  # noqa: PLC0415
+
+        return add_lattice_to_builder(
+            self,
+            link=link,
+            morphit_json=morphit_json,
+            total_mass=total_mass,
+            pos=pos,
+            rot=rot,
+            k_anchor=k_anchor,
+            k_lateral=k_lateral,
+            k_bulk=k_bulk,
+            damping=damping,
+        )
 
     def add_spring(
         self,
