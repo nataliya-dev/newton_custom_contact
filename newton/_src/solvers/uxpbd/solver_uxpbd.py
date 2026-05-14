@@ -15,6 +15,7 @@ from ..solver import SolverBase
 from ..xpbd.kernels import (
     apply_body_deltas,
     apply_joint_forces,
+    convert_joint_impulse_to_parent_f,
     copy_kinematic_body_state_kernel,
     solve_body_joints,
 )
@@ -128,6 +129,12 @@ class SolverUXPBD(SolverBase):
         # apply_body_deltas requires distinct input and output arrays (no aliasing).
         # We keep a scratch buffer pair and ping-pong with state_out so that
         # cur_(q|qd) -> nxt_(q|qd) always refer to different allocations.
+        # Allocate joint impulse accumulator only if the user requested body_parent_f reporting.
+        if state_out.body_parent_f is not None and model.joint_count > 0:
+            joint_impulse = wp.zeros(model.joint_count, dtype=wp.spatial_vector, device=model.device)
+        else:
+            joint_impulse = None
+
         if model.body_count:
             body_deltas = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
             _body_q = [state_out.body_q, wp.clone(state_out.body_q)]
@@ -214,7 +221,11 @@ class SolverUXPBD(SolverBase):
             # Joints
             if model.joint_count and body_deltas is not None:
                 body_deltas.zero_()
-                joint_impulse = wp.zeros(model.joint_count, dtype=wp.spatial_vector, device=model.device)
+                if joint_impulse is not None:
+                    impulse_out = joint_impulse
+                else:
+                    # Need a temp buffer because solve_body_joints requires an output array.
+                    impulse_out = wp.zeros(model.joint_count, dtype=wp.spatial_vector, device=model.device)
                 wp.launch(
                     kernel=solve_body_joints,
                     dim=model.joint_count,
@@ -245,13 +256,31 @@ class SolverUXPBD(SolverBase):
                         0.7,
                         dt,
                     ],
-                    outputs=[body_deltas, joint_impulse],
+                    outputs=[body_deltas, impulse_out],
                     device=model.device,
                 )
                 _apply_deltas_flip()
                 self.update_lattice_world_positions(state_out)
 
-        # 5. Copy kinematic body state forward.
+        # 5. Populate state_out.body_parent_f from joint_impulse (XPBD convention).
+        if state_out.body_parent_f is not None:
+            state_out.body_parent_f.zero_()
+            if joint_impulse is not None:
+                wp.launch(
+                    kernel=convert_joint_impulse_to_parent_f,
+                    dim=model.joint_count,
+                    inputs=[
+                        joint_impulse,
+                        model.joint_enabled,
+                        model.joint_type,
+                        model.joint_child,
+                        dt,
+                    ],
+                    outputs=[state_out.body_parent_f],
+                    device=model.device,
+                )
+
+        # 6. Copy kinematic body state forward.
         if model.body_count:
             wp.launch(
                 kernel=copy_kinematic_body_state_kernel,
