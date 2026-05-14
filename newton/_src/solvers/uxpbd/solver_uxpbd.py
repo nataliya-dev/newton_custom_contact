@@ -26,6 +26,11 @@ from ..xpbd.kernels import (
     copy_kinematic_body_state_kernel,
     solve_body_joints,
 )
+from .fluid import (
+    compute_fluid_density,
+    compute_fluid_lambda,
+    compute_fluid_position_delta,
+)
 from .kernels import (
     compute_mass_scale,
     solve_particle_particle_contacts_uxpbd,
@@ -61,6 +66,9 @@ class SolverUXPBD(SolverBase):
         shock_propagation_k: UPPFRTA mass-scaling factor for stack stability
             (default 0 = off; positive values reduce upper-particle effective
             mass via m* = m * exp(-k * h)).
+        fluid_iterations: Number of PBF sub-iterations per main iteration for
+            incompressibility enforcement on fluid particles (Macklin and Muller
+            2013). Default 4.
         enable_cslc: Must be False in Phase 1. Reserved for v2.
 
     Raises:
@@ -78,6 +86,7 @@ class SolverUXPBD(SolverBase):
         joint_angular_relaxation: float = 0.4,
         joint_linear_relaxation: float = 0.7,
         shock_propagation_k: float = 0.0,
+        fluid_iterations: int = 4,
         enable_cslc: bool = False,
     ):
         super().__init__(model=model)
@@ -94,6 +103,7 @@ class SolverUXPBD(SolverBase):
         self.joint_angular_relaxation = joint_angular_relaxation
         self.joint_linear_relaxation = joint_linear_relaxation
         self.shock_propagation_k = shock_propagation_k
+        self.fluid_iterations = fluid_iterations
 
         # Cache the up-axis integer (0=X, 1=Y, 2=Z) for shock propagation.
         # Derived from the dominant gravity axis: gravity is along -up.
@@ -391,6 +401,103 @@ class SolverUXPBD(SolverBase):
                 state_out.particle_q = new_q
                 state_out.particle_qd = new_qd
                 self.update_lattice_world_positions(state_out)
+
+            # Position-Based Fluids pipeline (Macklin and Muller 2013).
+            # Runs fluid_iterations sub-iterations per main iteration.
+            if model.fluid_phase_count > 0 and model.particle_count > 0:
+                fluid_density = wp.zeros(model.particle_count, dtype=wp.float32, device=model.device)
+                fluid_lambdas = wp.zeros(model.particle_count, dtype=wp.float32, device=model.device)
+                fluid_deltas = wp.zeros(model.particle_count, dtype=wp.vec3, device=model.device)
+                epsilon = wp.float32(100.0)
+                k_corr = wp.float32(0.1)
+                dq_factor = wp.float32(0.3)
+                n_corr = wp.float32(4.0)
+
+                for _ in range(self.fluid_iterations):
+                    with wp.ScopedDevice(model.device):
+                        model.particle_grid.build(
+                            state_out.particle_q,
+                            model.particle_max_radius * 4.0,
+                        )
+                    fluid_density.zero_()
+                    fluid_lambdas.zero_()
+                    fluid_deltas.zero_()
+
+                    wp.launch(
+                        kernel=compute_fluid_density,
+                        dim=model.particle_count,
+                        inputs=[
+                            model.particle_grid.id,
+                            state_out.particle_q,
+                            model.particle_mass,
+                            model.particle_substrate,
+                            model.particle_fluid_phase,
+                            model.fluid_smoothing_radius,
+                            model.fluid_solid_coupling_s,
+                        ],
+                        outputs=[fluid_density],
+                        device=model.device,
+                    )
+
+                    wp.launch(
+                        kernel=compute_fluid_lambda,
+                        dim=model.particle_count,
+                        inputs=[
+                            model.particle_grid.id,
+                            state_out.particle_q,
+                            model.particle_mass,
+                            model.particle_substrate,
+                            model.particle_fluid_phase,
+                            model.fluid_rest_density,
+                            model.fluid_smoothing_radius,
+                            fluid_density,
+                            epsilon,
+                        ],
+                        outputs=[fluid_lambdas],
+                        device=model.device,
+                    )
+
+                    wp.launch(
+                        kernel=compute_fluid_position_delta,
+                        dim=model.particle_count,
+                        inputs=[
+                            model.particle_grid.id,
+                            state_out.particle_q,
+                            model.particle_mass,
+                            model.particle_substrate,
+                            model.particle_fluid_phase,
+                            model.fluid_rest_density,
+                            model.fluid_smoothing_radius,
+                            fluid_lambdas,
+                            k_corr,
+                            dq_factor,
+                            n_corr,
+                        ],
+                        outputs=[fluid_deltas],
+                        device=model.device,
+                    )
+
+                    new_q = wp.empty_like(state_out.particle_q)
+                    new_qd = wp.empty_like(state_out.particle_qd)
+                    wp.launch(
+                        kernel=srxpbd_apply_particle_deltas,
+                        dim=model.particle_count,
+                        inputs=[
+                            self.particle_q_rest,
+                            state_out.particle_q,
+                            state_out.particle_qd,
+                            model.particle_flags,
+                            model.particle_mass,
+                            fluid_deltas,
+                            dt,
+                            model.particle_max_velocity,
+                        ],
+                        outputs=[new_q, new_qd],
+                        device=model.device,
+                    )
+                    state_out.particle_q = new_q
+                    state_out.particle_qd = new_qd
+                    self.update_lattice_world_positions(state_out)
 
             # Joints
             if model.joint_count and body_deltas is not None:

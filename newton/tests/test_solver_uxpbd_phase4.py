@@ -288,5 +288,61 @@ add_function_test(
 )
 
 
+def test_uxpbd_fluid_block_settles(test, device):
+    """A 3x3x3 fluid block falls under gravity but doesn't collapse to a point.
+
+    Without PBF: particles fall to a single location.
+    With PBF: incompressibility keeps inter-particle distances > ~radius.
+    """
+    builder = newton.ModelBuilder(up_axis="Z")
+    builder.add_ground_plane()
+    builder.add_fluid_grid(
+        pos=wp.vec3(0.0, 0.0, 0.2),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0, 0.0, 0.0),
+        dim_x=3,
+        dim_y=3,
+        dim_z=3,
+        cell_x=0.012,
+        cell_y=0.012,
+        cell_z=0.012,
+        particle_radius=0.006,
+        rest_density=1000.0,
+        viscosity=0.0,
+        cohesion=0.0,
+    )
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverUXPBD(model, iterations=2, fluid_iterations=4)
+    state_0 = model.state()
+    state_1 = model.state()
+    contacts = model.contacts()
+    dt = 0.001
+
+    for _ in range(200):
+        state_0.clear_forces()
+        model.collide(state_0, contacts)
+        solver.step(state_0, state_1, None, contacts, dt)
+        state_0, state_1 = state_1, state_0
+
+    pos = state_0.particle_q.numpy()
+    z_min = pos[:, 2].min()
+    bottom = pos[pos[:, 2] <= z_min + 0.005]
+    if len(bottom) >= 2:
+        d_min = np.inf
+        for i in range(len(bottom)):
+            for j in range(i + 1, len(bottom)):
+                d = np.linalg.norm(bottom[i] - bottom[j])
+                d_min = min(d_min, d)
+        test.assertGreater(d_min, 0.005, f"fluid clumped: min distance {d_min}")
+
+
+add_function_test(
+    TestSolverUXPBDPhase4,
+    "test_uxpbd_fluid_block_settles",
+    test_uxpbd_fluid_block_settles,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()
