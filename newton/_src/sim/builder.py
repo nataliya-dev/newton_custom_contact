@@ -10260,6 +10260,13 @@ class ModelBuilder:
                 p_to_l[p_i] = lat_i
             m.particle_to_lattice = wp.array(p_to_l, dtype=wp.int32, device=device)
 
+            # Tag particle substrate. Default = 1 (SM-rigid: particle is in a particle_group).
+            # Overwrite to 0 for any particle that is a lattice host's slot.
+            substrate_np = np.full(n_particles, 1, dtype=np.uint8)
+            for _lat_i, p_i in enumerate(self.lattice_particle_index):
+                substrate_np[p_i] = 0
+            m.particle_substrate = wp.array(substrate_np, dtype=wp.uint8, device=device)
+
             # hash-grid for particle interactions
             if self.particle_count > 1 and m.particle_max_radius > 0.0:
                 m.particle_grid = wp.HashGrid(128, 128, 128)

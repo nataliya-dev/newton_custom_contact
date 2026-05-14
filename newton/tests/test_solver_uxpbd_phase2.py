@@ -6,6 +6,9 @@
 import os
 import unittest
 
+import numpy as np
+import warp as wp
+
 import newton
 import newton.examples
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -39,6 +42,36 @@ add_function_test(
     TestSolverUXPBDPhase2,
     "test_uxpbd_link_lattice_csr_offsets",
     test_uxpbd_link_lattice_csr_offsets,
+    devices=get_test_devices(),
+)
+
+
+def test_uxpbd_particle_substrate_tagging(test, device):
+    """particle_substrate is 0 for lattice particles, 1 for shape-matched rigid."""
+    builder = newton.ModelBuilder()
+    link = builder.add_body(label="link")
+    builder.add_lattice(link=link, morphit_json=os.path.join(_ASSET_DIR, "tiny_lattice.json"), total_mass=1.0)
+
+    # Add a free SM-rigid group via add_particle_volume.
+    builder.add_particle_volume(
+        volume_data={"centers": [[1.0, 0.0, 0.0], [1.0, 0.1, 0.0]], "radii": [0.05, 0.05]},
+        total_mass=0.5,
+        pos=wp.vec3(0.0, 0.0, 0.0),
+    )
+
+    model = builder.finalize(device=device)
+
+    substrate = model.particle_substrate.numpy()
+    # First 5 particles are lattice (substrate=0).
+    np.testing.assert_array_equal(substrate[:5], [0, 0, 0, 0, 0])
+    # Next 2 particles are SM-rigid (substrate=1).
+    np.testing.assert_array_equal(substrate[5:7], [1, 1])
+
+
+add_function_test(
+    TestSolverUXPBDPhase2,
+    "test_uxpbd_particle_substrate_tagging",
+    test_uxpbd_particle_substrate_tagging,
     devices=get_test_devices(),
 )
 

@@ -212,6 +212,8 @@ class Model:
         # Reverse index: particle slot -> lattice sphere index, or -1 if not a lattice particle.
         self.particle_to_lattice: wp.array[wp.int32] = wp.empty(0, dtype=wp.int32, device=device)
         """Reverse map from particle index to lattice sphere index, or -1 if not a lattice particle. Shape [particle_count]."""
+        self.particle_substrate: wp.array[wp.uint8] = wp.empty(0, dtype=wp.uint8, device=device)
+        """Per-particle substrate tag (0=lattice, 1=SM-rigid, 2=soft, 3=fluid), shape [particle_count]."""
 
         # v2 CSLC seams. Present but unused in Phase 1.
         self.lattice_delta: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
