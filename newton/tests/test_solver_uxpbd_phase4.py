@@ -77,5 +77,68 @@ add_function_test(
 )
 
 
+def test_uxpbd_pbf_density_isolated_particle(test, device):
+    """A fluid particle far from any neighbor has density = self-contribution.
+
+    Self-contribution at r=0 is W(0, h) = 315/(64*pi*h^9) * h^6 = 315/(64*pi*h^3).
+    For h=0.01, this should be ~1.79e7 * mass.
+    """
+    from newton._src.solvers.uxpbd.fluid import compute_fluid_density  # noqa: PLC0415
+
+    builder = newton.ModelBuilder()
+    builder.add_fluid_grid(
+        pos=wp.vec3(0.0, 0.0, 0.0),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0, 0.0, 0.0),
+        dim_x=1,
+        dim_y=1,
+        dim_z=1,
+        cell_x=1.0,
+        cell_y=1.0,
+        cell_z=1.0,
+        particle_radius=0.005,
+        rest_density=1000.0,
+    )
+    model = builder.finalize(device=device)
+    state = model.state()
+
+    # particle_grid is None when particle_count <= 1; build one manually.
+    if model.particle_grid is None:
+        model.particle_grid = wp.HashGrid(128, 128, 128)
+    model.particle_grid.build(state.particle_q, model.particle_max_radius * 4.0)
+    density_out = wp.zeros(model.particle_count, dtype=wp.float32, device=device)
+    h = 2.0 * 0.005
+    mass = 1000.0 * 1.0 * 1.0 * 1.0  # cell volume * rest density
+    expected_density = mass * (315.0 / (64.0 * np.pi * h**3))
+
+    wp.launch(
+        kernel=compute_fluid_density,
+        dim=model.particle_count,
+        inputs=[
+            model.particle_grid.id,
+            state.particle_q,
+            model.particle_mass,
+            model.particle_substrate,
+            model.particle_fluid_phase,
+            model.fluid_smoothing_radius,
+            model.fluid_solid_coupling_s,
+        ],
+        outputs=[density_out],
+        device=device,
+    )
+    density = float(density_out.numpy()[0])
+    test.assertAlmostEqual(
+        density, expected_density, delta=0.01 * expected_density, msg=f"density {density}, expected {expected_density}"
+    )
+
+
+add_function_test(
+    TestSolverUXPBDPhase4,
+    "test_uxpbd_pbf_density_isolated_particle",
+    test_uxpbd_pbf_density_isolated_particle,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()
