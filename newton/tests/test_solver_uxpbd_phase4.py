@@ -397,5 +397,55 @@ add_function_test(
 )
 
 
+def test_uxpbd_cohesion_pulls_neighbors_together(test, device):
+    """Two adjacent fluid particles attract via cohesion."""
+    from newton._src.solvers.uxpbd.fluid import apply_cohesion_forces  # noqa: PLC0415
+
+    builder = newton.ModelBuilder()
+    builder.add_fluid_particles(
+        positions=[[0.0, 0.0, 0.0], [0.008, 0.0, 0.0]],
+        velocities=[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        particle_radius=0.005,
+        rest_density=1000.0,
+        cohesion=10.0,
+    )
+    model = builder.finalize(device=device)
+    state = model.state()
+    if model.particle_grid is None:
+        model.particle_grid = wp.HashGrid(128, 128, 128)
+
+    n = model.particle_count
+    forces = wp.zeros(n, dtype=wp.vec3, device=device)
+
+    model.particle_grid.build(state.particle_q, model.particle_max_radius * 4.0)
+    wp.launch(
+        kernel=apply_cohesion_forces,
+        dim=n,
+        inputs=[
+            model.particle_grid.id,
+            state.particle_q,
+            model.particle_mass,
+            model.particle_substrate,
+            model.particle_fluid_phase,
+            model.fluid_smoothing_radius,
+            model.fluid_cohesion,
+        ],
+        outputs=[forces],
+        device=device,
+    )
+
+    f = forces.numpy()
+    test.assertGreater(f[0, 0], 0.0, f"p0 not attracted: {f[0]}")
+    test.assertLess(f[1, 0], 0.0, f"p1 not attracted: {f[1]}")
+
+
+add_function_test(
+    TestSolverUXPBDPhase4,
+    "test_uxpbd_cohesion_pulls_neighbors_together",
+    test_uxpbd_cohesion_pulls_neighbors_together,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()

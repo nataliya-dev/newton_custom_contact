@@ -27,6 +27,7 @@ from ..xpbd.kernels import (
     solve_body_joints,
 )
 from .fluid import (
+    apply_cohesion_forces,
     apply_xsph_viscosity,
     compute_fluid_density,
     compute_fluid_lambda,
@@ -157,6 +158,30 @@ class SolverUXPBD(SolverBase):
 
         if control is None:
             control = model.control(clone_variables=False)
+
+        # Akinci cohesion: accumulate cohesion forces into state_in.particle_f
+        # before the predict step so the integrator sees them as external forces.
+        if model.fluid_phase_count > 0 and model.particle_count > 0:
+            with wp.ScopedDevice(model.device):
+                model.particle_grid.build(
+                    state_in.particle_q,
+                    model.particle_max_radius * 4.0,
+                )
+            wp.launch(
+                kernel=apply_cohesion_forces,
+                dim=model.particle_count,
+                inputs=[
+                    model.particle_grid.id,
+                    state_in.particle_q,
+                    model.particle_mass,
+                    model.particle_substrate,
+                    model.particle_fluid_phase,
+                    model.fluid_smoothing_radius,
+                    model.fluid_cohesion,
+                ],
+                outputs=[state_in.particle_f],
+                device=model.device,
+            )
 
         # 1. Predict body positions: integrate_bodies with joint feedforward.
         if model.body_count:

@@ -360,3 +360,98 @@ def apply_xsph_viscosity(
             delta_v += (particle_v[j] - v_i) * (w / rho_j)
 
     new_v[i] = v_i + c * delta_v
+
+
+@wp.func
+def akinci_cohesion_kernel(r_len: wp.float32, h: wp.float32) -> wp.float32:
+    """Akinci 2013 cohesion support function C(r, h).
+
+    C(r, h) = 32 / (pi * h^9) * (h - r)^3 * r^3,              h/2 < r < h
+              32 / (pi * h^9) * (2*(h-r)^3*r^3 - h^6/64),     0  < r <= h/2
+              0,                                                 otherwise
+
+    Reference: Akinci et al. 2013, "Versatile Surface Tension and Adhesion for
+    SPH Fluids", eq. 2.
+
+    Args:
+        r_len: Distance between particles |r| [m].
+        h: Smoothing radius [m].
+
+    Returns:
+        Kernel value [1/m^6] (unnormalized cohesion weight).
+    """
+    if r_len <= wp.float32(0.0) or r_len >= h:
+        return wp.float32(0.0)
+    coeff = wp.float32(32.0) / (PI * wp.pow(h, wp.float32(9.0)))
+    base = wp.pow(h - r_len, wp.float32(3.0)) * wp.pow(r_len, wp.float32(3.0))
+    if wp.float32(2.0) * r_len > h:
+        return coeff * base
+    h6 = wp.pow(h, wp.float32(6.0))
+    return coeff * (wp.float32(2.0) * base - h6 / wp.float32(64.0))
+
+
+@wp.kernel
+def apply_cohesion_forces(
+    grid: wp.uint64,
+    particle_x: wp.array[wp.vec3],
+    particle_mass: wp.array[wp.float32],
+    particle_substrate: wp.array[wp.uint8],
+    particle_fluid_phase: wp.array[wp.int32],
+    fluid_smoothing_radius: wp.array[wp.float32],
+    fluid_cohesion: wp.array[wp.float32],
+    # output
+    particle_f: wp.array[wp.vec3],
+):
+    """Akinci 2013 cohesion forces between same-phase fluid neighbors.
+
+    f_ij = -kc * m_i * m_j * C(|r|, h) * (r / |r|)
+
+    Accumulates into particle_f via atomic_add (composes with other
+    external-force sources).
+
+    Reference: Akinci et al. 2013, "Versatile Surface Tension and Adhesion for
+    SPH Fluids", eq. 1.
+
+    Args:
+        grid: Warp hash grid id built from particle positions.
+        particle_x: Particle positions [m], shape [particle_count].
+        particle_mass: Particle masses [kg], shape [particle_count].
+        particle_substrate: Substrate type per particle; value 3 denotes fluid.
+        particle_fluid_phase: Fluid phase index per particle; -1 for non-fluid.
+        fluid_smoothing_radius: Smoothing radius h per fluid phase [m].
+        fluid_cohesion: Cohesion coefficient kc per fluid phase [N/kg^2].
+        particle_f: Output force accumulator per particle [N], shape [particle_count].
+    """
+    i = wp.tid()
+    if particle_substrate[i] != wp.uint8(3):
+        return
+    phase = particle_fluid_phase[i]
+    if phase < 0:
+        return
+
+    h = fluid_smoothing_radius[phase]
+    kc = fluid_cohesion[phase]
+    if kc <= wp.float32(0.0):
+        return
+
+    x_i = particle_x[i]
+    m_i = particle_mass[i]
+
+    query = wp.hash_grid_query(grid, x_i, h)
+    j = int(0)
+    while wp.hash_grid_query_next(query, j):
+        if j == i:
+            continue
+        if particle_substrate[j] != wp.uint8(3) or particle_fluid_phase[j] != phase:
+            continue
+        r = x_i - particle_x[j]
+        r_len = wp.length(r)
+        if r_len < wp.float32(1.0e-9):
+            continue
+        c_val = akinci_cohesion_kernel(r_len, h)
+        if c_val <= wp.float32(0.0):
+            continue
+        m_j = particle_mass[j]
+        f_dir = -r / r_len
+        f_mag = kc * m_i * m_j * c_val
+        wp.atomic_add(particle_f, i, f_mag * f_dir)
