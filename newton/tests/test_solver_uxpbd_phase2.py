@@ -654,5 +654,72 @@ add_function_test(
 )
 
 
+def test_pbdr_t7_rod_pushing_box(test, device):
+    """PBD-R Test 7: rod pushing a box, F=0.1 N, mu=0.4.
+
+    Validates the rod stays in contact with the box throughout the 10 s
+    simulation (gap < 5 cm). Full Lynch-Mason reference deferred.
+    """
+    if not device.is_cuda:
+        test.skipTest("SRXPBD tile-reduce broadcast not supported on CPU (Warp 1.14.0).")
+
+    builder = newton.ModelBuilder(up_axis="Z")
+    builder.add_ground_plane()
+    box_group = _build_pbdr_box(builder, pos=(0.5, 0.0, 0.11))
+
+    # 1D rod: 10 spheres along x.
+    rod_centers = [[-0.05 - 0.02 * i, 0.0, 0.11] for i in range(10)]
+    rod_radii = [0.01] * 10
+    rod_group = builder.add_particle_volume(
+        volume_data={"centers": rod_centers, "radii": rod_radii},
+        total_mass=2.0,
+    )
+    model = builder.finalize(device=device)
+    model.particle_mu = 0.4
+    model.soft_contact_mu = 0.4
+
+    F = 0.1
+    solver = newton.solvers.SolverUXPBD(model, iterations=10)
+    state_0 = model.state()
+    state_1 = model.state()
+    contacts = model.contacts()
+    dt = 0.001
+    n_steps = 10000
+
+    rod_idx = model.particle_groups[rod_group]
+    if hasattr(rod_idx, "numpy"):
+        rod_idx = rod_idx.numpy()
+    rod_idx = np.asarray(list(rod_idx), dtype=np.int32)
+    box_idx_arr = model.particle_groups[box_group]
+    if hasattr(box_idx_arr, "numpy"):
+        box_idx_arr = box_idx_arr.numpy()
+    box_idx_arr = np.asarray(list(box_idx_arr), dtype=np.int32)
+
+    f_per_p = F / rod_idx.size
+    force_np = np.zeros((model.particle_count, 3), dtype=np.float32)
+    force_np[rod_idx, 0] = f_per_p
+
+    for _ in range(n_steps):
+        state_0.clear_forces()
+        state_0.particle_f.assign(force_np)
+        model.collide(state_0, contacts)
+        solver.step(state_0, state_1, None, contacts, dt)
+        state_0, state_1 = state_1, state_0
+
+    final = state_0.particle_q.numpy()
+    rod_tip_x = float(np.max(final[rod_idx, 0]))
+    box_left_edge_x = float(np.min(final[box_idx_arr, 0]))
+    gap = abs(box_left_edge_x - rod_tip_x)
+    test.assertLess(gap, 0.05, f"rod separated from box; gap={gap:.4f}")
+
+
+add_function_test(
+    TestSolverUXPBDPhase2,
+    "test_pbdr_t7_rod_pushing_box",
+    test_pbdr_t7_rod_pushing_box,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()
