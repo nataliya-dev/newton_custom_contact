@@ -21,6 +21,7 @@ from ..xpbd.kernels import (
 )
 from .kernels import solve_lattice_shape_contacts
 from .kernels import update_lattice_world_positions as update_lattice_world_positions_kernel
+from .shape_match import build_shape_match_cache
 
 
 class SolverUXPBD(SolverBase):
@@ -78,6 +79,23 @@ class SolverUXPBD(SolverBase):
         self.joint_angular_relaxation = joint_angular_relaxation
         self.joint_linear_relaxation = joint_linear_relaxation
         self._init_kinematic_state()
+
+        cache = build_shape_match_cache(model)
+        self._num_dynamic_groups: int = cache["num_dynamic_groups"]
+        self._dynamic_group_ids = cache["dynamic_group_ids"]
+        self._group_particle_start = cache["group_particle_start"]
+        self._group_particle_count = cache["group_particle_count"]
+        self._group_particles_flat = cache["group_particles_flat"]
+        self.total_group_mass = cache["total_group_mass"]
+        self._shape_match_block_dim: int = cache["block_dim"]
+
+        # Per-step rest pose snapshot. Phase 2 shape matching needs the initial
+        # particle positions (at solver-create time) to compare against. Phase 3+
+        # may need to refresh this on notify_model_changed.
+        if model.particle_count > 0:
+            self.particle_q_rest = wp.clone(model.particle_q)
+        else:
+            self.particle_q_rest = wp.empty(0, dtype=wp.vec3, device=model.device)
 
     def step(
         self,

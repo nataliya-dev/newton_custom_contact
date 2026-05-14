@@ -76,5 +76,37 @@ add_function_test(
 )
 
 
+def test_uxpbd_solver_caches_shape_match_data(test, device):
+    """SolverUXPBD precomputes shape-matching group data at init."""
+    builder = newton.ModelBuilder()
+    # Two free SM-rigid groups.
+    builder.add_particle_volume(
+        volume_data={"centers": [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]], "radii": [0.05, 0.05]},
+        total_mass=1.0,
+    )
+    builder.add_particle_volume(
+        volume_data={"centers": [[2.0, 0.0, 0.0], [2.1, 0.0, 0.0], [2.2, 0.0, 0.0]], "radii": [0.05, 0.05, 0.05]},
+        total_mass=2.0,
+    )
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverUXPBD(model)
+
+    test.assertEqual(solver._num_dynamic_groups, 2)
+    counts = solver._group_particle_count.numpy()
+    test.assertEqual(int(counts[0]), 2)
+    test.assertEqual(int(counts[1]), 3)
+    masses = solver.total_group_mass.numpy()
+    test.assertAlmostEqual(float(masses[0]), 1.0, places=4)
+    test.assertAlmostEqual(float(masses[1]), 2.0, places=4)
+
+
+add_function_test(
+    TestSolverUXPBDPhase2,
+    "test_uxpbd_solver_caches_shape_match_data",
+    test_uxpbd_solver_caches_shape_match_data,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()
