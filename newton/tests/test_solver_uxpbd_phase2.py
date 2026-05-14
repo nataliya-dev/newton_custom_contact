@@ -270,5 +270,198 @@ add_function_test(
 )
 
 
+def _build_pbdr_box(builder, pos=(0.0, 0.0, 0.11)):
+    """Build the PBD-R reference box: 4x4x4 = 64 spheres, m=4 kg, edge=0.22 m."""
+    half_extent = 0.11
+    sphere_r = 0.025
+    coords = np.linspace(-half_extent + sphere_r, half_extent - sphere_r, 4)
+    xs, ys, zs = np.meshgrid(coords, coords, coords, indexing="ij")
+    centers = np.stack([xs.flatten(), ys.flatten(), zs.flatten()], axis=1)
+    radii = np.full(centers.shape[0], sphere_r)
+    return builder.add_particle_volume(
+        volume_data={"centers": centers.tolist(), "radii": radii.tolist()},
+        total_mass=4.0,
+        pos=wp.vec3(*pos),
+    )
+
+
+def test_pbdr_t1_pushed_box(test, device):
+    """PBD-R Test 1: F=17 N horizontal at COM, mu=0.4 ground. Analytical
+    x(t) = 0.5 * (F - mu*M*g)/M * t^2.
+    """
+    if not device.is_cuda:
+        test.skipTest("SRXPBD tile-reduce broadcast not supported on CPU (Warp 1.14.0).")
+
+    builder = newton.ModelBuilder(up_axis="Z")
+    builder.add_ground_plane()
+    _build_pbdr_box(builder)
+    model = builder.finalize(device=device)
+    model.particle_mu = 0.4
+    model.soft_contact_mu = 0.4
+
+    F = 17.0
+    M = 4.0
+    mu = 0.4
+    g = 9.81
+    a = (F - mu * M * g) / M
+
+    solver = newton.solvers.SolverUXPBD(model, iterations=10)
+    state_0 = model.state()
+    state_1 = model.state()
+    contacts = model.contacts()
+    dt = 0.001
+    n_steps = 10000
+
+    force_per_particle = np.zeros((model.particle_count, 3), dtype=np.float32)
+    force_per_particle[:, 0] = F / model.particle_count
+
+    for _ in range(n_steps):
+        state_0.clear_forces()
+        state_0.particle_f.assign(force_per_particle)
+        model.collide(state_0, contacts)
+        solver.step(state_0, state_1, None, contacts, dt)
+        state_0, state_1 = state_1, state_0
+
+    final_pos = state_0.particle_q.numpy()
+    com_x = float(np.mean(final_pos[:, 0]))
+    expected = 0.5 * a * (n_steps * dt) ** 2
+    rel_err = abs(com_x - expected) / abs(expected)
+    test.assertLess(rel_err, 0.05, f"Test 1 final x={com_x:.4f}, expected={expected:.4f}, err={rel_err:.4f}")
+
+
+add_function_test(
+    TestSolverUXPBDPhase2,
+    "test_pbdr_t1_pushed_box",
+    test_pbdr_t1_pushed_box,
+    devices=get_test_devices(),
+)
+
+
+def test_pbdr_t2_box_torque(test, device):
+    """PBD-R Test 2: tau=0.01 N*m about z, mu=0, zero gravity. Analytical
+    theta(t) = 0.5 * (tau/lambda) * t^2, lambda_zz = (2/3)*M*h^2.
+    """
+    if not device.is_cuda:
+        test.skipTest("SRXPBD tile-reduce broadcast not supported on CPU (Warp 1.14.0).")
+
+    builder = newton.ModelBuilder(up_axis="Z")
+    _build_pbdr_box(builder, pos=(0.0, 0.0, 5.0))
+    model = builder.finalize(device=device)
+    grav_np = model.gravity.numpy() * 0.0
+    model.gravity.assign(grav_np)
+    model.particle_mu = 0.0
+
+    M = 4.0
+    h = 0.11
+    lam = (2.0 / 3.0) * M * h * h
+    tau = 0.01
+    alpha = tau / lam
+
+    solver = newton.solvers.SolverUXPBD(model, iterations=10)
+    state_0 = model.state()
+    state_1 = model.state()
+
+    # Build a per-particle tangential-force pattern that produces net torque = tau.
+    initial_pos = state_0.particle_q.numpy()
+    com = initial_pos.mean(axis=0)
+    r = initial_pos - com
+    tangent = np.stack([-r[:, 1], r[:, 0], np.zeros_like(r[:, 0])], axis=1)
+    tangent_norm = np.linalg.norm(tangent, axis=1, keepdims=True)
+    tangent_norm = np.where(tangent_norm > 1e-9, tangent_norm, 1.0)
+    tangent = tangent / tangent_norm
+    r_xy = np.linalg.norm(r[:, :2], axis=1)
+    sum_r_xy = float(np.sum(r_xy))
+    f_mag = tau / sum_r_xy
+    force_per_particle = (tangent * f_mag).astype(np.float32)
+
+    dt = 0.001
+    n_steps = 10000
+    for _ in range(n_steps):
+        state_0.clear_forces()
+        state_0.particle_f.assign(force_per_particle)
+        solver.step(state_0, state_1, None, None, dt)
+        state_0, state_1 = state_1, state_0
+
+    final_pos = state_0.particle_q.numpy()
+    com_f = final_pos.mean(axis=0)
+    p_init = initial_pos[0] - com
+    p_final = final_pos[0] - com_f
+    theta_init = np.arctan2(p_init[1], p_init[0])
+    theta_final = np.arctan2(p_final[1], p_final[0])
+    theta = theta_final - theta_init
+    expected = 0.5 * alpha * (n_steps * dt) ** 2
+    # Unwrap to within pi of the expected.
+    while theta < expected - np.pi:
+        theta += 2.0 * np.pi
+    while theta > expected + np.pi:
+        theta -= 2.0 * np.pi
+    rel_err = abs(theta - expected) / abs(expected)
+    test.assertLess(rel_err, 0.05, f"Test 2 theta={theta:.4f}, expected={expected:.4f}, err={rel_err:.4f}")
+
+
+add_function_test(
+    TestSolverUXPBDPhase2,
+    "test_pbdr_t2_box_torque",
+    test_pbdr_t2_box_torque,
+    devices=get_test_devices(),
+)
+
+
+def test_pbdr_t3_box_on_slope(test, device):
+    """PBD-R Test 3: box on theta=pi/8 slope, mu=0.4. Analytical
+    x(t) = 0.5 * (g sin theta - mu g cos theta) * t^2.
+    """
+    if not device.is_cuda:
+        test.skipTest("SRXPBD tile-reduce broadcast not supported on CPU (Warp 1.14.0).")
+
+    builder = newton.ModelBuilder(up_axis="Z")
+    slope_angle = np.pi / 8.0
+    rot = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), slope_angle)
+    builder.add_shape_plane(
+        body=-1,
+        xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.0), q=rot),
+        width=10.0,
+        length=10.0,
+    )
+    _build_pbdr_box(builder, pos=(0.0, 0.0, 0.20))
+    model = builder.finalize(device=device)
+    model.particle_mu = 0.4
+    model.soft_contact_mu = 0.4
+
+    g = 9.81
+    mu = 0.4
+    a = g * np.sin(slope_angle) - mu * g * np.cos(slope_angle)
+
+    solver = newton.solvers.SolverUXPBD(model, iterations=10)
+    state_0 = model.state()
+    state_1 = model.state()
+    contacts = model.contacts()
+    dt = 0.001
+    n_steps = 10000
+
+    initial_com = state_0.particle_q.numpy().mean(axis=0)
+    for _ in range(n_steps):
+        state_0.clear_forces()
+        model.collide(state_0, contacts)
+        solver.step(state_0, state_1, None, contacts, dt)
+        state_0, state_1 = state_1, state_0
+
+    final_com = state_0.particle_q.numpy().mean(axis=0)
+    slope_dir = np.array([np.sin(slope_angle), 0.0, -np.cos(slope_angle)])
+    delta = final_com - initial_com
+    x_slide = float(np.dot(delta, slope_dir))
+    expected = 0.5 * a * (n_steps * dt) ** 2
+    rel_err = abs(x_slide - expected) / abs(expected)
+    test.assertLess(rel_err, 0.05, f"Test 3 slide={x_slide:.4f}, expected={expected:.4f}, err={rel_err:.4f}")
+
+
+add_function_test(
+    TestSolverUXPBDPhase2,
+    "test_pbdr_t3_box_on_slope",
+    test_pbdr_t3_box_on_slope,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()
