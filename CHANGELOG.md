@@ -46,6 +46,7 @@
 - Add per-mesh `color` override to `ViewerBase.log_mesh()` for tinting individual meshes without authoring per-vertex colors
 - Add per-mesh `roughness` and `metallic` PBR overrides to `ViewerBase.log_mesh()`
 - Add `SolverUXPBD` Phase 1: articulated rigid bodies with a MorphIt-generated kinematic lattice for particle-based contact against analytical static shapes. Reserves architectural seams for CSLC v2.
+- Add `SolverUXPBD` Phase 2: free shape-matched rigid groups (PBD-R momentum-correct shape matching), cross-substrate particle-shape and particle-particle contact, opt-in UPPFRTA mass-scaling shock propagation (`shock_propagation_k`), all seven PBD-R analytical benchmark tests (box and bunny push/torque/slope plus rod-pushing-box), and a Franka friction-closure pick-and-place demo. Tile-reduce kernels require CUDA on Warp 1.14.
 
 ### Changed
 
