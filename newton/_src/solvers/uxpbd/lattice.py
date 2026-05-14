@@ -169,3 +169,72 @@ def add_lattice_to_builder(
         builder.lattice_damping.append(float(damping))
 
     return lattice_start
+
+
+def _uniform_box_lattice(n: int, half_extent: float = 0.1) -> dict[str, np.ndarray]:
+    """Build an ``n x n x n`` uniform sphere packing inscribed in a cube of
+    half-extent ``half_extent``.
+
+    Returns the same dict shape as :func:`load_morphit_lattice`.
+
+    Args:
+        n: Spheres per axis (n >= 1).
+        half_extent: Half-extent of the inscribed cube [m]. Defaults to 0.1.
+
+    Returns:
+        A dict with keys ``centers`` [N, 3] float32, ``radii`` [N] float32,
+        ``normals`` [N, 3] float32 (outward from centroid), ``is_surface``
+        [N] uint8 (1 for boundary spheres, 0 for interior).
+    """
+    if n < 1:
+        raise ValueError("fallback_uniform_n must be >= 1")
+    spacing = (2.0 * half_extent) / n
+    sphere_r = spacing * 0.5
+    coords = np.linspace(-half_extent + sphere_r, half_extent - sphere_r, n)
+    xs, ys, zs = np.meshgrid(coords, coords, coords, indexing="ij")
+    centers = np.stack([xs.flatten(), ys.flatten(), zs.flatten()], axis=1).astype(np.float32)
+    radii = np.full(centers.shape[0], sphere_r, dtype=np.float32)
+    centroid = centers.mean(axis=0, keepdims=True)
+    offsets = centers - centroid
+    lens = np.linalg.norm(offsets, axis=1, keepdims=True)
+    lens = np.where(lens > 1e-12, lens, 1.0)
+    normals = (offsets / lens).astype(np.float32)
+    boundary = (np.abs(np.abs(centers) - (half_extent - sphere_r)) < 1.0e-6).any(axis=1)
+    is_surface = boundary.astype(np.uint8)
+    return {"centers": centers, "radii": radii, "normals": normals, "is_surface": is_surface}
+
+
+def add_lattice_to_all_links_in_builder(
+    builder,
+    morphit_json_dir: str | Path,
+    *,
+    fallback_uniform_n: int | None = 4,
+    **lattice_kwargs,
+) -> None:
+    """Attach a lattice to every body in the builder.
+
+    For each body, look up ``<morphit_json_dir>/<body_label>.json``. If the
+    file exists, attach a MorphIt lattice from it. Otherwise, if
+    ``fallback_uniform_n`` is not ``None``, attach a uniform ``n^3`` lattice
+    inscribed in a unit cube; if ``fallback_uniform_n`` is ``None``, skip
+    that body.
+
+    Args:
+        builder: The :class:`~newton.ModelBuilder` to populate.
+        morphit_json_dir: Directory containing per-link MorphIt JSON files
+            named ``<body_label>.json``.
+        fallback_uniform_n: Sphere count per axis for the fallback packing,
+            or ``None`` to skip bodies with no JSON.
+        **lattice_kwargs: Forwarded to :func:`add_lattice_to_builder` per
+            body (e.g., ``total_mass=...``, ``k_anchor=...``).
+    """
+    dir_path = Path(morphit_json_dir)
+    body_count = len(builder.body_label)
+    for link in range(body_count):
+        label = builder.body_label[link]
+        candidate = dir_path / f"{label}.json"
+        if candidate.is_file():
+            add_lattice_to_builder(builder, link=link, morphit_json=str(candidate), **lattice_kwargs)
+        elif fallback_uniform_n is not None:
+            data = _uniform_box_lattice(fallback_uniform_n)
+            add_lattice_to_builder(builder, link=link, morphit_json=data, **lattice_kwargs)

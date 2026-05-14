@@ -7584,6 +7584,48 @@ class ModelBuilder:
             damping=damping,
         )
 
+    def add_lattice_to_all_links(
+        self,
+        morphit_json_dir: str,
+        *,
+        fallback_uniform_n: int | None = 4,
+        total_mass: float = 0.0,
+        k_anchor: float = 1.0e3,
+        k_lateral: float = 5.0e2,
+        k_bulk: float = 1.0e5,
+        damping: float = 2.0,
+    ) -> None:
+        """Attach a MorphIt lattice to every articulated link.
+
+        For each link, look up ``<morphit_json_dir>/<link_label>.json``. If
+        found, use that MorphIt sphere packing. Otherwise, fall back to a
+        uniform ``fallback_uniform_n^3`` packing inscribed in a unit cube. Pass
+        ``fallback_uniform_n=None`` to skip links missing a JSON file.
+
+        Args:
+            morphit_json_dir: Directory containing one JSON per link, named
+                after the link's label (e.g., ``link_0.json``).
+            fallback_uniform_n: Sphere count per axis for fallback packing, or
+                ``None`` to skip links missing a JSON.
+            total_mass: Per-link total lattice mass [kg]. Defaults to 0.0.
+            k_anchor: v2 CSLC anchor stiffness [N/m]. Stored but unused in Phase 1.
+            k_lateral: v2 CSLC lateral coupling stiffness [N/m].
+            k_bulk: v2 CSLC bulk material stiffness [N/m].
+            damping: v2 CSLC Hunt-Crossley damping [s/m].
+        """
+        from ..solvers.uxpbd.lattice import add_lattice_to_all_links_in_builder  # noqa: PLC0415
+
+        add_lattice_to_all_links_in_builder(
+            self,
+            morphit_json_dir=morphit_json_dir,
+            fallback_uniform_n=fallback_uniform_n,
+            total_mass=total_mass,
+            k_anchor=k_anchor,
+            k_lateral=k_lateral,
+            k_bulk=k_bulk,
+            damping=damping,
+        )
+
     def add_spring(
         self,
         i: int,

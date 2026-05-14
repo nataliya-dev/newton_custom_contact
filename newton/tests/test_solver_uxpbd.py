@@ -418,5 +418,41 @@ add_function_test(
 )
 
 
+def test_uxpbd_add_lattice_to_all_links_with_fallback(test, device):
+    """add_lattice_to_all_links uses JSON when present, falls back to uniform packing otherwise."""
+    import shutil  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    tmp = tempfile.mkdtemp(prefix="uxpbd_test_")
+    try:
+        shutil.copy(
+            os.path.join(_ASSET_DIR, "tiny_lattice.json"),
+            os.path.join(tmp, "link_a.json"),
+        )
+
+        builder = newton.ModelBuilder()
+        builder.add_body(label="link_a")
+        builder.add_body(label="link_b")
+
+        builder.add_lattice_to_all_links(
+            morphit_json_dir=tmp,
+            fallback_uniform_n=2,  # 2x2x2 = 8 spheres
+        )
+
+        model = builder.finalize(device=device)
+        # 5 spheres from JSON + 8 from fallback = 13.
+        test.assertEqual(model.lattice_sphere_count, 13)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+add_function_test(
+    TestSolverUXPBD,
+    "test_uxpbd_add_lattice_to_all_links_with_fallback",
+    test_uxpbd_add_lattice_to_all_links_with_fallback,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()
