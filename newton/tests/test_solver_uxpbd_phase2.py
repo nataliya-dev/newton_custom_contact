@@ -463,5 +463,196 @@ add_function_test(
 )
 
 
+def _build_pbdr_bunny(builder, pos=(0.0, 0.0, 0.15)):
+    """Build the PBD-R reference bunny (Stanford Bunny, m=2.18 kg)."""
+    return builder.add_particle_volume(
+        volume_data="assets/bunny-lowpoly/morphit_results.json",
+        total_mass=2.18,
+        pos=wp.vec3(*pos),
+    )
+
+
+def _compute_principal_inertia_zz(particle_q_np, particle_mass_np, group_indices):
+    """Compute the principal moment of inertia about z for a particle group."""
+    p = particle_q_np[group_indices]
+    m = particle_mass_np[group_indices]
+    M = m.sum()
+    com = (m[:, None] * p).sum(axis=0) / M
+    r = p - com
+    return float(np.sum(m * (r[:, 0] ** 2 + r[:, 1] ** 2)))
+
+
+def test_pbdr_t4_pushed_bunny(test, device):
+    """PBD-R Test 4: F=10 N horizontal at COM, mu=0.4 ground. Bunny shape."""
+    if not device.is_cuda:
+        test.skipTest("SRXPBD tile-reduce broadcast not supported on CPU (Warp 1.14.0).")
+
+    builder = newton.ModelBuilder(up_axis="Z")
+    builder.add_ground_plane()
+    _build_pbdr_bunny(builder)
+    model = builder.finalize(device=device)
+    model.particle_mu = 0.4
+    model.soft_contact_mu = 0.4
+
+    F = 10.0
+    M = 2.18
+    mu = 0.4
+    g = 9.81
+    a = (F - mu * M * g) / M
+
+    solver = newton.solvers.SolverUXPBD(model, iterations=10)
+    state_0 = model.state()
+    state_1 = model.state()
+    contacts = model.contacts()
+    dt = 0.001
+    n_steps = 10000
+
+    f_per_p = F / model.particle_count
+    force_np = np.zeros((model.particle_count, 3), dtype=np.float32)
+    force_np[:, 0] = f_per_p
+
+    for _ in range(n_steps):
+        state_0.clear_forces()
+        state_0.particle_f.assign(force_np)
+        model.collide(state_0, contacts)
+        solver.step(state_0, state_1, None, contacts, dt)
+        state_0, state_1 = state_1, state_0
+
+    com_x = float(state_0.particle_q.numpy().mean(axis=0)[0])
+    expected = 0.5 * a * (n_steps * dt) ** 2
+    rel_err = abs(com_x - expected) / abs(expected)
+    test.assertLess(rel_err, 0.10, f"Test 4 com_x={com_x:.4f}, expected={expected:.4f}, err={rel_err:.4f}")
+
+
+add_function_test(
+    TestSolverUXPBDPhase2,
+    "test_pbdr_t4_pushed_bunny",
+    test_pbdr_t4_pushed_bunny,
+    devices=get_test_devices(),
+)
+
+
+def test_pbdr_t5_bunny_torque(test, device):
+    """PBD-R Test 5: tau=0.01 Nm about z, zero gravity and friction. Bunny shape."""
+    if not device.is_cuda:
+        test.skipTest("SRXPBD tile-reduce broadcast not supported on CPU (Warp 1.14.0).")
+
+    builder = newton.ModelBuilder(up_axis="Z")
+    _build_pbdr_bunny(builder, pos=(0.0, 0.0, 5.0))
+    model = builder.finalize(device=device)
+    grav_np = model.gravity.numpy() * 0.0
+    model.gravity.assign(grav_np)
+    model.particle_mu = 0.0
+
+    # Compute principal inertia from the actual bunny packing.
+    pos_np = model.particle_q.numpy()
+    mass_np = model.particle_mass.numpy()
+    group_indices = np.arange(model.particle_count, dtype=np.int32)  # bunny is the only group
+    Izz = _compute_principal_inertia_zz(pos_np, mass_np, group_indices)
+    tau = 0.01
+    alpha = tau / Izz
+
+    solver = newton.solvers.SolverUXPBD(model, iterations=10)
+    state_0 = model.state()
+    state_1 = model.state()
+
+    initial_pos = state_0.particle_q.numpy()
+    com = initial_pos.mean(axis=0)
+    r = initial_pos - com
+    tangent = np.stack([-r[:, 1], r[:, 0], np.zeros_like(r[:, 0])], axis=1)
+    tan_norm = np.linalg.norm(tangent, axis=1, keepdims=True)
+    tan_norm = np.where(tan_norm > 1e-9, tan_norm, 1.0)
+    tangent = tangent / tan_norm
+    r_xy = np.linalg.norm(r[:, :2], axis=1)
+    sum_r_xy = float(np.sum(r_xy))
+    f_mag = tau / sum_r_xy
+    force_per_particle = (tangent * f_mag).astype(np.float32)
+
+    dt = 0.001
+    n_steps = 10000
+    for _ in range(n_steps):
+        state_0.clear_forces()
+        state_0.particle_f.assign(force_per_particle)
+        solver.step(state_0, state_1, None, None, dt)
+        state_0, state_1 = state_1, state_0
+
+    final_pos = state_0.particle_q.numpy()
+    com_f = final_pos.mean(axis=0)
+    p_init = initial_pos[0] - com
+    p_final = final_pos[0] - com_f
+    theta_init = np.arctan2(p_init[1], p_init[0])
+    theta_final = np.arctan2(p_final[1], p_final[0])
+    theta = theta_final - theta_init
+    expected = 0.5 * alpha * (n_steps * dt) ** 2
+    while theta < expected - np.pi:
+        theta += 2.0 * np.pi
+    while theta > expected + np.pi:
+        theta -= 2.0 * np.pi
+    rel_err = abs(theta - expected) / abs(expected)
+    test.assertLess(rel_err, 0.10, f"Test 5 theta={theta:.4f}, expected={expected:.4f}, err={rel_err:.4f}")
+
+
+add_function_test(
+    TestSolverUXPBDPhase2,
+    "test_pbdr_t5_bunny_torque",
+    test_pbdr_t5_bunny_torque,
+    devices=get_test_devices(),
+)
+
+
+def test_pbdr_t6_bunny_on_slope(test, device):
+    """PBD-R Test 6: bunny on theta=pi/8 slope, mu=0.4."""
+    if not device.is_cuda:
+        test.skipTest("SRXPBD tile-reduce broadcast not supported on CPU (Warp 1.14.0).")
+
+    builder = newton.ModelBuilder(up_axis="Z")
+    slope_angle = np.pi / 8.0
+    rot = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), slope_angle)
+    builder.add_shape_plane(
+        body=-1,
+        xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.0), q=rot),
+        width=10.0,
+        length=10.0,
+    )
+    _build_pbdr_bunny(builder, pos=(0.0, 0.0, 0.30))
+    model = builder.finalize(device=device)
+    model.particle_mu = 0.4
+    model.soft_contact_mu = 0.4
+
+    g = 9.81
+    mu = 0.4
+    a = g * np.sin(slope_angle) - mu * g * np.cos(slope_angle)
+
+    solver = newton.solvers.SolverUXPBD(model, iterations=10)
+    state_0 = model.state()
+    state_1 = model.state()
+    contacts = model.contacts()
+    dt = 0.001
+    n_steps = 10000
+
+    initial_com = state_0.particle_q.numpy().mean(axis=0)
+    for _ in range(n_steps):
+        state_0.clear_forces()
+        model.collide(state_0, contacts)
+        solver.step(state_0, state_1, None, contacts, dt)
+        state_0, state_1 = state_1, state_0
+
+    final_com = state_0.particle_q.numpy().mean(axis=0)
+    slope_dir = np.array([np.sin(slope_angle), 0.0, -np.cos(slope_angle)])
+    delta = final_com - initial_com
+    x_slide = float(np.dot(delta, slope_dir))
+    expected = 0.5 * a * (n_steps * dt) ** 2
+    rel_err = abs(x_slide - expected) / abs(expected)
+    test.assertLess(rel_err, 0.10, f"Test 6 slide={x_slide:.4f}, expected={expected:.4f}, err={rel_err:.4f}")
+
+
+add_function_test(
+    TestSolverUXPBDPhase2,
+    "test_pbdr_t6_bunny_on_slope",
+    test_pbdr_t6_bunny_on_slope,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()
