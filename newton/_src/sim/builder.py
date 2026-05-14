@@ -971,6 +971,20 @@ class ModelBuilder:
         self.lattice_damping: list[float] = []
         """Hunt-Crossley damping coefficient per lattice sphere [s/m] accumulated for :attr:`Model.lattice_damping`."""
 
+        # UXPBD Phase 4 fluid metadata accumulators.
+        self.fluid_rest_density: list[float] = []
+        """Per fluid phase rest density [kg/m^3] accumulated for :attr:`Model.fluid_rest_density`."""
+        self.fluid_smoothing_radius: list[float] = []
+        """Per fluid phase smoothing radius h [m] accumulated for :attr:`Model.fluid_smoothing_radius`."""
+        self.fluid_viscosity: list[float] = []
+        """Per fluid phase XSPH viscosity coefficient accumulated for :attr:`Model.fluid_viscosity`."""
+        self.fluid_cohesion: list[float] = []
+        """Per fluid phase Akinci cohesion coefficient [N] accumulated for :attr:`Model.fluid_cohesion`."""
+        self.fluid_solid_coupling_s: list[float] = []
+        """Per fluid phase solid-side density scaling factor accumulated for :attr:`Model.fluid_solid_coupling_s`."""
+        self.particle_fluid_phase: list[int] = []
+        """Per-particle fluid phase index (-1 for non-fluid). Parallel to particle_q."""
+
         # shapes (each shape has an entry in these arrays)
         self.shape_label: list[str] = []
         """Shape labels accumulated for :attr:`Model.shape_label`."""
@@ -7320,6 +7334,7 @@ class ModelBuilder:
         self.particle_world.append(self.current_world)
         # Particle is not part of a group by default; assigned later via add_particle_group.
         self.particle_group.append(-1)
+        self.particle_fluid_phase.append(-1)
 
         particle_id = self.particle_count - 1
 
@@ -10266,6 +10281,19 @@ class ModelBuilder:
             for _lat_i, p_i in enumerate(self.lattice_particle_index):
                 substrate_np[p_i] = 0
             m.particle_substrate = wp.array(substrate_np, dtype=wp.uint8, device=device)
+
+            # Bake UXPBD fluid metadata.
+            n_fluid_phases = len(self.fluid_rest_density)
+            m.fluid_phase_count = n_fluid_phases
+            if n_fluid_phases:
+                m.fluid_rest_density = wp.array(self.fluid_rest_density, dtype=wp.float32, device=device)
+                m.fluid_smoothing_radius = wp.array(self.fluid_smoothing_radius, dtype=wp.float32, device=device)
+                m.fluid_viscosity = wp.array(self.fluid_viscosity, dtype=wp.float32, device=device)
+                m.fluid_cohesion = wp.array(self.fluid_cohesion, dtype=wp.float32, device=device)
+                m.fluid_solid_coupling_s = wp.array(self.fluid_solid_coupling_s, dtype=wp.float32, device=device)
+
+            if n_particles:
+                m.particle_fluid_phase = wp.array(self.particle_fluid_phase, dtype=wp.int32, device=device)
 
             # hash-grid for particle interactions
             if self.particle_count > 1 and m.particle_max_radius > 0.0:

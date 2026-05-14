@@ -246,6 +246,30 @@ class Model:
         self.link_lattice_sphere_count: wp.array[wp.int32] = wp.empty(0, dtype=wp.int32, device=device)
         """Number of lattice spheres hosted by each link, shape [body_count]. Zero for unshelled links."""
 
+        # UXPBD Phase 4: fluid metadata. One entry per fluid phase. Empty when
+        # no fluid is added.
+        self.fluid_phase_count: int = 0
+        """Number of distinct fluid phases registered in this model."""
+        self.fluid_rest_density: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
+        """Rest density per fluid phase [kg/m^3], shape [fluid_phase_count]."""
+        self.fluid_smoothing_radius: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
+        """SPH smoothing radius h per fluid phase [m], shape [fluid_phase_count].
+        Typically 2*particle_radius."""
+        self.fluid_viscosity: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
+        """XSPH viscosity coefficient per fluid phase [dimensionless 0..1].
+        Higher values damp tangential velocity differences more aggressively."""
+        self.fluid_cohesion: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
+        """Akinci cohesion coefficient per fluid phase [N], shape [fluid_phase_count].
+        Phase 4 default is 0.01 N (modest cohesion so pours don't shatter)."""
+        self.fluid_solid_coupling_s: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
+        """UPPFRTA eq.27 scaling factor s for solid-side density contribution,
+        per fluid phase. Defaults to 1.0; tune down if solid sampling is denser
+        than fluid sampling. Shape [fluid_phase_count]."""
+
+        # Per-particle fluid phase index (-1 if not a fluid particle).
+        self.particle_fluid_phase: wp.array[wp.int32] = wp.empty(0, dtype=wp.int32, device=device)
+        """Per-particle fluid phase index. -1 for non-fluid particles. Shape [particle_count]."""
+
         self.shape_label: list[str] = []
         """List of labels for each shape."""
         self.shape_transform: wp.array[wp.transform] | None = None
