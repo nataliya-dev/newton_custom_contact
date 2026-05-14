@@ -3,7 +3,9 @@
 
 """Tests for the UXPBD solver (Phase 1: articulated rigid + lattice + static contact)."""
 
+import json
 import os
+import tempfile
 import unittest
 
 import numpy as np
@@ -188,6 +190,78 @@ add_function_test(
     TestSolverUXPBD,
     "test_uxpbd_update_lattice_handles_rotation",
     test_uxpbd_update_lattice_handles_rotation,
+    devices=get_test_devices(),
+)
+
+
+def test_uxpbd_lattice_sphere_drops_to_ground(test, device):
+    """A free body with one lattice sphere settles on the ground plane.
+
+    Validates lattice-to-body wrench routing: contact on the lattice
+    sphere must push the host body upward, not the particle.
+
+    NOTE: This test will fail until Task 6 wires SolverUXPBD.step(). It
+    is queued here as the integration target for the contact kernel.
+    """
+    builder = newton.ModelBuilder(up_axis="Z")
+    link = builder.add_body(
+        mass=1.0,
+        xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.5), q=wp.quat_identity()),
+    )
+    sphere_json = {
+        "centers": [[0.0, 0.0, 0.0]],
+        "radii": [0.05],
+        "normals": [[0.0, 0.0, -1.0]],
+        "is_surface": [1],
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(sphere_json, f)
+        temp_path = f.name
+    try:
+        builder.add_lattice(link=link, morphit_json=temp_path, total_mass=0.0)
+    finally:
+        os.unlink(temp_path)
+
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+
+    solver = newton.solvers.SolverUXPBD(model, iterations=4)
+    state_0 = model.state()
+    state_1 = model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+
+    dt = 1.0 / 1000.0
+    contacts = model.contacts()
+    for _ in range(2000):
+        state_0.clear_forces()
+        model.collide(state_0, contacts)
+        solver.step(state_0, state_1, None, contacts, dt)
+        state_0, state_1 = state_1, state_0
+
+    body_q = state_0.body_q.numpy()
+    body_z = float(body_q[0, 2])
+    test.assertAlmostEqual(body_z, 0.05, delta=1e-3)
+
+
+add_function_test(
+    TestSolverUXPBD,
+    "test_uxpbd_lattice_sphere_drops_to_ground",
+    test_uxpbd_lattice_sphere_drops_to_ground,
+    devices=get_test_devices(),
+)
+
+
+def test_uxpbd_lattice_w_eff_helper_callable(test, device):
+    """The lattice_sphere_w_eff device function is exposed and callable."""
+    from newton._src.solvers.uxpbd.kernels import lattice_sphere_w_eff  # noqa: PLC0415
+
+    test.assertTrue(callable(lattice_sphere_w_eff))
+
+
+add_function_test(
+    TestSolverUXPBD,
+    "test_uxpbd_lattice_w_eff_helper_callable",
+    test_uxpbd_lattice_w_eff_helper_callable,
     devices=get_test_devices(),
 )
 
