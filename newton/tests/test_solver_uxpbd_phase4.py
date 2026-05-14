@@ -344,5 +344,58 @@ add_function_test(
 )
 
 
+def test_uxpbd_xsph_viscosity_damps_relative_velocity(test, device):
+    """Two adjacent fluid particles with opposing velocities slow each other."""
+    from newton._src.solvers.uxpbd.fluid import apply_xsph_viscosity  # noqa: PLC0415
+
+    builder = newton.ModelBuilder()
+    builder.add_fluid_particles(
+        positions=[[0.0, 0.0, 0.0], [0.006, 0.0, 0.0]],
+        velocities=[[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]],
+        particle_radius=0.005,
+        rest_density=1000.0,
+        viscosity=0.5,
+    )
+    model = builder.finalize(device=device)
+    state = model.state()
+    if model.particle_grid is None:
+        model.particle_grid = wp.HashGrid(128, 128, 128)
+
+    n = model.particle_count
+    density = wp.array([1000.0] * n, dtype=wp.float32, device=device)
+    new_v = wp.zeros(n, dtype=wp.vec3, device=device)
+
+    model.particle_grid.build(state.particle_q, model.particle_max_radius * 4.0)
+    wp.launch(
+        kernel=apply_xsph_viscosity,
+        dim=n,
+        inputs=[
+            model.particle_grid.id,
+            state.particle_q,
+            state.particle_qd,
+            model.particle_mass,
+            model.particle_substrate,
+            model.particle_fluid_phase,
+            model.fluid_smoothing_radius,
+            model.fluid_viscosity,
+            density,
+        ],
+        outputs=[new_v],
+        device=device,
+    )
+
+    v_new = new_v.numpy()
+    test.assertLess(v_new[0, 0], 1.0, f"viscosity did not damp p0: {v_new[0]}")
+    test.assertGreater(v_new[1, 0], -1.0, f"viscosity did not damp p1: {v_new[1]}")
+
+
+add_function_test(
+    TestSolverUXPBDPhase4,
+    "test_uxpbd_xsph_viscosity_damps_relative_velocity",
+    test_uxpbd_xsph_viscosity_damps_relative_velocity,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()

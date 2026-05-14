@@ -290,3 +290,73 @@ def compute_fluid_position_delta(
         delta += (lam_i + lam_j + s_corr) * grad_w
 
     deltas[i] = delta / rho0
+
+
+@wp.kernel
+def apply_xsph_viscosity(
+    grid: wp.uint64,
+    particle_x: wp.array[wp.vec3],
+    particle_v: wp.array[wp.vec3],
+    particle_mass: wp.array[wp.float32],
+    particle_substrate: wp.array[wp.uint8],
+    particle_fluid_phase: wp.array[wp.int32],
+    fluid_smoothing_radius: wp.array[wp.float32],
+    fluid_viscosity: wp.array[wp.float32],
+    density: wp.array[wp.float32],
+    # output
+    new_v: wp.array[wp.vec3],
+):
+    """XSPH viscosity smoothing on fluid particles.
+
+    Smooths velocities between neighbors once per main iteration after the
+    PBF sub-iteration loop:
+
+        v_i_new = v_i + c * sum_j (v_j - v_i) * W(x_i - x_j, h) / rho_j
+
+    Reference: Macklin and Muller 2013, "Position Based Fluids", eq. 17.
+
+    Args:
+        grid: Warp hash grid id built from particle positions.
+        particle_x: Particle positions [m], shape [particle_count].
+        particle_v: Particle velocities [m/s], shape [particle_count].
+        particle_mass: Particle masses [kg], shape [particle_count].
+        particle_substrate: Substrate type per particle; value 3 denotes fluid.
+        particle_fluid_phase: Fluid phase index per particle; -1 for non-fluid.
+        fluid_smoothing_radius: Smoothing radius h per fluid phase [m].
+        fluid_viscosity: XSPH viscosity coefficient c per fluid phase [dimensionless].
+        density: Current density rho per particle [kg/m^3].
+        new_v: Output smoothed velocity per particle [m/s], shape [particle_count].
+    """
+    i = wp.tid()
+    if particle_substrate[i] != wp.uint8(3):
+        new_v[i] = particle_v[i]
+        return
+    phase = particle_fluid_phase[i]
+    if phase < 0:
+        new_v[i] = particle_v[i]
+        return
+
+    h = fluid_smoothing_radius[phase]
+    c = fluid_viscosity[phase]
+    if c <= wp.float32(0.0):
+        new_v[i] = particle_v[i]
+        return
+
+    x_i = particle_x[i]
+    v_i = particle_v[i]
+    delta_v = wp.vec3(0.0, 0.0, 0.0)
+
+    query = wp.hash_grid_query(grid, x_i, h)
+    j = int(0)
+    while wp.hash_grid_query_next(query, j):
+        if j == i:
+            continue
+        if particle_substrate[j] != wp.uint8(3) or particle_fluid_phase[j] != phase:
+            continue
+        r = x_i - particle_x[j]
+        w = poly6_kernel(r, h)
+        rho_j = density[j]
+        if rho_j > wp.float32(1.0e-12):
+            delta_v += (particle_v[j] - v_i) * (w / rho_j)
+
+    new_v[i] = v_i + c * delta_v

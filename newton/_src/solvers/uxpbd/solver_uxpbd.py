@@ -27,6 +27,7 @@ from ..xpbd.kernels import (
     solve_body_joints,
 )
 from .fluid import (
+    apply_xsph_viscosity,
     compute_fluid_density,
     compute_fluid_lambda,
     compute_fluid_position_delta,
@@ -498,6 +499,27 @@ class SolverUXPBD(SolverBase):
                     state_out.particle_q = new_q
                     state_out.particle_qd = new_qd
                     self.update_lattice_world_positions(state_out)
+
+                # XSPH viscosity (one pass per main iteration).
+                xsph_v = wp.empty_like(state_out.particle_qd)
+                wp.launch(
+                    kernel=apply_xsph_viscosity,
+                    dim=model.particle_count,
+                    inputs=[
+                        model.particle_grid.id,
+                        state_out.particle_q,
+                        state_out.particle_qd,
+                        model.particle_mass,
+                        model.particle_substrate,
+                        model.particle_fluid_phase,
+                        model.fluid_smoothing_radius,
+                        model.fluid_viscosity,
+                        fluid_density,
+                    ],
+                    outputs=[xsph_v],
+                    device=model.device,
+                )
+                state_out.particle_qd = xsph_v
 
             # Joints
             if model.joint_count and body_deltas is not None:
