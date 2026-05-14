@@ -266,5 +266,42 @@ add_function_test(
 )
 
 
+def test_uxpbd_free_fall_trajectory(test, device):
+    """A free body with no lattice contact falls under gravity as g*t^2/2."""
+    builder = newton.ModelBuilder(up_axis="Z")
+    builder.add_body(
+        mass=1.0,
+        xform=wp.transform(p=wp.vec3(0.0, 0.0, 10.0), q=wp.quat_identity()),
+    )
+    model = builder.finalize(device=device)
+
+    solver = newton.solvers.SolverUXPBD(model, iterations=1)
+    state_0 = model.state()
+    state_1 = model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+
+    dt = 0.001
+    t = 0.5
+    n_steps = int(t / dt)
+    for _ in range(n_steps):
+        state_0.clear_forces()
+        solver.step(state_0, state_1, None, None, dt)
+        state_0, state_1 = state_1, state_0
+
+    body_q = state_0.body_q.numpy()
+    body_z = float(body_q[0, 2])
+    expected_z = 10.0 - 0.5 * 9.81 * t * t
+    relative_err = abs(body_z - expected_z) / expected_z
+    test.assertLess(relative_err, 0.005, f"free fall z={body_z}, expected={expected_z}")
+
+
+add_function_test(
+    TestSolverUXPBD,
+    "test_uxpbd_free_fall_trajectory",
+    test_uxpbd_free_fall_trajectory,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()

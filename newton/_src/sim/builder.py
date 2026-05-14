@@ -10182,6 +10182,13 @@ class ModelBuilder:
                 m.lattice_damping = wp.array(self.lattice_damping, dtype=wp.float32, device=device)
                 # lattice_neighbors_* stay empty until later tasks generate adjacency.
 
+            # Reverse index from particle slot to lattice sphere index.
+            n_particles = len(self.particle_q)
+            p_to_l = np.full(n_particles, -1, dtype=np.int32)
+            for lat_i, p_i in enumerate(self.lattice_particle_index):
+                p_to_l[p_i] = lat_i
+            m.particle_to_lattice = wp.array(p_to_l, dtype=wp.int32, device=device)
+
             # hash-grid for particle interactions
             if self.particle_count > 1 and m.particle_max_radius > 0.0:
                 m.particle_grid = wp.HashGrid(128, 128, 128)

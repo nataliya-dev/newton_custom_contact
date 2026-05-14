@@ -12,6 +12,13 @@ import warp as wp
 
 from ...sim import Contacts, Control, Model, State
 from ..solver import SolverBase
+from ..xpbd.kernels import (
+    apply_body_deltas,
+    apply_joint_forces,
+    copy_kinematic_body_state_kernel,
+    solve_body_joints,
+)
+from .kernels import solve_lattice_shape_contacts
 from .kernels import update_lattice_world_positions as update_lattice_world_positions_kernel
 
 
@@ -59,14 +66,200 @@ class SolverUXPBD(SolverBase):
         contacts: Contacts | None,
         dt: float,
     ) -> None:
-        """Advance the simulation by ``dt`` seconds.
+        """Advance the simulation by ``dt`` seconds. Phase 1: articulated rigid + lattice.
 
-        Phase 1 stub: implementation is added in Task 6 of the UXPBD Phase 1 plan.
-
-        Raises:
-            NotImplementedError: Always, until Task 6 wires up the iteration loop.
+        Args:
+            state_in: Input state at time t.
+            state_out: Output state at time t + dt.
+            control: Joint actuation. If None, use the model's zero control.
+            contacts: Contact list from a prior ``model.collide`` call. May be None.
+            dt: Time step [s].
         """
-        raise NotImplementedError("SolverUXPBD.step() is implemented in Task 6.")
+        model = self.model
+
+        if control is None:
+            control = model.control(clone_variables=False)
+
+        # 1. Predict body positions: integrate_bodies with joint feedforward.
+        if model.body_count:
+            body_f_local = state_in.body_f
+            if model.joint_count:
+                body_f_local = wp.clone(state_in.body_f)
+                wp.launch(
+                    kernel=apply_joint_forces,
+                    dim=model.joint_count,
+                    inputs=[
+                        state_in.body_q,
+                        model.body_com,
+                        model.joint_type,
+                        model.joint_enabled,
+                        model.joint_parent,
+                        model.joint_child,
+                        model.joint_X_p,
+                        model.joint_X_c,
+                        model.joint_qd_start,
+                        model.joint_dof_dim,
+                        model.joint_axis,
+                        control.joint_f,
+                    ],
+                    outputs=[body_f_local],
+                    device=model.device,
+                )
+            if body_f_local is state_in.body_f:
+                self.integrate_bodies(model, state_in, state_out, dt)
+            else:
+                body_f_prev = state_in.body_f
+                state_in.body_f = body_f_local
+                self.integrate_bodies(model, state_in, state_out, dt)
+                state_in.body_f = body_f_prev
+
+        # Copy any non-lattice particles forward (Phase 1 has none, but keep API consistent).
+        if model.particle_count:
+            state_out.particle_q.assign(state_in.particle_q)
+            state_out.particle_qd.assign(state_in.particle_qd)
+
+        # 2. Project body_q onto lattice particles.
+        self.update_lattice_world_positions(state_out)
+
+        # 3. v2 CSLC hook (no-op in v1).
+        self.compute_compliant_contact_response(state_in, state_out, contacts, dt)
+
+        # 4. Main iteration loop.
+        # apply_body_deltas requires distinct input and output arrays (no aliasing).
+        # We keep a scratch buffer pair and ping-pong with state_out so that
+        # cur_(q|qd) -> nxt_(q|qd) always refer to different allocations.
+        if model.body_count:
+            body_deltas = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
+            _body_q = [state_out.body_q, wp.clone(state_out.body_q)]
+            _body_qd = [state_out.body_qd, wp.clone(state_out.body_qd)]
+            _cur = 0  # index into _body_q/_body_qd that holds the current state
+        else:
+            body_deltas = None
+            _body_q = None
+            _body_qd = None
+            _cur = 0
+
+        def _apply_deltas_flip():
+            nonlocal _cur
+            _nxt = 1 - _cur
+            wp.launch(
+                kernel=apply_body_deltas,
+                dim=model.body_count,
+                inputs=[
+                    _body_q[_cur],
+                    _body_qd[_cur],
+                    model.body_com,
+                    model.body_inertia,
+                    self.body_inv_mass_effective,
+                    self.body_inv_inertia_effective,
+                    body_deltas,
+                    None,
+                    dt,
+                ],
+                outputs=[_body_q[_nxt], _body_qd[_nxt]],
+                device=model.device,
+            )
+            _cur = _nxt
+            # Keep state_out.body_q/qd pointing at the authoritative data so that
+            # every downstream kernel (lattice projection, contact solve, joints)
+            # reads the most recent body state without extra indirection.
+            state_out.body_q = _body_q[_cur]
+            state_out.body_qd = _body_qd[_cur]
+
+        for _ in range(self.iterations):
+            if body_deltas is not None:
+                body_deltas.zero_()
+
+            # Lattice-shape contacts (Phase 1's only contact path).
+            if contacts is not None and model.lattice_sphere_count and body_deltas is not None:
+                wp.launch(
+                    kernel=solve_lattice_shape_contacts,
+                    dim=contacts.soft_contact_max,
+                    inputs=[
+                        state_out.particle_q,
+                        state_out.particle_qd,
+                        model.particle_radius,
+                        model.particle_flags,
+                        model.lattice_particle_index,
+                        model.lattice_link,
+                        state_out.body_q,
+                        state_out.body_qd,
+                        model.body_com,
+                        self.body_inv_mass_effective,
+                        self.body_inv_inertia_effective,
+                        model.shape_body,
+                        model.shape_material_mu,
+                        model.soft_contact_mu,
+                        model.particle_adhesion,
+                        contacts.soft_contact_count,
+                        contacts.soft_contact_particle,
+                        contacts.soft_contact_shape,
+                        contacts.soft_contact_body_pos,
+                        contacts.soft_contact_body_vel,
+                        contacts.soft_contact_normal,
+                        contacts.soft_contact_max,
+                        model.particle_to_lattice,
+                        dt,
+                        0.8,
+                    ],
+                    outputs=[body_deltas],
+                    device=model.device,
+                )
+
+                _apply_deltas_flip()
+
+                # Re-sync lattice after body update so next iter sees consistent state.
+                self.update_lattice_world_positions(state_out)
+
+            # Joints
+            if model.joint_count and body_deltas is not None:
+                body_deltas.zero_()
+                joint_impulse = wp.zeros(model.joint_count, dtype=wp.spatial_vector, device=model.device)
+                wp.launch(
+                    kernel=solve_body_joints,
+                    dim=model.joint_count,
+                    inputs=[
+                        state_out.body_q,
+                        state_out.body_qd,
+                        model.body_com,
+                        self.body_inv_mass_effective,
+                        self.body_inv_inertia_effective,
+                        model.joint_type,
+                        model.joint_enabled,
+                        model.joint_parent,
+                        model.joint_child,
+                        model.joint_X_p,
+                        model.joint_X_c,
+                        model.joint_limit_lower,
+                        model.joint_limit_upper,
+                        model.joint_qd_start,
+                        model.joint_dof_dim,
+                        model.joint_axis,
+                        control.joint_target_pos,
+                        control.joint_target_vel,
+                        model.joint_target_ke,
+                        model.joint_target_kd,
+                        0.0,
+                        0.0,
+                        0.4,
+                        0.7,
+                        dt,
+                    ],
+                    outputs=[body_deltas, joint_impulse],
+                    device=model.device,
+                )
+                _apply_deltas_flip()
+                self.update_lattice_world_positions(state_out)
+
+        # 5. Copy kinematic body state forward.
+        if model.body_count:
+            wp.launch(
+                kernel=copy_kinematic_body_state_kernel,
+                dim=model.body_count,
+                inputs=[model.body_flags, state_in.body_q, state_in.body_qd],
+                outputs=[state_out.body_q, state_out.body_qd],
+                device=model.device,
+            )
 
     def update_lattice_world_positions(self, state: State) -> None:
         """Project ``body_q``/``body_qd`` onto every lattice particle.

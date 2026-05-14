@@ -167,16 +167,6 @@ def solve_lattice_shape_contacts(
     # Relative velocity at contact.
     v = pv - bv
 
-    # Normal correction.
-    lambda_n = c
-    delta_n = n * lambda_n
-
-    # Friction (Coulomb, position-level).
-    vn = wp.dot(n, v)
-    vt = v - n * vn
-    lambda_f = wp.max(mu * lambda_n, -wp.length(vt) * dt)
-    delta_f = wp.normalize(vt) * lambda_f
-
     # Effective inverse mass on the lattice side using the host link's inertia.
     host_q = body_q[host_link]
     host_com_world = wp.transform_point(host_q, body_com[host_link])
@@ -201,14 +191,32 @@ def solve_lattice_shape_contacts(
     if denom == 0.0:
         return
 
+    # Normal correction in velocity domain: lambda = c / (dt * denom).
+    # Matching the convention of solve_body_contact_positions (compute_contact_constraint_delta),
+    # apply_body_deltas interprets body_delta linear part as velocity-domain, so
+    # dp = body_delta * inv_m [m/s], p += dp * dt [m], v += dp [m/s].
+    # Dividing c by dt gives impulse-scale correction sufficient to stop a fast body.
+    lambda_n = c / dt
+    delta_n = n * lambda_n
+
+    # Friction (Coulomb, velocity-level).
+    vn = wp.dot(n, v)
+    vt = v - n * vn
+    lambda_f = wp.max(mu * lambda_n, -wp.length(vt))
+    delta_f = wp.normalize(vt) * lambda_f
+
     delta_total = (delta_f - delta_n) / denom * relaxation
 
-    # Route delta on the lattice sphere into the host link's wrench.
-    # Direction matches XPBD's wp.atomic_sub for the body side.
+    # Route the position correction into the host body.
+    # The lattice sphere is rigidly attached to the body, so the body receives
+    # the same correction direction as the sphere (unlike XPBD particle-shape
+    # where the shape body receives the Newton's-3rd-law reaction).
+    # apply_body_deltas: dp = spatial_top(body_delta) * inv_m => p += dp * dt,
+    # so a positive linear contribution moves the body in that direction.
     t_lat = wp.cross(r_lat, delta_total)
-    wp.atomic_sub(body_delta, host_link, wp.spatial_vector(delta_total, t_lat))
+    wp.atomic_add(body_delta, host_link, wp.spatial_vector(delta_total, t_lat))
 
     if shape_link >= 0:
         # Shape is dynamic: also push back its body.
         t_shape = wp.cross(r_shape, delta_total)
-        wp.atomic_add(body_delta, shape_link, wp.spatial_vector(delta_total, t_shape))
+        wp.atomic_sub(body_delta, shape_link, wp.spatial_vector(delta_total, t_shape))

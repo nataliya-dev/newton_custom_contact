@@ -209,6 +209,9 @@ class Model:
         """Body link index for each lattice sphere, shape [lattice_sphere_count]."""
         self.lattice_particle_index: wp.array[wp.int32] = wp.empty(0, dtype=wp.int32, device=device)
         """Warp particle index corresponding to each lattice sphere, shape [lattice_sphere_count]."""
+        # Reverse index: particle slot -> lattice sphere index, or -1 if not a lattice particle.
+        self.particle_to_lattice: wp.array[wp.int32] = wp.empty(0, dtype=wp.int32, device=device)
+        """Reverse map from particle index to lattice sphere index, or -1 if not a lattice particle. Shape [particle_count]."""
 
         # v2 CSLC seams. Present but unused in Phase 1.
         self.lattice_delta: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
