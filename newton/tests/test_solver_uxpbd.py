@@ -47,5 +47,27 @@ add_function_test(
 )
 
 
+def test_uxpbd_empty_model_has_zero_lattice(test, device):
+    """A Model finalized with no lattices has lattice_sphere_count == 0."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+
+    test.assertEqual(getattr(model, "lattice_sphere_count", 0), 0)
+    # Lattice arrays exist but are empty
+    test.assertEqual(model.lattice_p_rest.shape[0], 0)
+    test.assertEqual(model.lattice_r.shape[0], 0)
+    test.assertEqual(model.lattice_link.shape[0], 0)
+    test.assertEqual(model.lattice_delta.shape[0], 0)
+
+
+add_function_test(
+    TestSolverUXPBD,
+    "test_uxpbd_empty_model_has_zero_lattice",
+    test_uxpbd_empty_model_has_zero_lattice,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()

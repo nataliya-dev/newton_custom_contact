@@ -335,7 +335,6 @@ class ModelBuilder:
         """Jacobi damping factor (under-relaxation). 0.2-0.5 typical.
         Lower = more stable, higher = faster convergence."""
 
-
         def configure_sdf(
             self,
             *,
@@ -419,14 +418,9 @@ class ModelBuilder:
                     "Hydroelastic shapes require an SDF. Set either sdf_max_resolution or sdf_target_voxel_size."
                 )
             if self.is_cslc and self.is_hydroelastic:
-                raise ValueError(
-                    "A shape cannot be both CSLC and hydroelastic. Choose one."
-                )
+                raise ValueError("A shape cannot be both CSLC and hydroelastic. Choose one.")
             if self.is_cslc and shape_type in (GeoType.PLANE, GeoType.HFIELD):
-                raise ValueError(
-                    "CSLC is not supported for plane or heightfield shapes."
-                )
-
+                raise ValueError("CSLC is not supported for plane or heightfield shapes.")
 
         def mark_as_site(self) -> None:
             """Marks this shape as a site and enforces all site invariants.
@@ -953,6 +947,29 @@ class ModelBuilder:
         self.particle_group_count: int = 0
         """Total number of particle groups registered via :meth:`add_particle_group`."""
 
+        # UXPBD lattice metadata accumulators (Python lists, baked into Model at finalize).
+        self.lattice_p_rest: list[tuple[float, float, float]] = []
+        """Rest-pose positions of lattice spheres [m] accumulated for :attr:`Model.lattice_p_rest`."""
+        self.lattice_r: list[float] = []
+        """Radii of lattice spheres [m] accumulated for :attr:`Model.lattice_r`."""
+        self.lattice_normal: list[tuple[float, float, float]] = []
+        """Outward surface normals of lattice spheres accumulated for :attr:`Model.lattice_normal`."""
+        self.lattice_is_surface: list[int] = []
+        """Surface flags (1=surface, 0=interior) accumulated for :attr:`Model.lattice_is_surface`."""
+        self.lattice_link: list[int] = []
+        """Body link indices accumulated for :attr:`Model.lattice_link`."""
+        self.lattice_particle_index: list[int] = []
+        """Warp particle indices accumulated for :attr:`Model.lattice_particle_index`."""
+        # v2 CSLC seams. Defaults stored even when unused so the seam is testable.
+        self.lattice_k_anchor: list[float] = []
+        """Anchor stiffness per lattice sphere [N/m] accumulated for :attr:`Model.lattice_k_anchor`."""
+        self.lattice_k_lateral: list[float] = []
+        """Lateral stiffness per lattice sphere [N/m] accumulated for :attr:`Model.lattice_k_lateral`."""
+        self.lattice_k_contact: list[float] = []
+        """Contact stiffness per lattice sphere [N/m] accumulated for :attr:`Model.lattice_k_contact`."""
+        self.lattice_damping: list[float] = []
+        """Damping coefficient per lattice sphere [N·s/m] accumulated for :attr:`Model.lattice_damping`."""
+
         # shapes (each shape has an entry in these arrays)
         self.shape_label: list[str] = []
         """Shape labels accumulated for :attr:`Model.shape_label`."""
@@ -1009,7 +1026,6 @@ class ModelBuilder:
         """Per-shape SDF maximum resolutions retained until :meth:`finalize <ModelBuilder.finalize>`."""
         self.shape_sdf_texture_format: list[str] = []
         """Per-shape SDF texture format retained until :meth:`finalize <ModelBuilder.finalize>`."""
-
 
         # New CSLC addition
         self.shape_cslc_spacing: list[float] = []
@@ -7425,9 +7441,7 @@ class ModelBuilder:
         inside = mesh.contains(candidates)
         pts_in = candidates[inside]
         if pts_in.shape[0] == 0:
-            raise ValueError(
-                f"No points found inside mesh {mesh_file} with radius {radius} and spacing {spacing}"
-            )
+            raise ValueError(f"No points found inside mesh {mesh_file} with radius {radius} and spacing {spacing}")
 
         volume_dict = {
             "centers": pts_in.tolist(),
@@ -10088,6 +10102,26 @@ class ModelBuilder:
                 particle_colors[self.particle_color_groups[color]] = color
             m.particle_colors = wp.array(particle_colors, dtype=int)
             m.particle_color_groups = [wp.array(group, dtype=int) for group in self.particle_color_groups]
+
+            # Bake UXPBD lattice metadata.
+            n_lat = len(self.lattice_link)
+            m.lattice_sphere_count = n_lat
+            if n_lat:
+                m.lattice_p_rest = wp.array(self.lattice_p_rest, dtype=wp.vec3, device=device)
+                m.lattice_r = wp.array(self.lattice_r, dtype=wp.float32, device=device)
+                m.lattice_normal = wp.array(self.lattice_normal, dtype=wp.vec3, device=device)
+                m.lattice_is_surface = wp.array(self.lattice_is_surface, dtype=wp.uint8, device=device)
+                m.lattice_link = wp.array(self.lattice_link, dtype=wp.int32, device=device)
+                m.lattice_particle_index = wp.array(self.lattice_particle_index, dtype=wp.int32, device=device)
+                # v2 seams initialized to zero or stored defaults.
+                m.lattice_delta = wp.zeros(n_lat, dtype=wp.float32, device=device)
+                m.lattice_delta_prev = wp.zeros(n_lat, dtype=wp.float32, device=device)
+                m.lattice_K_diag = wp.zeros(n_lat, dtype=wp.float32, device=device)
+                m.lattice_k_anchor = wp.array(self.lattice_k_anchor, dtype=wp.float32, device=device)
+                m.lattice_k_lateral = wp.array(self.lattice_k_lateral, dtype=wp.float32, device=device)
+                m.lattice_k_contact = wp.array(self.lattice_k_contact, dtype=wp.float32, device=device)
+                m.lattice_damping = wp.array(self.lattice_damping, dtype=wp.float32, device=device)
+                # lattice_neighbors_* stay empty until later tasks generate adjacency.
 
             # hash-grid for particle interactions
             if self.particle_count > 1 and m.particle_max_radius > 0.0:

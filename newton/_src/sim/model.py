@@ -193,6 +193,43 @@ class Model:
             num_global_particles = particle_world_start[-1] - particle_world_start[-2] + particle_world_start[0]
         """
 
+        # UXPBD lattice metadata. Empty when no link has a lattice attached.
+        # See docs/superpowers/specs/2026-05-13-uxpbd-design.md section 5.1.
+        self.lattice_sphere_count: int = 0
+        """Total number of lattice spheres across all attached lattices."""
+        self.lattice_p_rest: wp.array[wp.vec3] = wp.empty(0, dtype=wp.vec3, device=device)
+        """Rest-pose positions of lattice spheres [m], shape [lattice_sphere_count, 3]."""
+        self.lattice_r: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
+        """Radius of each lattice sphere [m], shape [lattice_sphere_count]."""
+        self.lattice_normal: wp.array[wp.vec3] = wp.empty(0, dtype=wp.vec3, device=device)
+        """Outward surface normal of each lattice sphere, expressed in the host link's body frame. Defined only for surface spheres (those with ``lattice_is_surface == 1``); interior-sphere values are unused. Shape [lattice_sphere_count]."""
+        self.lattice_is_surface: wp.array[wp.uint8] = wp.empty(0, dtype=wp.uint8, device=device)
+        """Whether each lattice sphere is a surface sphere (1) or interior (0), shape [lattice_sphere_count]."""
+        self.lattice_link: wp.array[wp.int32] = wp.empty(0, dtype=wp.int32, device=device)
+        """Body link index for each lattice sphere, shape [lattice_sphere_count]."""
+        self.lattice_particle_index: wp.array[wp.int32] = wp.empty(0, dtype=wp.int32, device=device)
+        """Warp particle index corresponding to each lattice sphere, shape [lattice_sphere_count]."""
+
+        # v2 CSLC seams. Present but unused in Phase 1.
+        self.lattice_delta: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
+        """CSLC seam displacement [m], shape [lattice_sphere_count]. Unused in Phase 1."""
+        self.lattice_delta_prev: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
+        """Previous CSLC seam displacement [m], shape [lattice_sphere_count]. Unused in Phase 1."""
+        self.lattice_K_diag: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
+        """Diagonal entries of the lattice stiffness matrix K, K_diag[i] = k_anchor[i] + k_lateral[i] * |N(i)| [N/m]. Computed at finalize from MorphIt adjacency, populated by v2 CSLC; allocated as zeros in Phase 1. Shape [lattice_sphere_count]."""
+        self.lattice_neighbors_csr: wp.array[wp.int32] = wp.empty(0, dtype=wp.int32, device=device)
+        """CSR column indices for lattice neighbor adjacency. Unused in Phase 1."""
+        self.lattice_neighbors_offset: wp.array[wp.int32] = wp.empty(0, dtype=wp.int32, device=device)
+        """CSR row offsets for lattice neighbor adjacency. Unused in Phase 1."""
+        self.lattice_k_anchor: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
+        """Anchor stiffness per lattice sphere [N/m], shape [lattice_sphere_count]. Unused in Phase 1."""
+        self.lattice_k_lateral: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
+        """Lateral stiffness per lattice sphere [N/m], shape [lattice_sphere_count]. Unused in Phase 1."""
+        self.lattice_k_contact: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
+        """Contact stiffness per lattice sphere [N/m], shape [lattice_sphere_count]. Unused in Phase 1."""
+        self.lattice_damping: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
+        """Damping coefficient per lattice sphere [N·s/m], shape [lattice_sphere_count]. Unused in Phase 1."""
+
         self.shape_label: list[str] = []
         """List of labels for each shape."""
         self.shape_transform: wp.array[wp.transform] | None = None
