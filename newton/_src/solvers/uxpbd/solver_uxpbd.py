@@ -334,6 +334,10 @@ class SolverUXPBD(SolverBase):
 
             # Cross-substrate particle-particle contact pass.
             if model.particle_count > 1 and model.particle_grid is not None and body_deltas is not None:
+                # Reset body_deltas before the PP-contact pass writes into it. The shape-
+                # contact pass above already applied its body deltas via _apply_deltas_flip,
+                # so we must NOT include them again.
+                body_deltas.zero_()
                 search_radius = model.particle_max_radius * 2.0 + model.particle_cohesion
                 with wp.ScopedDevice(model.device):
                     model.particle_grid.build(state_out.particle_q, radius=search_radius)
