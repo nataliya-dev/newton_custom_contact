@@ -8519,6 +8519,143 @@ class ModelBuilder:
             custom_attributes=broadcast_custom_attrs,
         )
 
+    def add_fluid_grid(
+        self,
+        pos,
+        rot,
+        vel,
+        dim_x: int,
+        dim_y: int,
+        dim_z: int,
+        cell_x: float,
+        cell_y: float,
+        cell_z: float,
+        *,
+        particle_radius: float,
+        rest_density: float = 1000.0,
+        smoothing_radius_factor: float = 2.0,
+        viscosity: float = 0.01,
+        cohesion: float = 0.01,
+        solid_coupling_s: float = 1.0,
+    ) -> int:
+        """Add a 3D grid of fluid particles registered as a new fluid phase.
+
+        Position-Based Fluids (Macklin & Muller 2013) require a rest density,
+        smoothing radius h (typically 2 * particle_radius), and optional
+        viscosity and cohesion. Each call creates a new fluid phase; particles
+        in the same phase mutually contribute to the density constraint.
+
+        Args:
+            pos: World-space origin of the grid corner [m].
+            rot: Rotation applied to the grid (quaternion).
+            vel: Initial velocity assigned to every fluid particle [m/s].
+            dim_x: Particles along X.
+            dim_y: Particles along Y.
+            dim_z: Particles along Z.
+            cell_x: Spacing along X [m].
+            cell_y: Spacing along Y [m].
+            cell_z: Spacing along Z [m].
+            particle_radius: Per-particle radius [m].
+            rest_density: Target density [kg/m^3]. Defaults to 1000 (water).
+            smoothing_radius_factor: Multiplied by particle_radius for the SPH
+                kernel support h. Defaults to 2.0.
+            viscosity: XSPH viscosity coefficient, dimensionless 0..1.
+            cohesion: Akinci cohesion strength [N].
+            solid_coupling_s: UPPFRTA eq.27 scaling for solid-particle density
+                contribution to fluid density.
+
+        Returns:
+            The fluid phase index for this grid.
+        """
+        import numpy as np  # noqa: PLC0415
+
+        phase_id = len(self.fluid_rest_density)
+        h = smoothing_radius_factor * particle_radius
+        self.fluid_rest_density.append(float(rest_density))
+        self.fluid_smoothing_radius.append(float(h))
+        self.fluid_viscosity.append(float(viscosity))
+        self.fluid_cohesion.append(float(cohesion))
+        self.fluid_solid_coupling_s.append(float(solid_coupling_s))
+
+        rest_volume_per_particle = float(cell_x) * float(cell_y) * float(cell_z)
+        mass_per_particle = float(rest_density) * rest_volume_per_particle
+
+        px = np.arange(dim_x) * cell_x
+        py = np.arange(dim_y) * cell_y
+        pz = np.arange(dim_z) * cell_z
+        points = np.stack(np.meshgrid(px, py, pz, indexing="ij")).reshape(3, -1).T
+        rot_mat = wp.quat_to_matrix(rot)
+        points = points @ np.array(rot_mat).reshape(3, 3).T + np.array(pos)
+        velocity = np.broadcast_to(np.array(vel).reshape(1, 3), points.shape)
+
+        for i in range(points.shape[0]):
+            p = wp.vec3(float(points[i, 0]), float(points[i, 1]), float(points[i, 2]))
+            v = wp.vec3(float(velocity[i, 0]), float(velocity[i, 1]), float(velocity[i, 2]))
+            self.add_particle(p, v, mass_per_particle, float(particle_radius))
+            self.particle_fluid_phase[-1] = phase_id
+
+        return phase_id
+
+    def add_fluid_particles(
+        self,
+        positions,
+        velocities=None,
+        *,
+        particle_radius: float,
+        rest_density: float = 1000.0,
+        smoothing_radius_factor: float = 2.0,
+        viscosity: float = 0.01,
+        cohesion: float = 0.01,
+        solid_coupling_s: float = 1.0,
+        mass_per_particle: float | None = None,
+    ) -> int:
+        """Add explicit fluid particles registered as a new fluid phase.
+
+        Args:
+            positions: Sequence of (N, 3) positions [m].
+            velocities: Sequence of (N, 3) initial velocities, or None for zero.
+            particle_radius: Per-particle radius [m].
+            rest_density: Rest density [kg/m^3]. Defaults to 1000.
+            smoothing_radius_factor: h = factor * particle_radius. Defaults to 2.0.
+            viscosity: XSPH viscosity coefficient.
+            cohesion: Akinci cohesion strength [N].
+            solid_coupling_s: UPPFRTA eq.27 scaling.
+            mass_per_particle: Per-particle mass [kg]. If None, derived from
+                rest_density and the rest sphere volume (4/3 * pi * r^3).
+
+        Returns:
+            The fluid phase index.
+        """
+        import numpy as np  # noqa: PLC0415
+
+        phase_id = len(self.fluid_rest_density)
+        h = smoothing_radius_factor * particle_radius
+        self.fluid_rest_density.append(float(rest_density))
+        self.fluid_smoothing_radius.append(float(h))
+        self.fluid_viscosity.append(float(viscosity))
+        self.fluid_cohesion.append(float(cohesion))
+        self.fluid_solid_coupling_s.append(float(solid_coupling_s))
+
+        positions = np.asarray(positions, dtype=np.float32).reshape(-1, 3)
+        if velocities is None:
+            velocities = np.zeros_like(positions)
+        else:
+            velocities = np.asarray(velocities, dtype=np.float32).reshape(-1, 3)
+            if velocities.shape != positions.shape:
+                raise ValueError("velocities must match positions shape")
+
+        if mass_per_particle is None:
+            rest_volume = (4.0 / 3.0) * np.pi * particle_radius**3
+            mass_per_particle = float(rest_density) * rest_volume
+
+        for i in range(positions.shape[0]):
+            p = wp.vec3(float(positions[i, 0]), float(positions[i, 1]), float(positions[i, 2]))
+            v = wp.vec3(float(velocities[i, 0]), float(velocities[i, 1]), float(velocities[i, 2]))
+            self.add_particle(p, v, float(mass_per_particle), float(particle_radius))
+            self.particle_fluid_phase[-1] = phase_id
+
+        return phase_id
+
     def add_soft_grid(
         self,
         pos: Vec3,
@@ -10275,11 +10412,14 @@ class ModelBuilder:
                 p_to_l[p_i] = lat_i
             m.particle_to_lattice = wp.array(p_to_l, dtype=wp.int32, device=device)
 
-            # Tag particle substrate. Default = 1 (SM-rigid: particle is in a particle_group).
-            # Overwrite to 0 for any particle that is a lattice host's slot.
+            # Tag particle substrate (0=lattice, 1=SM-rigid, 2=soft, 3=fluid).
+            # Default: 1 (SM-rigid). Overwrite to 0 for lattice slots, 3 for fluid slots.
             substrate_np = np.full(n_particles, 1, dtype=np.uint8)
             for _lat_i, p_i in enumerate(self.lattice_particle_index):
                 substrate_np[p_i] = 0
+            for p_i, fluid_phase in enumerate(self.particle_fluid_phase):
+                if fluid_phase >= 0:
+                    substrate_np[p_i] = 3
             m.particle_substrate = wp.array(substrate_np, dtype=wp.uint8, device=device)
 
             # Bake UXPBD fluid metadata.
