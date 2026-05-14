@@ -209,3 +209,84 @@ def compute_fluid_lambda(
     sum_grad_sq += wp.dot(grad_i, grad_i)
 
     lambdas[i] = -c / (sum_grad_sq + epsilon)
+
+
+@wp.kernel
+def compute_fluid_position_delta(
+    grid: wp.uint64,
+    particle_x: wp.array[wp.vec3],
+    particle_mass: wp.array[wp.float32],
+    particle_substrate: wp.array[wp.uint8],
+    particle_fluid_phase: wp.array[wp.int32],
+    fluid_rest_density: wp.array[wp.float32],
+    fluid_smoothing_radius: wp.array[wp.float32],
+    lambdas: wp.array[wp.float32],
+    k_corr: wp.float32,
+    dq_factor: wp.float32,
+    n_corr: wp.float32,
+    # output
+    deltas: wp.array[wp.vec3],
+):
+    """Per-fluid-particle position delta.
+
+        delta_i = (1/rho_0) * sum_j (lambda_i + lambda_j + s_corr) * grad W(x_i - x_j, h)
+
+    s_corr is Macklin-Muller's artificial pressure for tensile-instability
+    correction: s_corr = -k_corr * (W(r, h) / W(dq, h))^n_corr, with
+    dq = dq_factor * h.
+
+    Reference: Macklin and Muller 2013, "Position Based Fluids", eq. 13.
+
+    Args:
+        grid: Warp hash grid id built from particle positions.
+        particle_x: Particle positions [m], shape [particle_count].
+        particle_mass: Particle masses [kg], shape [particle_count].
+        particle_substrate: Substrate type per particle; value 3 denotes fluid.
+        particle_fluid_phase: Fluid phase index per particle; -1 for non-fluid.
+        fluid_rest_density: Rest density rho_0 per fluid phase [kg/m^3].
+        fluid_smoothing_radius: Smoothing radius h per fluid phase [m].
+        lambdas: Lagrange multipliers from compute_fluid_lambda [dimensionless].
+        k_corr: Artificial pressure magnitude coefficient [dimensionless].
+        dq_factor: Reference distance as fraction of h for s_corr [dimensionless].
+        n_corr: Exponent for artificial pressure kernel ratio [dimensionless].
+        deltas: Output position corrections [m], shape [particle_count].
+    """
+    i = wp.tid()
+    if particle_substrate[i] != wp.uint8(3):
+        return
+    phase = particle_fluid_phase[i]
+    if phase < 0:
+        return
+
+    rho0 = fluid_rest_density[phase]
+    h = fluid_smoothing_radius[phase]
+    lam_i = lambdas[i]
+
+    x_i = particle_x[i]
+    delta = wp.vec3(0.0, 0.0, 0.0)
+
+    # Reference kernel value at dq = dq_factor * h for s_corr denominator.
+    dq_vec = wp.vec3(dq_factor * h, 0.0, 0.0)
+    w_dq = poly6_kernel(dq_vec, h)
+
+    query = wp.hash_grid_query(grid, x_i, h)
+    j = int(0)
+    while wp.hash_grid_query_next(query, j):
+        if j == i:
+            continue
+        if particle_substrate[j] != wp.uint8(3) or particle_fluid_phase[j] != phase:
+            continue
+        r = x_i - particle_x[j]
+        grad_w = spiky_gradient(r, h)
+
+        # Artificial pressure s_corr prevents tensile instability (clumping).
+        w_r = poly6_kernel(r, h)
+        s_corr = wp.float32(0.0)
+        if w_dq > wp.float32(1.0e-12):
+            ratio = w_r / w_dq
+            s_corr = -k_corr * wp.pow(ratio, n_corr)
+
+        lam_j = lambdas[j]
+        delta += (lam_i + lam_j + s_corr) * grad_w
+
+    deltas[i] = delta / rho0

@@ -196,5 +196,97 @@ add_function_test(
 )
 
 
+def test_uxpbd_pbf_position_delta_separates_overdense(test, device):
+    """Two overlapping fluid particles get pushed apart by PBF."""
+    from newton._src.solvers.uxpbd.fluid import (  # noqa: PLC0415
+        compute_fluid_density,
+        compute_fluid_lambda,
+        compute_fluid_position_delta,
+    )
+
+    builder = newton.ModelBuilder()
+    builder.add_fluid_particles(
+        positions=[[0.0, 0.0, 0.0], [0.001, 0.0, 0.0]],
+        velocities=[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        particle_radius=0.005,
+        rest_density=1000.0,
+    )
+    model = builder.finalize(device=device)
+    state = model.state()
+    if model.particle_grid is None:
+        model.particle_grid = wp.HashGrid(128, 128, 128)
+
+    n = model.particle_count
+    density = wp.zeros(n, dtype=wp.float32, device=device)
+    lambdas = wp.zeros(n, dtype=wp.float32, device=device)
+    deltas = wp.zeros(n, dtype=wp.vec3, device=device)
+
+    model.particle_grid.build(state.particle_q, model.particle_max_radius * 4.0)
+    wp.launch(
+        compute_fluid_density,
+        dim=n,
+        inputs=[
+            model.particle_grid.id,
+            state.particle_q,
+            model.particle_mass,
+            model.particle_substrate,
+            model.particle_fluid_phase,
+            model.fluid_smoothing_radius,
+            model.fluid_solid_coupling_s,
+        ],
+        outputs=[density],
+        device=device,
+    )
+    wp.launch(
+        compute_fluid_lambda,
+        dim=n,
+        inputs=[
+            model.particle_grid.id,
+            state.particle_q,
+            model.particle_mass,
+            model.particle_substrate,
+            model.particle_fluid_phase,
+            model.fluid_rest_density,
+            model.fluid_smoothing_radius,
+            density,
+            wp.float32(100.0),
+        ],
+        outputs=[lambdas],
+        device=device,
+    )
+    wp.launch(
+        compute_fluid_position_delta,
+        dim=n,
+        inputs=[
+            model.particle_grid.id,
+            state.particle_q,
+            model.particle_mass,
+            model.particle_substrate,
+            model.particle_fluid_phase,
+            model.fluid_rest_density,
+            model.fluid_smoothing_radius,
+            lambdas,
+            wp.float32(0.1),
+            wp.float32(0.3),
+            wp.float32(4.0),
+        ],
+        outputs=[deltas],
+        device=device,
+    )
+
+    dx = deltas.numpy()
+    # Particle 0 should be pushed in -x; particle 1 in +x.
+    test.assertLess(dx[0, 0], 0.0, f"particle 0 not pushed -x: {dx[0]}")
+    test.assertGreater(dx[1, 0], 0.0, f"particle 1 not pushed +x: {dx[1]}")
+
+
+add_function_test(
+    TestSolverUXPBDPhase4,
+    "test_uxpbd_pbf_position_delta_separates_overdense",
+    test_uxpbd_pbf_position_delta_separates_overdense,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()
