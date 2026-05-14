@@ -233,5 +233,42 @@ add_function_test(
 )
 
 
+def test_uxpbd_shock_propagation_param_accepted(test, device):
+    """SolverUXPBD accepts shock_propagation_k > 0 and uses scaled inv_mass.
+
+    A full settling test would need the SRXPBD tile primitives to work on
+    CPU (deferred to CUDA validation). Phase 2 Task 6 only validates that
+    the constructor parameter is wired and the kernel launch path executes.
+    """
+    builder = newton.ModelBuilder(up_axis="Z")
+    builder.add_ground_plane()
+    builder.add_particle_volume(
+        volume_data={"centers": [[0.0, 0.0, 0.1]], "radii": [0.05]},
+        total_mass=1.0,
+    )
+    model = builder.finalize(device=device)
+
+    solver = newton.solvers.SolverUXPBD(model, iterations=2, shock_propagation_k=2.0)
+    test.assertEqual(solver.shock_propagation_k, 2.0)
+    # Up axis should be Z (=2) for the default gravity (0, 0, -9.81).
+    test.assertEqual(solver._up_axis_int, 2)
+
+    # One step should run without crashing (the scaled-mass kernel launches).
+    state_0 = model.state()
+    state_1 = model.state()
+    contacts = model.contacts()
+    state_0.clear_forces()
+    model.collide(state_0, contacts)
+    solver.step(state_0, state_1, None, contacts, 0.001)
+
+
+add_function_test(
+    TestSolverUXPBDPhase2,
+    "test_uxpbd_shock_propagation_param_accepted",
+    test_uxpbd_shock_propagation_param_accepted,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -343,3 +343,34 @@ def solve_particle_particle_contacts_uxpbd(
         wp.atomic_add(body_delta, host_i, wp.spatial_vector(body_delta_lin, body_delta_ang))
     else:
         wp.atomic_add(particle_deltas, i, delta_acc)
+
+
+@wp.kernel
+def compute_mass_scale(
+    particle_q: wp.array[wp.vec3],
+    particle_mass: wp.array[wp.float32],
+    up_axis: int,
+    k_factor: float,
+    # output
+    scaled_inv_mass: wp.array[wp.float32],
+):
+    """UPPFRTA §5.2 stack-height mass scaling: m* = m * exp(-k * h).
+
+    Returns scaled inverse mass (1 / m*) so contact kernels can read it
+    directly. h is the particle's coordinate along ``up_axis`` (0=X, 1=Y, 2=Z).
+    Negative h is clamped to 0.
+    """
+    tid = wp.tid()
+    m = particle_mass[tid]
+    if m <= 0.0:
+        scaled_inv_mass[tid] = wp.float32(0.0)
+        return
+    h = particle_q[tid][up_axis]
+    if h < 0.0:
+        h = wp.float32(0.0)
+    scale = wp.exp(-k_factor * h)
+    m_eff = m * scale
+    if m_eff <= 0.0:
+        scaled_inv_mass[tid] = wp.float32(0.0)
+    else:
+        scaled_inv_mass[tid] = wp.float32(1.0) / m_eff

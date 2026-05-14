@@ -27,6 +27,7 @@ from ..xpbd.kernels import (
     solve_body_joints,
 )
 from .kernels import (
+    compute_mass_scale,
     solve_particle_particle_contacts_uxpbd,
     solve_particle_shape_contacts_uxpbd,
 )
@@ -57,6 +58,9 @@ class SolverUXPBD(SolverBase):
             corrections per iteration. Defaults to 0.4 (XPBD default).
         joint_linear_relaxation: Relaxation factor applied to linear joint
             corrections per iteration. Defaults to 0.7 (XPBD default).
+        shock_propagation_k: UPPFRTA mass-scaling factor for stack stability
+            (default 0 = off; positive values reduce upper-particle effective
+            mass via m* = m * exp(-k * h)).
         enable_cslc: Must be False in Phase 1. Reserved for v2.
 
     Raises:
@@ -73,6 +77,7 @@ class SolverUXPBD(SolverBase):
         joint_angular_compliance: float = 0.0,
         joint_angular_relaxation: float = 0.4,
         joint_linear_relaxation: float = 0.7,
+        shock_propagation_k: float = 0.0,
         enable_cslc: bool = False,
     ):
         super().__init__(model=model)
@@ -88,6 +93,19 @@ class SolverUXPBD(SolverBase):
         self.joint_angular_compliance = joint_angular_compliance
         self.joint_angular_relaxation = joint_angular_relaxation
         self.joint_linear_relaxation = joint_linear_relaxation
+        self.shock_propagation_k = shock_propagation_k
+
+        # Cache the up-axis integer (0=X, 1=Y, 2=Z) for shock propagation.
+        # Derived from the dominant gravity axis: gravity is along -up.
+        import numpy as _np  # noqa: PLC0415
+
+        grav_np = model.gravity.numpy()
+        if grav_np.shape[0] > 0:
+            abs_grav = _np.abs(grav_np[0])
+            self._up_axis_int: int = int(_np.argmax(abs_grav))
+        else:
+            self._up_axis_int = 2  # Z default
+
         self._init_kinematic_state()
 
         cache = build_shape_match_cache(model)
@@ -221,6 +239,26 @@ class SolverUXPBD(SolverBase):
             state_out.body_q = _body_q[_cur]
             state_out.body_qd = _body_qd[_cur]
 
+        # Compute scaled inverse mass for contact kernels (UPPFRTA §5.2).
+        if self.shock_propagation_k > 0.0 and model.particle_count > 0:
+            if not hasattr(self, "_scaled_inv_mass") or self._scaled_inv_mass.shape[0] != model.particle_count:
+                self._scaled_inv_mass = wp.zeros(model.particle_count, dtype=wp.float32, device=model.device)
+            wp.launch(
+                kernel=compute_mass_scale,
+                dim=model.particle_count,
+                inputs=[
+                    state_out.particle_q,
+                    model.particle_mass,
+                    self._up_axis_int,
+                    self.shock_propagation_k,
+                ],
+                outputs=[self._scaled_inv_mass],
+                device=model.device,
+            )
+            inv_mass_for_contact = self._scaled_inv_mass
+        else:
+            inv_mass_for_contact = model.particle_inv_mass
+
         for _ in range(self.iterations):
             if body_deltas is not None:
                 body_deltas.zero_()
@@ -236,7 +274,7 @@ class SolverUXPBD(SolverBase):
                     inputs=[
                         state_out.particle_q,
                         state_out.particle_qd,
-                        model.particle_inv_mass,
+                        inv_mass_for_contact,
                         model.particle_radius,
                         model.particle_flags,
                         model.particle_substrate,
@@ -307,7 +345,7 @@ class SolverUXPBD(SolverBase):
                         model.particle_grid.id,
                         state_out.particle_q,
                         state_out.particle_qd,
-                        model.particle_inv_mass,
+                        inv_mass_for_contact,
                         model.particle_radius,
                         model.particle_flags,
                         model.particle_group,
