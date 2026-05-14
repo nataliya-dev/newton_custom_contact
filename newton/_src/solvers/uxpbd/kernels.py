@@ -136,6 +136,10 @@ def solve_lattice_shape_contacts(
     shape_index = contact_shape[tid]
     shape_link = shape_body[shape_index]
 
+    # Skip self-contacts: lattice spheres embedded in their own host link's shape.
+    if shape_link == host_link:
+        return
+
     px = particle_x[particle_index]
     pv = particle_v[particle_index]
 
