@@ -228,10 +228,12 @@ class Model:
         """Anchor stiffness per lattice sphere [N/m], shape [lattice_sphere_count]. Unused in Phase 1."""
         self.lattice_k_lateral: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
         """Lateral stiffness per lattice sphere [N/m], shape [lattice_sphere_count]. Unused in Phase 1."""
-        self.lattice_k_contact: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
-        """Contact stiffness per lattice sphere [N/m], shape [lattice_sphere_count]. Unused in Phase 1."""
+        self.lattice_k_bulk: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
+        """Bulk material stiffness per lattice sphere [N/m], shape [lattice_sphere_count]. Phase 1 stores
+        the user-supplied value verbatim; v2 CSLC calibrates the per-sphere contact stiffness ``k_c``
+        from this bulk value via the formula in CSLC eq. (8). Unused in Phase 1."""
         self.lattice_damping: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
-        """Damping coefficient per lattice sphere [N·s/m], shape [lattice_sphere_count]. Unused in Phase 1."""
+        """Hunt-Crossley damping coefficient per lattice sphere [s/m], shape [lattice_sphere_count]. Unused in Phase 1."""
 
         self.shape_label: list[str] = []
         """List of labels for each shape."""

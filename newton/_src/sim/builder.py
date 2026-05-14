@@ -966,10 +966,10 @@ class ModelBuilder:
         """Anchor stiffness per lattice sphere [N/m] accumulated for :attr:`Model.lattice_k_anchor`."""
         self.lattice_k_lateral: list[float] = []
         """Lateral stiffness per lattice sphere [N/m] accumulated for :attr:`Model.lattice_k_lateral`."""
-        self.lattice_k_contact: list[float] = []
-        """Contact stiffness per lattice sphere [N/m] accumulated for :attr:`Model.lattice_k_contact`."""
+        self.lattice_k_bulk: list[float] = []
+        """Bulk material stiffness per lattice sphere [N/m] accumulated for :attr:`Model.lattice_k_bulk`."""
         self.lattice_damping: list[float] = []
-        """Damping coefficient per lattice sphere [N·s/m] accumulated for :attr:`Model.lattice_damping`."""
+        """Hunt-Crossley damping coefficient per lattice sphere [s/m] accumulated for :attr:`Model.lattice_damping`."""
 
         # shapes (each shape has an entry in these arrays)
         self.shape_label: list[str] = []
@@ -7550,6 +7550,21 @@ class ModelBuilder:
         See ``docs/superpowers/specs/2026-05-13-uxpbd-design.md`` section 5 for
         the full data model and v2 CSLC extension hooks.
 
+        .. note::
+            The host link must have a physically realistic inertia tensor.
+            A body created with :meth:`add_body` but no collision shape has
+            its inertia clamped by ``validate_inertia`` to ``~1e-6 kg m^2``,
+            producing ``inv_I ~ 1e6``. With off-COM lattice contacts the
+            resulting torques ``tau = r x F`` blow up angular velocity
+            within a few hundred substeps. Either add a collision shape
+            (``add_shape_box``/``add_shape_sphere``/``add_shape_capsule``/
+            etc.) to the link so Newton derives a sensible inertia, or
+            pass an explicit ``inertia=...`` argument to :meth:`add_body`.
+            The self-contact guard in ``solve_lattice_shape_contacts``
+            prevents the link's own analytical shape from colliding with
+            its lattice spheres, so adding a shape solely for inertia has
+            no contact side effects.
+
         Args:
             link: The articulated link (``body_index``) that hosts this lattice.
             morphit_json: Path to a MorphIt JSON file, or an already-parsed dict with the same shape.
@@ -7563,7 +7578,9 @@ class ModelBuilder:
             k_anchor: Anchor spring stiffness for v2 CSLC [N/m]. Stored in
                 ``model.lattice_k_anchor``; not read in Phase 1.
             k_lateral: Lateral coupling stiffness for v2 CSLC [N/m]. Stored.
-            k_bulk: Bulk material stiffness for v2 CSLC [N/m]. Stored.
+            k_bulk: Bulk material stiffness for v2 CSLC [N/m]. Stored in
+                ``model.lattice_k_bulk``; v2 calibrates the per-sphere
+                contact stiffness ``k_c`` from this value.
             damping: Hunt-Crossley damping coefficient for v2 CSLC [s/m]. Stored.
 
         Returns:
@@ -10220,7 +10237,7 @@ class ModelBuilder:
                 m.lattice_K_diag = wp.zeros(n_lat, dtype=wp.float32, device=device)
                 m.lattice_k_anchor = wp.array(self.lattice_k_anchor, dtype=wp.float32, device=device)
                 m.lattice_k_lateral = wp.array(self.lattice_k_lateral, dtype=wp.float32, device=device)
-                m.lattice_k_contact = wp.array(self.lattice_k_contact, dtype=wp.float32, device=device)
+                m.lattice_k_bulk = wp.array(self.lattice_k_bulk, dtype=wp.float32, device=device)
                 m.lattice_damping = wp.array(self.lattice_damping, dtype=wp.float32, device=device)
                 # lattice_neighbors_* stay empty until later tasks generate adjacency.
 

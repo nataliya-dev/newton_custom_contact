@@ -136,7 +136,15 @@ def solve_lattice_shape_contacts(
     shape_index = contact_shape[tid]
     shape_link = shape_body[shape_index]
 
-    # Skip self-contacts: lattice spheres embedded in their own host link's shape.
+    # Skip self-contacts. When a link carries both an analytical collision shape
+    # (e.g. add_shape_box) and a MorphIt lattice, the collision pipeline finds
+    # particle-shape overlaps between the embedded lattice spheres and the host
+    # body's own analytical shape. Resolving these as contacts produces spurious
+    # bidirectional impulses that diverge within ~50 frames. Skipping when the
+    # contact's shape body equals the lattice sphere's host link is the
+    # correct fix: the lattice spheres ARE the body's particle-world
+    # representation, so the analytical shape on the same body is logically
+    # redundant for physics (it remains for rendering / debug visualization).
     if shape_link == host_link:
         return
 

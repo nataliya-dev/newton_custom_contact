@@ -165,7 +165,7 @@ def add_lattice_to_builder(
         builder.lattice_particle_index.append(int(particle_idx))
         builder.lattice_k_anchor.append(float(k_anchor))
         builder.lattice_k_lateral.append(float(k_lateral))
-        builder.lattice_k_contact.append(float(k_bulk))
+        builder.lattice_k_bulk.append(float(k_bulk))
         builder.lattice_damping.append(float(damping))
 
     return lattice_start

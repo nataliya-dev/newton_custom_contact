@@ -36,6 +36,16 @@ class SolverUXPBD(SolverBase):
         model: The :class:`~newton.Model` to simulate.
         iterations: Number of main constraint loop iterations per step.
         stabilization_iterations: UPPFRTA stabilization pre-pass iterations.
+        soft_contact_relaxation: Relaxation factor for lattice-shape contact
+            corrections; lower values damp contact response. Defaults to 0.8.
+        joint_linear_compliance: Linear-axis compliance for joint constraints
+            (XPBD ``alpha`` for translation). Defaults to 0.0 (hard).
+        joint_angular_compliance: Angular-axis compliance for joint constraints.
+            Defaults to 0.0 (hard).
+        joint_angular_relaxation: Relaxation factor applied to angular joint
+            corrections per iteration. Defaults to 0.4 (XPBD default).
+        joint_linear_relaxation: Relaxation factor applied to linear joint
+            corrections per iteration. Defaults to 0.7 (XPBD default).
         enable_cslc: Must be False in Phase 1. Reserved for v2.
 
     Raises:
@@ -47,6 +57,11 @@ class SolverUXPBD(SolverBase):
         model: Model,
         iterations: int = 4,
         stabilization_iterations: int = 1,
+        soft_contact_relaxation: float = 0.8,
+        joint_linear_compliance: float = 0.0,
+        joint_angular_compliance: float = 0.0,
+        joint_angular_relaxation: float = 0.4,
+        joint_linear_relaxation: float = 0.7,
         enable_cslc: bool = False,
     ):
         super().__init__(model=model)
@@ -57,6 +72,11 @@ class SolverUXPBD(SolverBase):
             )
         self.iterations = iterations
         self.stabilization_iterations = stabilization_iterations
+        self.soft_contact_relaxation = soft_contact_relaxation
+        self.joint_linear_compliance = joint_linear_compliance
+        self.joint_angular_compliance = joint_angular_compliance
+        self.joint_angular_relaxation = joint_angular_relaxation
+        self.joint_linear_relaxation = joint_linear_relaxation
         self._init_kinematic_state()
 
     def step(
@@ -207,7 +227,7 @@ class SolverUXPBD(SolverBase):
                         contacts.soft_contact_max,
                         model.particle_to_lattice,
                         dt,
-                        0.8,
+                        self.soft_contact_relaxation,
                     ],
                     outputs=[body_deltas],
                     device=model.device,
@@ -250,10 +270,10 @@ class SolverUXPBD(SolverBase):
                         control.joint_target_vel,
                         model.joint_target_ke,
                         model.joint_target_kd,
-                        0.0,
-                        0.0,
-                        0.4,
-                        0.7,
+                        self.joint_linear_compliance,
+                        self.joint_angular_compliance,
+                        self.joint_angular_relaxation,
+                        self.joint_linear_relaxation,
                         dt,
                     ],
                     outputs=[body_deltas, impulse_out],
