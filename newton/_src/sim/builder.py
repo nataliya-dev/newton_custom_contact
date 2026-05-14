@@ -10241,6 +10241,18 @@ class ModelBuilder:
                 m.lattice_damping = wp.array(self.lattice_damping, dtype=wp.float32, device=device)
                 # lattice_neighbors_* stay empty until later tasks generate adjacency.
 
+            # Per-link CSR offsets for the lattice arrays.
+            if n_lat:
+                body_count = len(self.body_label)
+                starts_np = np.zeros(body_count, dtype=np.int32)
+                counts_np = np.zeros(body_count, dtype=np.int32)
+                for sphere_idx, link in enumerate(self.lattice_link):
+                    if counts_np[link] == 0:
+                        starts_np[link] = sphere_idx
+                    counts_np[link] += 1
+                m.link_lattice_sphere_start = wp.array(starts_np, dtype=wp.int32, device=device)
+                m.link_lattice_sphere_count = wp.array(counts_np, dtype=wp.int32, device=device)
+
             # Reverse index from particle slot to lattice sphere index.
             n_particles = len(self.particle_q)
             p_to_l = np.full(n_particles, -1, dtype=np.int32)

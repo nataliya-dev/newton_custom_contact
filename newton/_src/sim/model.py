@@ -235,6 +235,15 @@ class Model:
         self.lattice_damping: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
         """Hunt-Crossley damping coefficient per lattice sphere [s/m], shape [lattice_sphere_count]. Unused in Phase 1."""
 
+        # UXPBD Phase 2: per-link CSR offsets into the flat lattice arrays.
+        # link_lattice_sphere_start[link] is the starting index for this link's
+        # lattice spheres; link_lattice_sphere_count[link] is the count. Lets
+        # kernels iterate one link's lattice without scanning the global list.
+        self.link_lattice_sphere_start: wp.array[wp.int32] = wp.empty(0, dtype=wp.int32, device=device)
+        """CSR row-start offsets per link into the flat ``lattice_*`` arrays, shape [body_count]."""
+        self.link_lattice_sphere_count: wp.array[wp.int32] = wp.empty(0, dtype=wp.int32, device=device)
+        """Number of lattice spheres hosted by each link, shape [body_count]. Zero for unshelled links."""
+
         self.shape_label: list[str] = []
         """List of labels for each shape."""
         self.shape_transform: wp.array[wp.transform] | None = None
