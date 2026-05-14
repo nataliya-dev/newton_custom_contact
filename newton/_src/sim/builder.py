@@ -7560,7 +7560,7 @@ class ModelBuilder:
             (``add_shape_box``/``add_shape_sphere``/``add_shape_capsule``/
             etc.) to the link so Newton derives a sensible inertia, or
             pass an explicit ``inertia=...`` argument to :meth:`add_body`.
-            The self-contact guard in ``solve_lattice_shape_contacts``
+            The self-contact guard in ``solve_particle_shape_contacts_uxpbd``
             prevents the link's own analytical shape from colliding with
             its lattice spheres, so adding a shape solely for inertia has
             no contact side effects.

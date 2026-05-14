@@ -26,7 +26,10 @@ from ..xpbd.kernels import (
     copy_kinematic_body_state_kernel,
     solve_body_joints,
 )
-from .kernels import solve_lattice_shape_contacts
+from .kernels import (
+    solve_particle_particle_contacts_uxpbd,
+    solve_particle_shape_contacts_uxpbd,
+)
 from .kernels import update_lattice_world_positions as update_lattice_world_positions_kernel
 from .shape_match import build_shape_match_cache
 
@@ -222,17 +225,22 @@ class SolverUXPBD(SolverBase):
             if body_deltas is not None:
                 body_deltas.zero_()
 
-            # Lattice-shape contacts (Phase 1's only contact path).
-            if contacts is not None and model.lattice_sphere_count and body_deltas is not None:
+            # Particle-shape contacts: dispatches on particle_substrate.
+            # Lattice particles (substrate=0) route deltas into body_deltas.
+            # SM-rigid particles (substrate=1) route into particle_deltas_contact.
+            if contacts is not None and body_deltas is not None:
+                particle_deltas_contact = wp.zeros(model.particle_count, dtype=wp.vec3, device=model.device)
                 wp.launch(
-                    kernel=solve_lattice_shape_contacts,
+                    kernel=solve_particle_shape_contacts_uxpbd,
                     dim=contacts.soft_contact_max,
                     inputs=[
                         state_out.particle_q,
                         state_out.particle_qd,
+                        model.particle_inv_mass,
                         model.particle_radius,
                         model.particle_flags,
-                        model.lattice_particle_index,
+                        model.particle_substrate,
+                        model.particle_to_lattice,
                         model.lattice_link,
                         state_out.body_q,
                         state_out.body_qd,
@@ -250,17 +258,96 @@ class SolverUXPBD(SolverBase):
                         contacts.soft_contact_body_vel,
                         contacts.soft_contact_normal,
                         contacts.soft_contact_max,
-                        model.particle_to_lattice,
                         dt,
                         self.soft_contact_relaxation,
                     ],
-                    outputs=[body_deltas],
+                    outputs=[body_deltas, particle_deltas_contact],
                     device=model.device,
                 )
 
                 _apply_deltas_flip()
 
                 # Re-sync lattice after body update so next iter sees consistent state.
+                self.update_lattice_world_positions(state_out)
+
+                # Apply particle-side deltas from shape contact (SM-rigid path).
+                if model.particle_count > 0:
+                    new_q = wp.empty_like(state_out.particle_q)
+                    new_qd = wp.empty_like(state_out.particle_qd)
+                    wp.launch(
+                        kernel=srxpbd_apply_particle_deltas,
+                        dim=model.particle_count,
+                        inputs=[
+                            self.particle_q_rest,
+                            state_out.particle_q,
+                            state_out.particle_qd,
+                            model.particle_flags,
+                            model.particle_mass,
+                            particle_deltas_contact,
+                            dt,
+                            model.particle_max_velocity,
+                        ],
+                        outputs=[new_q, new_qd],
+                        device=model.device,
+                    )
+                    state_out.particle_q = new_q
+                    state_out.particle_qd = new_qd
+                    self.update_lattice_world_positions(state_out)
+
+            # Cross-substrate particle-particle contact pass.
+            if model.particle_count > 1 and model.particle_grid is not None and body_deltas is not None:
+                search_radius = model.particle_max_radius * 2.0 + model.particle_cohesion
+                with wp.ScopedDevice(model.device):
+                    model.particle_grid.build(state_out.particle_q, radius=search_radius)
+                pp_particle_deltas = wp.zeros(model.particle_count, dtype=wp.vec3, device=model.device)
+                wp.launch(
+                    kernel=solve_particle_particle_contacts_uxpbd,
+                    dim=model.particle_count,
+                    inputs=[
+                        model.particle_grid.id,
+                        state_out.particle_q,
+                        state_out.particle_qd,
+                        model.particle_inv_mass,
+                        model.particle_radius,
+                        model.particle_flags,
+                        model.particle_group,
+                        model.particle_substrate,
+                        model.particle_to_lattice,
+                        model.lattice_link,
+                        state_out.body_q,
+                        model.body_com,
+                        self.body_inv_mass_effective,
+                        self.body_inv_inertia_effective,
+                        model.particle_mu,
+                        model.particle_cohesion,
+                        model.particle_max_radius,
+                        dt,
+                        self.soft_contact_relaxation,
+                    ],
+                    outputs=[pp_particle_deltas, body_deltas],
+                    device=model.device,
+                )
+                _apply_deltas_flip()
+                new_q = wp.empty_like(state_out.particle_q)
+                new_qd = wp.empty_like(state_out.particle_qd)
+                wp.launch(
+                    kernel=srxpbd_apply_particle_deltas,
+                    dim=model.particle_count,
+                    inputs=[
+                        self.particle_q_rest,
+                        state_out.particle_q,
+                        state_out.particle_qd,
+                        model.particle_flags,
+                        model.particle_mass,
+                        pp_particle_deltas,
+                        dt,
+                        model.particle_max_velocity,
+                    ],
+                    outputs=[new_q, new_qd],
+                    device=model.device,
+                )
+                state_out.particle_q = new_q
+                state_out.particle_qd = new_qd
                 self.update_lattice_world_positions(state_out)
 
             # Joints

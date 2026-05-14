@@ -82,41 +82,44 @@ def lattice_sphere_w_eff(
 
 
 @wp.kernel
-def solve_lattice_shape_contacts(
+def solve_particle_shape_contacts_uxpbd(
     particle_x: wp.array[wp.vec3],
     particle_v: wp.array[wp.vec3],
-    particle_radius: wp.array[float],
+    particle_invmass: wp.array[wp.float32],
+    particle_radius: wp.array[wp.float32],
     particle_flags: wp.array[wp.int32],
-    lattice_particle_index: wp.array[wp.int32],
+    particle_substrate: wp.array[wp.uint8],
+    particle_to_lattice: wp.array[wp.int32],
     lattice_link: wp.array[wp.int32],
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_com: wp.array[wp.vec3],
-    body_m_inv: wp.array[float],
+    body_m_inv: wp.array[wp.float32],
     body_I_inv: wp.array[wp.mat33],
-    shape_body: wp.array[int],
-    shape_material_mu: wp.array[float],
+    shape_body: wp.array[wp.int32],
+    shape_material_mu: wp.array[wp.float32],
     particle_mu: float,
     particle_ka: float,
-    contact_count: wp.array[int],
-    contact_particle: wp.array[int],
-    contact_shape: wp.array[int],
+    contact_count: wp.array[wp.int32],
+    contact_particle: wp.array[wp.int32],
+    contact_shape: wp.array[wp.int32],
     contact_body_pos: wp.array[wp.vec3],
     contact_body_vel: wp.array[wp.vec3],
     contact_normal: wp.array[wp.vec3],
     contact_max: int,
-    particle_to_lattice: wp.array[wp.int32],
     dt: float,
     relaxation: float,
     # outputs
     body_delta: wp.array[wp.spatial_vector],
+    particle_deltas: wp.array[wp.vec3],
 ):
-    """Lattice-aware variant of XPBD's solve_particle_shape_contacts.
+    """Phase 2 cross-substrate particle-shape contact.
 
-    Routes the position correction for each lattice-sphere contact into the
-    host link's spatial wrench accumulator. Non-lattice particles are
-    ignored by this kernel; XPBD's solve_particle_shape_contacts handles
-    those in later phases.
+    Substrate 0 (lattice): routes Δx into the host link's spatial wrench
+        (Newton's 3rd law on the shape side; self-contact with host shape is
+        skipped, same as Phase 1).
+    Substrate 1 (SM-rigid): routes Δx into particle_deltas; the SRXPBD
+        shape-matching pass at the end of the iteration re-enforces rigidity.
     """
     tid = wp.tid()
     count = wp.min(contact_max, contact_count[0])
@@ -127,31 +130,21 @@ def solve_lattice_shape_contacts(
     if (particle_flags[particle_index] & ParticleFlags.ACTIVE) == 0:
         return
 
-    # Only handle lattice particles in this kernel.
-    lat_idx = particle_to_lattice[particle_index]
-    if lat_idx < 0:
-        return
+    sub = particle_substrate[particle_index]
+    is_lattice = sub == wp.uint8(0)
 
-    host_link = lattice_link[lat_idx]
     shape_index = contact_shape[tid]
     shape_link = shape_body[shape_index]
 
-    # Skip self-contacts. When a link carries both an analytical collision shape
-    # (e.g. add_shape_box) and a MorphIt lattice, the collision pipeline finds
-    # particle-shape overlaps between the embedded lattice spheres and the host
-    # body's own analytical shape. Resolving these as contacts produces spurious
-    # bidirectional impulses that diverge within ~50 frames. Skipping when the
-    # contact's shape body equals the lattice sphere's host link is the
-    # correct fix: the lattice spheres ARE the body's particle-world
-    # representation, so the analytical shape on the same body is logically
-    # redundant for physics (it remains for rendering / debug visualization).
-    if shape_link == host_link:
-        return
+    # Self-contact guard for the lattice case.
+    if is_lattice:
+        host_link = lattice_link[particle_to_lattice[particle_index]]
+        if shape_link == host_link:
+            return
 
     px = particle_x[particle_index]
     pv = particle_v[particle_index]
 
-    # Build the world-space contact frame from the shape side.
     X_wb = wp.transform_identity()
     X_com = wp.vec3()
     if shape_link >= 0:
@@ -168,67 +161,185 @@ def solve_lattice_shape_contacts(
 
     mu = 0.5 * (particle_mu + shape_material_mu[shape_index])
 
-    # Shape-side body velocity at contact.
     body_v_s = wp.spatial_vector()
     if shape_link >= 0:
         body_v_s = body_qd[shape_link]
     body_w = wp.spatial_bottom(body_v_s)
     body_v = wp.spatial_top(body_v_s)
     bv = body_v + wp.cross(body_w, r_shape) + wp.transform_vector(X_wb, contact_body_vel[tid])
-
-    # Relative velocity at contact.
     v = pv - bv
 
-    # Effective inverse mass on the lattice side using the host link's inertia.
-    host_q = body_q[host_link]
-    host_com_world = wp.transform_point(host_q, body_com[host_link])
-    r_lat = px - host_com_world
-    w_lat = lattice_sphere_w_eff(
-        body_m_inv[host_link],
-        body_I_inv[host_link],
-        wp.transform_get_rotation(host_q),
-        r_lat,
-        n,
-    )
-
-    # Effective inverse mass on the shape side.
-    w_shape = float(0.0)
-    if shape_link >= 0:
-        angular = wp.cross(r_shape, n)
-        q_shape = wp.transform_get_rotation(X_wb)
-        rot_angular = wp.quat_rotate_inv(q_shape, angular)
-        w_shape = body_m_inv[shape_link] + wp.dot(rot_angular, body_I_inv[shape_link] * rot_angular)
-
-    denom = w_lat + w_shape
-    if denom == 0.0:
-        return
-
-    # Normal correction in velocity domain: lambda = c / (dt * denom).
-    # Matching the convention of solve_body_contact_positions (compute_contact_constraint_delta),
-    # apply_body_deltas interprets body_delta linear part as velocity-domain, so
-    # dp = body_delta * inv_m [m/s], p += dp * dt [m], v += dp [m/s].
-    # Dividing c by dt gives impulse-scale correction sufficient to stop a fast body.
     lambda_n = c / dt
     delta_n = n * lambda_n
-
-    # Friction (Coulomb, velocity-level).
     vn = wp.dot(n, v)
     vt = v - n * vn
     lambda_f = wp.max(mu * lambda_n, -wp.length(vt))
     delta_f = wp.normalize(vt) * lambda_f
 
+    # Particle-side effective inverse mass.
+    if is_lattice:
+        host_link = lattice_link[particle_to_lattice[particle_index]]
+        host_q = body_q[host_link]
+        host_com_world = wp.transform_point(host_q, body_com[host_link])
+        r_lat = px - host_com_world
+        angular = wp.cross(r_lat, n)
+        rot_angular = wp.quat_rotate_inv(wp.transform_get_rotation(host_q), angular)
+        w_particle = body_m_inv[host_link] + wp.dot(rot_angular, body_I_inv[host_link] * rot_angular)
+    else:
+        w_particle = particle_invmass[particle_index]
+
+    # Shape-side effective inverse mass.
+    w_shape = wp.float32(0.0)
+    if shape_link >= 0:
+        angular = wp.cross(r_shape, n)
+        rot_angular = wp.quat_rotate_inv(wp.transform_get_rotation(X_wb), angular)
+        w_shape = body_m_inv[shape_link] + wp.dot(rot_angular, body_I_inv[shape_link] * rot_angular)
+
+    denom = w_particle + w_shape
+    if denom == 0.0:
+        return
+
     delta_total = (delta_f - delta_n) / denom * relaxation
 
-    # Route the position correction into the host body.
-    # The lattice sphere is rigidly attached to the body, so the body receives
-    # the same correction direction as the sphere (unlike XPBD particle-shape
-    # where the shape body receives the Newton's-3rd-law reaction).
-    # apply_body_deltas: dp = spatial_top(body_delta) * inv_m => p += dp * dt,
-    # so a positive linear contribution moves the body in that direction.
-    t_lat = wp.cross(r_lat, delta_total)
-    wp.atomic_add(body_delta, host_link, wp.spatial_vector(delta_total, t_lat))
+    # Route particle-side correction.
+    if is_lattice:
+        host_link = lattice_link[particle_to_lattice[particle_index]]
+        host_q = body_q[host_link]
+        host_com_world = wp.transform_point(host_q, body_com[host_link])
+        r_lat = px - host_com_world
+        t_lat = wp.cross(r_lat, delta_total)
+        wp.atomic_add(body_delta, host_link, wp.spatial_vector(delta_total, t_lat))
+    else:
+        wp.atomic_add(particle_deltas, particle_index, delta_total * w_particle)
 
+    # Newton's 3rd law on the shape side.
     if shape_link >= 0:
-        # Shape is dynamic: also push back its body.
         t_shape = wp.cross(r_shape, delta_total)
         wp.atomic_sub(body_delta, shape_link, wp.spatial_vector(delta_total, t_shape))
+
+
+@wp.kernel
+def solve_particle_particle_contacts_uxpbd(
+    grid: wp.uint64,
+    particle_x: wp.array[wp.vec3],
+    particle_v: wp.array[wp.vec3],
+    particle_invmass: wp.array[wp.float32],
+    particle_radius: wp.array[wp.float32],
+    particle_flags: wp.array[wp.int32],
+    particle_group: wp.array[wp.int32],
+    particle_substrate: wp.array[wp.uint8],
+    particle_to_lattice: wp.array[wp.int32],
+    lattice_link: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_m_inv: wp.array[wp.float32],
+    body_I_inv: wp.array[wp.mat33],
+    k_mu: float,
+    k_cohesion: float,
+    max_radius: float,
+    dt: float,
+    relaxation: float,
+    # outputs
+    particle_deltas: wp.array[wp.vec3],
+    body_delta: wp.array[wp.spatial_vector],
+):
+    """Cross-substrate particle-particle contact.
+
+    For each cross-phase pair: lattice particles route corrections into body
+    wrenches, SM-rigid particles route into particle_deltas. Same-group and
+    same-lattice-host pairs are skipped.
+    """
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid, tid)
+    if i == -1:
+        return
+    if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+        return
+
+    sub_i = particle_substrate[i]
+    is_lat_i = sub_i == wp.uint8(0)
+
+    x_i = particle_x[i]
+    v_i = particle_v[i]
+    r_i = particle_radius[i]
+
+    query = wp.hash_grid_query(grid, x_i, r_i + max_radius + k_cohesion)
+    index = int(0)
+    delta_acc = wp.vec3(0.0)
+    body_delta_lin = wp.vec3(0.0)
+    body_delta_ang = wp.vec3(0.0)
+
+    while wp.hash_grid_query_next(query, index):
+        if index == i:
+            continue
+        if (particle_flags[index] & ParticleFlags.ACTIVE) == 0:
+            continue
+        # Same particle group -> skip (handled by shape matching).
+        if particle_group[i] >= 0 and particle_group[i] == particle_group[index]:
+            continue
+        sub_j = particle_substrate[index]
+        is_lat_j = sub_j == wp.uint8(0)
+        # Same lattice host -> skip.
+        if is_lat_i and is_lat_j:
+            host_i = lattice_link[particle_to_lattice[i]]
+            host_j = lattice_link[particle_to_lattice[index]]
+            if host_i == host_j:
+                continue
+
+        n = x_i - particle_x[index]
+        d = wp.length(n)
+        err = d - r_i - particle_radius[index]
+        if err > k_cohesion:
+            continue
+        if d < 1e-12:
+            continue
+        n_unit = n / d
+
+        # Effective inverse mass for each side.
+        if is_lat_i:
+            host_i = lattice_link[particle_to_lattice[i]]
+            host_q = body_q[host_i]
+            r_lat_i = x_i - wp.transform_point(host_q, body_com[host_i])
+            angular = wp.cross(r_lat_i, n_unit)
+            rot_a = wp.quat_rotate_inv(wp.transform_get_rotation(host_q), angular)
+            w_i = body_m_inv[host_i] + wp.dot(rot_a, body_I_inv[host_i] * rot_a)
+        else:
+            w_i = particle_invmass[i]
+
+        if is_lat_j:
+            host_j = lattice_link[particle_to_lattice[index]]
+            host_q = body_q[host_j]
+            r_lat_j = particle_x[index] - wp.transform_point(host_q, body_com[host_j])
+            angular = wp.cross(r_lat_j, n_unit)
+            rot_a = wp.quat_rotate_inv(wp.transform_get_rotation(host_q), angular)
+            w_j = body_m_inv[host_j] + wp.dot(rot_a, body_I_inv[host_j] * rot_a)
+        else:
+            w_j = particle_invmass[index]
+
+        denom = w_i + w_j
+        if denom == 0.0:
+            continue
+
+        vrel = v_i - particle_v[index]
+        lambda_n = err / dt
+        delta_n = n_unit * lambda_n
+        vn = wp.dot(n_unit, vrel)
+        vt = vrel - n_unit * vn
+        lambda_f = wp.max(k_mu * lambda_n, -wp.length(vt))
+        delta_f = wp.normalize(vt) * lambda_f
+        d_total = (delta_f - delta_n) / denom * relaxation
+
+        if is_lat_i:
+            host_i = lattice_link[particle_to_lattice[i]]
+            host_q = body_q[host_i]
+            r_lat_i = x_i - wp.transform_point(host_q, body_com[host_i])
+            body_delta_lin += d_total
+            body_delta_ang += wp.cross(r_lat_i, d_total)
+        else:
+            delta_acc += d_total * w_i
+
+    if is_lat_i:
+        host_i = lattice_link[particle_to_lattice[i]]
+        wp.atomic_add(body_delta, host_i, wp.spatial_vector(body_delta_lin, body_delta_ang))
+    else:
+        wp.atomic_add(particle_deltas, i, delta_acc)

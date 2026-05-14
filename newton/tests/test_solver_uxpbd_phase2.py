@@ -178,5 +178,60 @@ add_function_test(
 )
 
 
+def test_uxpbd_sm_rigid_cube_drops_to_ground(test, device):
+    """A free SM-rigid cube falls and settles on the ground plane.
+
+    Validates the cross-substrate particle-shape contact path: SM-rigid
+    particles must contact the ground plane via solve_particle_shape_contacts_uxpbd
+    and route deltas into particle_deltas (not the body wrench path).
+
+    Skipped on CPU due to the Warp tile-reduce CPU limitation documented
+    in test_uxpbd_sm_rigid_cube_stays_rigid.
+    """
+    if not device.is_cuda:
+        test.skipTest("SRXPBD tiled shape-matching does not broadcast correctly on CPU (Warp 1.14.0).")
+
+    builder = newton.ModelBuilder(up_axis="Z")
+    builder.add_ground_plane()
+    half_extent = 0.11
+    sphere_r = 0.025
+    coords = np.linspace(-half_extent + sphere_r, half_extent - sphere_r, 4)
+    xs, ys, zs = np.meshgrid(coords, coords, coords, indexing="ij")
+    centers = np.stack([xs.flatten(), ys.flatten(), zs.flatten()], axis=1)
+    radii = np.full(centers.shape[0], sphere_r)
+    builder.add_particle_volume(
+        volume_data={"centers": centers.tolist(), "radii": radii.tolist()},
+        total_mass=4.0,
+        pos=wp.vec3(0.0, 0.0, 0.5),
+    )
+    model = builder.finalize(device=device)
+    model.particle_mu = 0.4
+    model.soft_contact_mu = 0.4
+
+    solver = newton.solvers.SolverUXPBD(model, iterations=10)
+    state_0 = model.state()
+    state_1 = model.state()
+    dt = 0.001
+    contacts = model.contacts()
+    for _ in range(2000):
+        state_0.clear_forces()
+        model.collide(state_0, contacts)
+        solver.step(state_0, state_1, None, contacts, dt)
+        state_0, state_1 = state_1, state_0
+
+    # Cube rests with bottom sphere touching ground: COM_z = half_extent ~= 0.11.
+    particle_q = state_0.particle_q.numpy()
+    com_z = float(np.mean(particle_q[:, 2]))
+    test.assertAlmostEqual(com_z, 0.11, delta=0.02, msg=f"cube settled at {com_z}, expected ~0.11")
+
+
+add_function_test(
+    TestSolverUXPBDPhase2,
+    "test_uxpbd_sm_rigid_cube_drops_to_ground",
+    test_uxpbd_sm_rigid_cube_drops_to_ground,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()

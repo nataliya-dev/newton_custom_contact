@@ -14,7 +14,7 @@
 # physically realistic inertia tensor. Without it, validate_inertia clamps
 # the inertia to ~1e-6 kg*m^2 (inv_I ~ 1e6), and torques from off-COM
 # contacts (tau = r x F, |r| up to 0.14 m) blow up angular velocity within
-# ~1500 substeps. The self-contact guard in solve_lattice_shape_contacts
+# ~1500 substeps. The self-contact guard in solve_particle_shape_contacts_uxpbd
 # prevents the body's own box from colliding with its own lattice spheres.
 #
 # Resting geometry:
@@ -57,7 +57,7 @@ class Example:
         # inertia tensor (I ~ 1/6 * m * side^2 per axis). Without a shape,
         # validate_inertia clamps to ~1e-6 kg*m^2, giving inv_I ~ 1e6, which
         # causes torque blow-up from off-COM lattice contacts.
-        # The self-contact guard in solve_lattice_shape_contacts (shape_link ==
+        # The self-contact guard in solve_particle_shape_contacts_uxpbd (shape_link ==
         # host_link) prevents this box from colliding with the body's own lattice.
         builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
 
