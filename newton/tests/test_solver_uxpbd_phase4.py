@@ -140,5 +140,61 @@ add_function_test(
 )
 
 
+def test_uxpbd_pbf_lambda_at_rest_density(test, device):
+    """When density == rest_density, lambda is 0 (unilateral)."""
+    from newton._src.solvers.uxpbd.fluid import compute_fluid_lambda  # noqa: PLC0415
+
+    builder = newton.ModelBuilder()
+    builder.add_fluid_grid(
+        pos=wp.vec3(0.0, 0.0, 0.0),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0, 0.0, 0.0),
+        dim_x=1,
+        dim_y=1,
+        dim_z=1,
+        cell_x=1.0,
+        cell_y=1.0,
+        cell_z=1.0,
+        particle_radius=0.005,
+        rest_density=1000.0,
+    )
+    model = builder.finalize(device=device)
+    state = model.state()
+    if model.particle_grid is None:
+        model.particle_grid = wp.HashGrid(128, 128, 128)
+
+    n = model.particle_count
+    density = wp.array([1000.0] * n, dtype=wp.float32, device=device)
+    lambdas = wp.zeros(n, dtype=wp.float32, device=device)
+
+    model.particle_grid.build(state.particle_q, model.particle_max_radius * 4.0)
+    wp.launch(
+        kernel=compute_fluid_lambda,
+        dim=n,
+        inputs=[
+            model.particle_grid.id,
+            state.particle_q,
+            model.particle_mass,
+            model.particle_substrate,
+            model.particle_fluid_phase,
+            model.fluid_rest_density,
+            model.fluid_smoothing_radius,
+            density,
+            wp.float32(100.0),
+        ],
+        outputs=[lambdas],
+        device=device,
+    )
+    test.assertAlmostEqual(float(lambdas.numpy()[0]), 0.0, delta=1e-6)
+
+
+add_function_test(
+    TestSolverUXPBDPhase4,
+    "test_uxpbd_pbf_lambda_at_rest_density",
+    test_uxpbd_pbf_lambda_at_rest_density,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()

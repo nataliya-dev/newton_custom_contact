@@ -129,3 +129,83 @@ def compute_fluid_density(
             # Fluid-solid contribution: scaled by coupling factor s.
             rho += s_scale * particle_mass[j] * w
     density[i] = rho
+
+
+@wp.kernel
+def compute_fluid_lambda(
+    grid: wp.uint64,
+    particle_x: wp.array[wp.vec3],
+    particle_mass: wp.array[wp.float32],
+    particle_substrate: wp.array[wp.uint8],
+    particle_fluid_phase: wp.array[wp.int32],
+    fluid_rest_density: wp.array[wp.float32],
+    fluid_smoothing_radius: wp.array[wp.float32],
+    density: wp.array[wp.float32],
+    epsilon: wp.float32,
+    # output
+    lambdas: wp.array[wp.float32],
+):
+    """Compute per-fluid-particle Lagrange multiplier lambda.
+
+    For the unilateral density constraint C_i = rho_i / rho_0 - 1 (active
+    only when rho_i > rho_0):
+
+        lambda_i = -C_i / (sum_k |grad_k C_i|^2 + epsilon)
+
+    Self-gradient grad_i C_i = -sum_{k != i} grad_k C_i (Newton's 3rd law
+    for the kernel). epsilon ~ 100 is Macklin and Muller's relaxation.
+
+    Reference: Macklin and Muller 2013, "Position Based Fluids", eq. 11.
+
+    Args:
+        grid: Warp hash grid id built from particle positions.
+        particle_x: Particle positions [m], shape [particle_count].
+        particle_mass: Particle masses [kg], shape [particle_count].
+        particle_substrate: Substrate type per particle; value 3 denotes fluid.
+        particle_fluid_phase: Fluid phase index per particle; -1 for non-fluid.
+        fluid_rest_density: Rest density rho_0 per fluid phase [kg/m^3].
+        fluid_smoothing_radius: Smoothing radius h per fluid phase [m].
+        density: Current density rho_i per particle [kg/m^3].
+        epsilon: Relaxation regularizer to prevent division by zero [dimensionless].
+        lambdas: Output Lagrange multiplier per particle [dimensionless].
+    """
+    i = wp.tid()
+    if particle_substrate[i] != wp.uint8(3):
+        lambdas[i] = wp.float32(0.0)
+        return
+    phase = particle_fluid_phase[i]
+    if phase < 0:
+        lambdas[i] = wp.float32(0.0)
+        return
+
+    rho0 = fluid_rest_density[phase]
+    h = fluid_smoothing_radius[phase]
+
+    # Unilateral constraint: only active when over-dense (C_i > 0).
+    c = density[i] / rho0 - wp.float32(1.0)
+    if c <= wp.float32(0.0):
+        lambdas[i] = wp.float32(0.0)
+        return
+
+    x_i = particle_x[i]
+    grad_i_sum = wp.vec3(0.0, 0.0, 0.0)
+    sum_grad_sq = wp.float32(0.0)
+
+    # Accumulate squared gradient contributions from neighbor particles j != i.
+    # grad_j C_i = (1/rho_0) * grad_W(x_i - x_j, h)
+    query = wp.hash_grid_query(grid, x_i, h)
+    j = int(0)
+    while wp.hash_grid_query_next(query, j):
+        if j == i:
+            continue
+        r = x_i - particle_x[j]
+        grad_w = spiky_gradient(r, h)
+        g_j = grad_w / rho0
+        sum_grad_sq += wp.dot(g_j, g_j)
+        grad_i_sum += g_j
+
+    # Self-gradient via Newton's 3rd law: grad_i C_i = -sum_{k != i} grad_k C_i.
+    grad_i = -grad_i_sum
+    sum_grad_sq += wp.dot(grad_i, grad_i)
+
+    lambdas[i] = -c / (sum_grad_sq + epsilon)
