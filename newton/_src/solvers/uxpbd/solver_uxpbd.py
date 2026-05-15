@@ -239,17 +239,34 @@ class SolverUXPBD(SolverBase):
 
         if model.body_count:
             body_deltas = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
+            # Per-body contact count (UPPFRTA §4.2 constraint averaging at the
+            # body level). Populated by the contact kernels alongside the
+            # atomic_add into body_deltas; consumed by apply_body_deltas via
+            # its constraint_inv_weights parameter, which divides the
+            # accumulated wrench by max(count, 0). Zeroed between phases.
+            # See the lattice-launch incident write-up in
+            # docs/superpowers/specs/2026-05-13-uxpbd-design.md §9.4.
+            body_contact_count = wp.zeros(model.body_count, dtype=wp.float32, device=model.device)
             _body_q = [state_out.body_q, wp.clone(state_out.body_q)]
             _body_qd = [state_out.body_qd, wp.clone(state_out.body_qd)]
             _cur = 0  # index into _body_q/_body_qd that holds the current state
         else:
-            body_deltas = None
+            # Dummy 1-element buffer so the particle-shape contact kernel signature
+            # is satisfied even with zero rigid bodies. The kernel only writes to
+            # body_deltas when is_lattice (no lattices without bodies) or
+            # shape_link >= 0 (ground is -1), so no writes actually hit this buffer.
+            body_deltas = wp.zeros(1, dtype=wp.spatial_vector, device=model.device)
+            body_contact_count = wp.zeros(1, dtype=wp.float32, device=model.device)
             _body_q = None
             _body_qd = None
             _cur = 0
 
-        def _apply_deltas_flip():
+        def _apply_deltas_flip(constraint_inv_weights=None):
             nonlocal _cur
+            # No-op when there are no bodies: _body_q/_body_qd weren't allocated
+            # and the kernel launch would have dim=0 anyway.
+            if _body_q is None:
+                return
             _nxt = 1 - _cur
             wp.launch(
                 kernel=apply_body_deltas,
@@ -262,7 +279,7 @@ class SolverUXPBD(SolverBase):
                     self.body_inv_mass_effective,
                     self.body_inv_inertia_effective,
                     body_deltas,
-                    None,
+                    constraint_inv_weights,
                     dt,
                 ],
                 outputs=[_body_q[_nxt], _body_qd[_nxt]],
@@ -298,18 +315,18 @@ class SolverUXPBD(SolverBase):
         for _ in range(self.iterations):
             if body_deltas is not None:
                 body_deltas.zero_()
+                body_contact_count.zero_()
 
             # Particle-shape contacts: dispatches on particle_substrate.
             # Lattice particles (substrate=0) route deltas into body_deltas.
             # SM-rigid particles (substrate=1) and fluid particles (substrate=3)
             # route into particle_deltas_contact via the ELSE branch.
-            # Runs even when body_count==0 (e.g. fluid-only + static ground plane).
+            # Runs even when body_count==0 (e.g. fluid-only + static ground plane);
+            # body_deltas / body_contact_count are pre-allocated as 1-element dummy
+            # buffers in the body_count==0 branch above, and the kernel's atomic
+            # writes to them are gated by is_lattice (needs bodies) or
+            # shape_link >= 0 (needs bodies), so no real writes hit the dummy.
             if contacts is not None and model.particle_count > 0:
-                _body_deltas_ps = (
-                    body_deltas
-                    if body_deltas is not None
-                    else wp.zeros(0, dtype=wp.spatial_vector, device=model.device)
-                )
                 _body_q_ps = (
                     state_out.body_q
                     if state_out.body_q is not None
@@ -352,12 +369,18 @@ class SolverUXPBD(SolverBase):
                         dt,
                         self.soft_contact_relaxation,
                     ],
-                    outputs=[_body_deltas_ps, particle_deltas_contact],
+                    outputs=[body_deltas, body_contact_count, particle_deltas_contact],
                     device=model.device,
                 )
 
-                if body_deltas is not None:
-                    _apply_deltas_flip()
+                # Per-body contact-count averaging (UPPFRTA §4.2 promoted to
+                # the body level, design spec §5.7). Without dividing by the
+                # per-body contact count, N synchronized lattice-particle
+                # penetrations against one shape compound into N× the body
+                # wrench and the body launches off the ground (lattice drop
+                # regression). _apply_deltas_flip itself early-returns when
+                # body_count==0, so this is safe for fluid-only scenes.
+                _apply_deltas_flip(constraint_inv_weights=body_contact_count)
 
                 # Re-sync lattice after body update so next iter sees consistent state.
                 self.update_lattice_world_positions(state_out)
@@ -392,6 +415,7 @@ class SolverUXPBD(SolverBase):
                 # contact pass above already applied its body deltas via _apply_deltas_flip,
                 # so we must NOT include them again.
                 body_deltas.zero_()
+                body_contact_count.zero_()
                 search_radius = model.particle_max_radius * 2.0 + model.particle_cohesion
                 with wp.ScopedDevice(model.device):
                     model.particle_grid.build(state_out.particle_q, radius=search_radius)
@@ -420,10 +444,10 @@ class SolverUXPBD(SolverBase):
                         dt,
                         self.soft_contact_relaxation,
                     ],
-                    outputs=[pp_particle_deltas, body_deltas],
+                    outputs=[pp_particle_deltas, body_deltas, body_contact_count],
                     device=model.device,
                 )
-                _apply_deltas_flip()
+                _apply_deltas_flip(constraint_inv_weights=body_contact_count)
                 new_q = wp.empty_like(state_out.particle_q)
                 new_qd = wp.empty_like(state_out.particle_qd)
                 wp.launch(
@@ -654,9 +678,14 @@ class SolverUXPBD(SolverBase):
                 state_out.particle_q = new_q
                 state_out.particle_qd = new_qd
 
-                # Momentum conservation post-pass.
-                final_q = wp.empty_like(state_out.particle_q)
-                final_qd = wp.empty_like(state_out.particle_qd)
+                # Momentum conservation post-pass. enforce_momemntum_conservation_tiled
+                # writes x_out/v_out only for particles in dynamic SM-rigid groups, so
+                # pre-seed final_q/final_qd with the current state to avoid leaving
+                # non-group particles (lattice, static, ungrouped) with uninitialized
+                # memory. Without this, the next iteration's contact pass reads
+                # garbage lattice positions and routes junk wrenches into body_deltas.
+                final_q = wp.clone(state_out.particle_q)
+                final_qd = wp.clone(state_out.particle_qd)
                 wp.launch(
                     kernel=enforce_momemntum_conservation_tiled,
                     dim=(self._num_dynamic_groups, bd),
@@ -678,6 +707,13 @@ class SolverUXPBD(SolverBase):
                 )
                 state_out.particle_q = final_q
                 state_out.particle_qd = final_qd
+
+                # Re-sync lattice particle positions and velocities from body_q/qd.
+                # The intermediate srxpbd_apply_particle_deltas above zeroes the
+                # velocity of any mass-0 particle (lattice spheres carry mass on the
+                # host body, not the particle), so we must restore particle_qd[lattice]
+                # = v_lin + omega x r before the next iteration reads it.
+                self.update_lattice_world_positions(state_out)
 
         # 5. Populate state_out.body_parent_f from joint_impulse (XPBD convention).
         if state_out.body_parent_f is not None:

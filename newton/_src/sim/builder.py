@@ -245,7 +245,7 @@ class ModelBuilder:
         """The friction damping coefficient. Used by SemiImplicit, Featherstone."""
         ka: float = 0.0
         """The contact adhesion distance. Used by SemiImplicit, Featherstone."""
-        mu: float = 1.0
+        mu: float = 0.5
         """The coefficient of friction. Used by all solvers."""
         restitution: float = 0.0
         """The coefficient of restitution. Used by XPBD. To take effect, enable restitution in solver constructor via ``enable_restitution=True``."""
