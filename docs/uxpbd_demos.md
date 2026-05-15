@@ -2,12 +2,6 @@
 
 How to run every UXPBD viewer demo, every unit test, and the MuJoCo comparison harness. All commands use `uv run` and assume the repo root as the working directory.
 
-**Implementation status (2026-05-14):**
-- **Phase 1**: articulated rigid + lattice + static contact. Complete.
-- **Phase 2**: free shape-matched rigid + cross-substrate contact + 7 PBD-R benchmarks + Franka pick-and-place + MuJoCo comparison. Complete.
-- **Phase 3**: soft bodies. Not started.
-- **Phase 4**: liquids. Not started.
-
 **CUDA caveat:** the SRXPBD tile-reduce primitives (`solve_shape_matching_batch_tiled`, `enforce_momemntum_conservation_tiled`) require a CUDA-enabled Warp build. On CPU, every test or demo that exercises free shape-matched rigid bodies will skip (unit tests) or run-but-not-validate (demos). The lattice-only Phase 1 path runs identically on CPU and CUDA.
 
 ---
@@ -34,38 +28,43 @@ uv run python -m cslc_mujoco.uxpbd_comparison.box_push --solver both
 
 Each demo opens an interactive OpenGL window by default. Add `--headless` to run without a window, or `--viewer null` for a no-graphics CI run, or `--viewer usd --output-path file.usd` to export.
 
-### Phase 1 demos
+### Phase 1 demos (articulated rigid + lattice, no SM-rigid required)
+
+These run on both CPU and CUDA.
 
 | Command | What you'll see |
 |---|---|
-| `uv run python -m newton.examples uxpbd_drop_to_ground` | A box with a 16-sphere lattice falls and settles on the ground |
-| `uv run python -m newton.examples uxpbd_free_fall` | A free rigid body falls under gravity, no contact |
-| `uv run python -m newton.examples uxpbd_pendulum` | Small-angle pendulum hangs from a revolute joint |
-| `uv run python -m newton.examples uxpbd_compare_xpbd` | Same pendulum simulated under SolverXPBD and SolverUXPBD in lockstep |
-| `uv run python -m newton.examples uxpbd_lattice_push` | Single revolute link with a lattice rotates and pushes a static box |
-| `uv run python -m newton.examples uxpbd_arm_push` | 3-link arm with per-link lattices pushes a static target box |
+| `uv run python -m newton.examples uxpbd_pendulum` | A single-link revolute pendulum of length L swings under gravity at the analytical period 2π·√(L/g). `test_final` checks the period within 1%. |
+| `uv run python -m newton.examples uxpbd_lattice_drop` | A free rigid body wrapped in a kinematic lattice (4×4×4 packing inscribed in a 0.04 m half-extent cube) falls under gravity and settles on the ground at `body_z = 0.048` ± 5 mm. Exercises the per-body wrench accumulation pipeline with N synchronized bottom-face contacts (regression for the "lattice launches off the ground" bug — see design doc §5.7). |
 
-### Phase 2 demos
+### Phase 2 demos (cross-substrate: lattice ↔ SM-rigid, CUDA only)
+
+The SM-rigid path uses SRXPBD tile-reduce primitives that require a CUDA-enabled Warp build.
 
 | Command | What you'll see |
 |---|---|
-| `uv run python -m newton.examples uxpbd_pick_and_place` | Franka arm friction-grasps a 64-sphere SM-rigid cube and lifts it. APPROACH → SQUEEZE → LIFT → HOLD phases. Needs CUDA for the SM-rigid shape-matching to converge correctly. |
+| `uv run python -m newton.examples uxpbd_lattice_stack` | A free SM-rigid cube drops on top of a lattice-clad rigid body sharing the **exact same** 4×4×4 sphere packing (same centers, same radii). Both substrates settle: body at `z = 0.04`, cube COM at `z = 0.12 ± 4 cm`. Validates lattice ↔ SM-rigid cross-substrate contact through `solve_particle_particle_contacts_uxpbd` plus the UPPFRTA per-body averaging in `apply_body_deltas`. |
+| `uv run python -m newton.examples uxpbd_lift_test` | Two articulated lattice-clad gripper pads (driven by prismatic-X + prismatic-Z joints) close on a free SM-rigid cube, squeeze, then lift it together against gravity. APPROACH → SQUEEZE → LIFT → HOLD phases. `test_final` asserts the object did not fall and slip is < 1 cm over a ~20 mm lift. Exercises the friction-driven grasp path. |
+| `uv run python -m newton.examples uxpbd_box_push` | Visualizes PBD-R Test 1: a 4×4×4 sphere-packed SM-rigid cube is pushed by a constant horizontal body force on a μ=0.4 ground. Analytical trajectory x(t) = ½·(F−μMg)/M·t². |
+| `uv run python -m newton.examples uxpbd_box_torque` | Visualizes PBD-R Test 2: torque-only rotation, μ=0. |
+| `uv run python -m newton.examples uxpbd_box_on_slope` | Visualizes PBD-R Test 3: SM-rigid cube on a π/8 inclined slope, μ=0.4. |
+| `uv run python -m newton.examples uxpbd_bunny_push` | Visualizes PBD-R Test 4: the Stanford Bunny sphere-packed and pushed. Loose tolerance because of the asymmetric mesh approximation. |
+| `uv run python -m newton.examples uxpbd_particle_drop` | A free SM-rigid sphere-packed cube falls onto the ground and settles. Sanity check for the SM-rigid + ground-contact path on its own. |
+| `uv run python -m newton.examples uxpbd_pick_and_place` | A Franka arm with lattice-shelled finger pads friction-grasps a 64-sphere SM-rigid cube, lifts, translates, and releases on a stack. APPROACH → SQUEEZE → LIFT → HOLD phases. |
 
 ### Useful demo invocations
 
 ```bash
 # Run for 5 seconds simulated (500 frames at 100 fps)
-uv run python -m newton.examples uxpbd_arm_push --num-frames 500
+uv run python -m newton.examples uxpbd_pick_and_place --num-frames 500
 
 # CI / smoke test: no viewer, asserts the demo's test_final()
-uv run python -m newton.examples uxpbd_drop_to_ground --viewer null --test --num-frames 500
+uv run python -m newton.examples uxpbd_lattice_drop --viewer null --test --num-frames 500
+uv run python -m newton.examples uxpbd_lattice_stack --viewer null --test --num-frames 500
+uv run python -m newton.examples uxpbd_lift_test  --viewer null --test --num-frames 400
 
-# CPU explicitly (skip CUDA initialization)
-uv run python -m newton.examples uxpbd_lattice_push --device cpu
-
-# Export to USD for paper figures
-uv run python -m newton.examples uxpbd_pendulum \
-    --viewer usd --output-path docs/figures/uxpbd_pendulum.usd --num-frames 600
+# CPU explicitly (skip CUDA initialization) -- Phase 1 demos only
+uv run python -m newton.examples uxpbd_lattice_drop --device cpu
 
 # Live-streamed to a Rerun viewer
 uv run python -m newton.examples uxpbd_pick_and_place --viewer rerun
@@ -98,54 +97,17 @@ Tests are plain `unittest` assertions. No viewer. Test discovery picks up everyt
 uv run --extra dev -m newton.tests -k SolverUXPBD
 ```
 
-On CPU you should see roughly:
-```
-Ran 25 tests in ~30s
-OK (skipped=9)
-```
-The 9 skips are all CUDA-only tests that exercise SRXPBD tile-reduce primitives. On CUDA, all 25 pass.
-
-### Run only Phase 1 tests
-
-```bash
-uv run --extra dev -m newton.tests -k "SolverUXPBD and not Phase2"
-```
-
-12 tests; all pass on CPU.
-
-### Run only Phase 2 tests
-
-```bash
-uv run --extra dev -m newton.tests -k SolverUXPBDPhase2
-```
-
-13 tests; 4 pass on CPU + 9 skip. On CUDA all 13 pass.
-
 ### Run a single specific test
 
 ```bash
-# Phase 1 lattice projection
-uv run --extra dev -m newton.tests -k test_uxpbd_update_lattice_projects_body_q
-
 # Phase 1 pendulum period (1% of analytical 2π·√(L/g))
 uv run --extra dev -m newton.tests -k test_uxpbd_pendulum_period
 
-# Phase 1 body_parent_f cross-validation against XPBD
-uv run --extra dev -m newton.tests -k test_uxpbd_body_parent_f_revolute_to_world
-
-# Phase 2 PBD-R box benchmarks (CUDA only)
-uv run --extra dev -m newton.tests -k "test_pbdr_t1 or test_pbdr_t2 or test_pbdr_t3"
-
-# Phase 2 PBD-R bunny benchmarks (CUDA only)
-uv run --extra dev -m newton.tests -k "test_pbdr_t4 or test_pbdr_t5 or test_pbdr_t6"
-
-# Phase 2 PBD-R rod-pushing-box (CUDA only)
-uv run --extra dev -m newton.tests -k test_pbdr_t7
 ```
 
 ### Full UXPBD test list
 
-**Phase 1** (`newton/tests/test_solver_uxpbd.py`):
+**Phase 1** (`newton/tests/test_solver_uxpbd_phase1.py`):
 
 | Test | Validates |
 |---|---|
@@ -157,7 +119,7 @@ uv run --extra dev -m newton.tests -k test_pbdr_t7
 | `test_uxpbd_update_lattice_handles_rotation` | Same, with 90° Z rotation |
 | `test_uxpbd_lattice_w_eff_helper_callable` | `lattice_sphere_w_eff` device function exists |
 | `test_uxpbd_lattice_sphere_drops_to_ground` | Single sphere settles at z = sphere radius |
-| `test_uxpbd_free_fall_trajectory` | Body falls under gravity at g·t²/2 (0.5% tolerance) |
+| `test_uxpbd_free_fall_trajectory` | Free-fall body trajectory matches `g·t²/2` within 0.5% |
 | `test_uxpbd_pendulum_period` | Pendulum period within 1% of 2π·√(L/g) |
 | `test_uxpbd_body_parent_f_revolute_to_world` | `body_parent_f` matches SolverXPBD within 5% on revolute joint |
 | `test_uxpbd_add_lattice_to_all_links_with_fallback` | Bulk lattice attach uses JSON when present, falls back to uniform |
@@ -177,8 +139,7 @@ uv run --extra dev -m newton.tests -k test_pbdr_t7
 | `test_pbdr_t3_box_on_slope` | π/8 slope, μ=0.4 → x(t) = 0.5·(g sinθ − μg cosθ)·t² within 5% | **CUDA only** |
 | `test_pbdr_t4_pushed_bunny` | Same as t1 on Stanford Bunny, 10% tolerance | **CUDA only** |
 | `test_pbdr_t5_bunny_torque` | Same as t2 on bunny, 10% tolerance | **CUDA only** |
-| `test_pbdr_t6_bunny_on_slope` | Same as t3 on bunny, 10% tolerance | **CUDA only** |
-| `test_pbdr_t7_rod_pushing_box` | Rod stays in contact with pushed box (gap < 5 cm) | **CUDA only** |
+| `test_pbdr_t1_lattice_pushed_box` | PBD-R t1 with the box replaced by a **lattice-clad articulated body** that shares its geometry with `example_uxpbd_lattice_stack` (half-extent 0.04, sphere_r 0.012, 4×4×4 packing). Force F scaled to preserve F/M so the analytical reference matches t1's SM-rigid variant. Within 5%. | **CUDA only** |
 
 ### Run the entire Newton test suite (regression check)
 
@@ -215,47 +176,24 @@ When you want to confirm nothing is broken locally:
 # All UXPBD unit tests
 uv run --extra dev -m newton.tests -k SolverUXPBD
 
-# Every viewer demo to 100 frames headless
+# Every viewer demo to 100 frames, headless, with test_final asserted
 for demo in \
-    uxpbd_drop_to_ground uxpbd_free_fall uxpbd_pendulum \
-    uxpbd_compare_xpbd uxpbd_lattice_push uxpbd_arm_push \
+    uxpbd_pendulum \
+    uxpbd_lattice_drop \
+    uxpbd_lattice_stack \
+    uxpbd_lift_test \
+    uxpbd_box_push \
+    uxpbd_box_torque \
+    uxpbd_box_on_slope \
+    uxpbd_bunny_push \
+    uxpbd_particle_drop \
     uxpbd_pick_and_place; do
     echo "=== $demo ==="
-    uv run python -m newton.examples $demo --viewer null --num-frames 100 || break
+    uv run python -m newton.examples $demo --viewer null --test --num-frames 400 || break
 done
 ```
 
-Expected:
-- 25 unit tests pass / skip per device (16 + 9 on CPU; 25 + 0 on CUDA).
-- All 7 demos exit code 0.
+Expected: every demo exit code 0; UXPBD test suite passes (Phase 1 on CPU+CUDA, Phase 2 SM-rigid tests skip on CPU and pass on CUDA).
 
 ---
 
-## 5. Not yet implemented (deferred phases)
-
-Scenarios from the design spec (`docs/superpowers/specs/2026-05-13-uxpbd-design.md`) that current code cannot demonstrate:
-
-- **Compliant grasp of a deformable object** (Spec scenario B). Requires **Phase 3**: soft body FEM tetrahedra, springs, bending.
-- **Pouring liquid from a cup into a bowl** (Spec scenario D). Requires **Phase 4**: Position-Based Fluids density constraint and fluid-solid coupling.
-- **CSLC compliant contact on robot fingers** (Spec section 5). Reserved as v2; `enable_cslc=True` raises `NotImplementedError` today. Architectural seams are present in Phase 1's lattice arrays.
-
-See `docs/superpowers/specs/2026-05-13-uxpbd-design.md` §8.3 and §8.4 for the planned scope of Phases 3 and 4.
-
----
-
-## 6. Where the code lives
-
-| Component | Path |
-|---|---|
-| Solver class | `newton/_src/solvers/uxpbd/solver_uxpbd.py` |
-| Warp kernels | `newton/_src/solvers/uxpbd/kernels.py` |
-| Shape-matching cache helper | `newton/_src/solvers/uxpbd/shape_match.py` |
-| MorphIt lattice loader | `newton/_src/solvers/uxpbd/lattice.py` |
-| Public re-export | `newton/solvers.py` (`newton.solvers.SolverUXPBD`) |
-| Phase 1 tests | `newton/tests/test_solver_uxpbd.py` |
-| Phase 2 tests | `newton/tests/test_solver_uxpbd_phase2.py` |
-| Demos | `newton/examples/contacts/example_uxpbd_*.py` |
-| MuJoCo comparison | `cslc_mujoco/uxpbd_comparison/box_push.py` |
-| Design spec | `docs/superpowers/specs/2026-05-13-uxpbd-design.md` |
-| Phase 1 plan | `docs/superpowers/plans/2026-05-14-uxpbd-phase1-implementation.md` |
-| Phase 2 plan | `docs/superpowers/plans/2026-05-14-uxpbd-phase2-implementation.md` |

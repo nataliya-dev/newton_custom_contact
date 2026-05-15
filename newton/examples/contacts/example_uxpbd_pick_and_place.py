@@ -50,10 +50,11 @@ def _find_body(builder, label):
     for i, lbl in enumerate(builder.body_label):
         if lbl == label or lbl.split("/")[-1] == label:
             return i
-    raise ValueError(f"Body '{label}' not found in builder. Available: {builder.body_label}")
+    raise ValueError(
+        f"Body '{label}' not found in builder. Available: {builder.body_label}")
 
 
-def _attach_pad_lattice(builder, link_idx, half_extents):
+def _attach_pad_lattice(builder, link_idx, half_extents, pos):
     """Build a 2x2x2 uniform lattice inside a finger pad and attach via add_lattice.
 
     The lattice is a 2x2x2 grid of equal-radius spheres inscribed in the
@@ -64,6 +65,12 @@ def _attach_pad_lattice(builder, link_idx, half_extents):
         builder: The ModelBuilder in progress.
         link_idx: Body index of the finger link to host the lattice.
         half_extents: (hx, hy, hz) half-extents [m] of the pad in link-local frame.
+        pos: World-space position of the finger body at t=0 (after FK). The
+            lattice particles are placed in world space as ``pos + p_local``,
+            so the anchor constraint sees zero error on frame 1. Without
+            this, mass-0 lattice particles get pulled across the world by
+            the stiff anchor and the solver diverges to NaN within a couple
+            of steps.
     """
     hx, hy, hz = half_extents
     n_per_axis = 2
@@ -84,8 +91,10 @@ def _attach_pad_lattice(builder, link_idx, half_extents):
 
     builder.add_lattice(
         link=link_idx,
-        morphit_json={"centers": centers, "radii": radii, "is_surface": is_surface},
+        morphit_json={"centers": centers,
+                      "radii": radii, "is_surface": is_surface},
         total_mass=0.0,
+        pos=pos,
     )
 
 
@@ -106,61 +115,95 @@ class Example:
 
         # Franka FR3 arm with hand (9 DOFs: 7 arm revolutes + 2 finger prismatic).
         builder.add_urdf(
-            newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
+            newton.utils.download_asset(
+                "franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
             xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.0), q=wp.quat_identity()),
             floating=False,
             enable_self_collisions=False,
+            collapse_fixed_joints=True,
         )
+
+        # Set arm home pose and finger open width BEFORE attaching the lattices.
+        # The lattice anchor is rigid (mass-0 particles) and starts in world space
+        # at ``pos + p_local``; if ``pos`` does not match the finger's home-pose
+        # world position, the anchor sees a huge initial error and diverges to NaN.
+        # The target gains replicate the PD-gravity-comp tuning from robot_lift.py.
+        builder.joint_q[:7] = FRANKA_HOME_Q
+        builder.joint_q[7:9] = [FINGER_OPEN, FINGER_OPEN]
+        builder.joint_target_pos[:9] = builder.joint_q[:9]
+
+        # Probe FK to read the finger bodies' home-pose world transforms. We
+        # finalize the URDF-only builder, run eval_fk, and discard; the second
+        # finalize below picks up the lattices and cube added after this point.
+        finger_l_idx = _find_body(builder, "fr3_leftfinger")
+        finger_r_idx = _find_body(builder, "fr3_rightfinger")
+        _probe_model = builder.finalize()
+        _probe_state = _probe_model.state()
+        newton.eval_fk(_probe_model, _probe_model.joint_q,
+                       _probe_model.joint_qd, _probe_state)
+        _probe_bq = _probe_state.body_q.numpy()
+        finger_l_pos = wp.vec3(*[float(v)
+                               for v in _probe_bq[finger_l_idx, :3]])
+        finger_r_pos = wp.vec3(*[float(v)
+                               for v in _probe_bq[finger_r_idx, :3]])
 
         # Attach a 2x2x2 lattice to each finger pad so they participate in
         # particle-based contact with the cube. The pad geometry is chosen to
         # match the physical finger tip dimensions of the Franka Hand.
-        finger_l_idx = _find_body(builder, "fr3_leftfinger")
-        finger_r_idx = _find_body(builder, "fr3_rightfinger")
         # Pad half-extents [m]: hx=cross-gap, hy=width, hz=height along finger
         pad_half = (0.012, 0.004, 0.025)
-        _attach_pad_lattice(builder, finger_l_idx, pad_half)
-        _attach_pad_lattice(builder, finger_r_idx, pad_half)
+        _attach_pad_lattice(builder, finger_l_idx, pad_half, finger_l_pos)
+        _attach_pad_lattice(builder, finger_r_idx, pad_half, finger_r_pos)
 
-        # Set arm home pose and finger open width. The target gains replicate
-        # the PD-gravity-comp tuning from robot_lift.py (see SceneParams there).
-        builder.joint_q[:7] = FRANKA_HOME_Q
-        builder.joint_q[7:9] = [FINGER_OPEN, FINGER_OPEN]
-        builder.joint_target_pos[:9] = builder.joint_q[:9]
         # PD gains: arm joints use high stiffness; finger joints are softer
         # so they can be compliant without launching the cube.
-        builder.joint_target_ke[:9] = [4500, 4500, 3500, 3500, 2000, 2000, 2000, 500, 500]
-        builder.joint_target_kd[:9] = [450, 450, 350, 350, 200, 200, 200, 50, 50]
+        builder.joint_target_ke[:9] = [4500, 4500,
+                                       3500, 3500, 2000, 2000, 2000, 500, 500]
+        builder.joint_target_kd[:9] = [
+            450, 450, 350, 350, 200, 200, 200, 50, 50]
 
         # Pickable cube: 4x4x4 sphere packing inscribed in a 0.08 m cube.
         # Total mass 0.3 kg, mu=0.7 (friction-closure grasp). The sphere packing
         # acts as the shape-matched rigid body for the cube in Phase 2.
         half_extent = 0.04  # cube half-side [m]
-        sphere_r = 0.012  # sphere radius [m]; 4 spheres span 0.096 m ~ 0.08 m side
-        coords = np.linspace(-half_extent + sphere_r, half_extent - sphere_r, 4)
+        # sphere radius [m]; 4 spheres span 0.096 m ~ 0.08 m side
+        sphere_r = 0.012
+        coords = np.linspace(-half_extent + sphere_r,
+                             half_extent - sphere_r, 4)
         xs, ys, zs = np.meshgrid(coords, coords, coords, indexing="ij")
-        cube_centers = np.stack([xs.flatten(), ys.flatten(), zs.flatten()], axis=1)
+        cube_centers = np.stack(
+            [xs.flatten(), ys.flatten(), zs.flatten()], axis=1)
         cube_radii = np.full(cube_centers.shape[0], sphere_r)
         self.cube_group = builder.add_particle_volume(
-            volume_data={"centers": cube_centers.tolist(), "radii": cube_radii.tolist()},
+            volume_data={"centers": cube_centers.tolist(),
+                         "radii": cube_radii.tolist()},
             total_mass=0.3,
             pos=wp.vec3(0.55, 0.0, 0.05),
         )
 
         self.model = builder.finalize()
         # Friction coefficient on cube particles (mu for particle-particle and
-        # particle-shape contacts, including the lattice finger pads).
+        # particle-shape contacts, including the lattice finger pads). The
+        # particle-shape kernel uses mu = 0.5 * (particle_mu + shape_material_mu[shape]),
+        # so we override the per-shape value to match the intended 0.7 effective
+        # coefficient (default shape_material_mu is 0.5).
         self.model.particle_mu = 0.7
         self.model.soft_contact_mu = 0.7
+        self.model.shape_material_mu.assign(
+            np.full(self.model.shape_count, 0.7, dtype=np.float32))
 
-        self.solver = newton.solvers.SolverUXPBD(self.model, iterations=8, shock_propagation_k=1.0)
+        self.solver = newton.solvers.SolverUXPBD(
+            self.model, iterations=8, shock_propagation_k=1.0)
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        newton.eval_fk(self.model, self.model.joint_q,
+                       self.model.joint_qd, self.state_0)
         self.contacts = self.model.contacts()
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True
+        self.viewer.set_camera(pos=wp.vec3(
+            1.5, -1.5, 1.2), pitch=-25.0, yaw=135.0)
 
     def _advance_phase(self):
         """Drive the phase machine: APPROACH -> SQUEEZE -> LIFT -> HOLD.
@@ -195,7 +238,8 @@ class Example:
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
             self.model.collide(self.state_0, self.contacts)
-            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            self.solver.step(self.state_0, self.state_1,
+                             self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
         self._advance_phase()
 

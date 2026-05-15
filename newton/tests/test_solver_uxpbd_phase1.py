@@ -3,6 +3,8 @@
 
 """Tests for the UXPBD solver (Phase 1: articulated rigid + lattice + static contact)."""
 
+# TODO rename this file to test_solver_uxpbd_phase1.py once Task 6 is merged, to allow a clean split of Phase 1 vs Phase 2 tests.
+
 import json
 import os
 import tempfile
@@ -37,18 +39,18 @@ def test_uxpbd_solver_instantiates_with_empty_model(test, device):
     test.assertIs(solver.model, model)
 
 
-class TestSolverUXPBD(unittest.TestCase):
+class TestSolverUXPBDPhase1(unittest.TestCase):
     pass
 
 
 add_function_test(
-    TestSolverUXPBD,
+    TestSolverUXPBDPhase1,
     "test_uxpbd_solver_rejects_enable_cslc",
     test_uxpbd_solver_rejects_enable_cslc,
     devices=get_test_devices(),
 )
 add_function_test(
-    TestSolverUXPBD,
+    TestSolverUXPBDPhase1,
     "test_uxpbd_solver_instantiates_with_empty_model",
     test_uxpbd_solver_instantiates_with_empty_model,
     devices=get_test_devices(),
@@ -70,7 +72,7 @@ def test_uxpbd_empty_model_has_zero_lattice(test, device):
 
 
 add_function_test(
-    TestSolverUXPBD,
+    TestSolverUXPBDPhase1,
     "test_uxpbd_empty_model_has_zero_lattice",
     test_uxpbd_empty_model_has_zero_lattice,
     devices=get_test_devices(),
@@ -106,7 +108,7 @@ def test_uxpbd_add_lattice_populates_arrays(test, device):
 
 
 add_function_test(
-    TestSolverUXPBD,
+    TestSolverUXPBDPhase1,
     "test_uxpbd_add_lattice_populates_arrays",
     test_uxpbd_add_lattice_populates_arrays,
     devices=get_test_devices(),
@@ -128,7 +130,8 @@ def test_uxpbd_update_lattice_projects_body_q(test, device):
 
     state = model.state()
     # Set body_q to translation (1.0, 2.0, 3.0), rotation identity.
-    body_q_np = np.array([[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0]], dtype=np.float32)
+    body_q_np = np.array(
+        [[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0]], dtype=np.float32)
     state.body_q.assign(body_q_np)
     state.body_qd.zero_()
 
@@ -150,7 +153,7 @@ def test_uxpbd_update_lattice_projects_body_q(test, device):
 
 
 add_function_test(
-    TestSolverUXPBD,
+    TestSolverUXPBDPhase1,
     "test_uxpbd_update_lattice_projects_body_q",
     test_uxpbd_update_lattice_projects_body_q,
     devices=get_test_devices(),
@@ -172,7 +175,8 @@ def test_uxpbd_update_lattice_handles_rotation(test, device):
     # 90 degree rotation around Z. The sphere at (+0.1, 0, 0) body frame
     # should project to (0, +0.1, 0) in world frame.
     rot = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.5 * np.pi)
-    body_q_np = np.array([[0.0, 0.0, 0.0, rot[0], rot[1], rot[2], rot[3]]], dtype=np.float32)
+    body_q_np = np.array(
+        [[0.0, 0.0, 0.0, rot[0], rot[1], rot[2], rot[3]]], dtype=np.float32)
     state.body_q.assign(body_q_np)
     state.body_qd.zero_()
 
@@ -187,7 +191,7 @@ def test_uxpbd_update_lattice_handles_rotation(test, device):
 
 
 add_function_test(
-    TestSolverUXPBD,
+    TestSolverUXPBDPhase1,
     "test_uxpbd_update_lattice_handles_rotation",
     test_uxpbd_update_lattice_handles_rotation,
     devices=get_test_devices(),
@@ -244,7 +248,7 @@ def test_uxpbd_lattice_sphere_drops_to_ground(test, device):
 
 
 add_function_test(
-    TestSolverUXPBD,
+    TestSolverUXPBDPhase1,
     "test_uxpbd_lattice_sphere_drops_to_ground",
     test_uxpbd_lattice_sphere_drops_to_ground,
     devices=get_test_devices(),
@@ -259,7 +263,7 @@ def test_uxpbd_lattice_w_eff_helper_callable(test, device):
 
 
 add_function_test(
-    TestSolverUXPBD,
+    TestSolverUXPBDPhase1,
     "test_uxpbd_lattice_w_eff_helper_callable",
     test_uxpbd_lattice_w_eff_helper_callable,
     devices=get_test_devices(),
@@ -292,11 +296,12 @@ def test_uxpbd_free_fall_trajectory(test, device):
     body_z = float(body_q[0, 2])
     expected_z = 10.0 - 0.5 * 9.81 * t * t
     relative_err = abs(body_z - expected_z) / expected_z
-    test.assertLess(relative_err, 0.005, f"free fall z={body_z}, expected={expected_z}")
+    test.assertLess(relative_err, 0.005,
+                    f"free fall z={body_z}, expected={expected_z}")
 
 
 add_function_test(
-    TestSolverUXPBD,
+    TestSolverUXPBDPhase1,
     "test_uxpbd_free_fall_trajectory",
     test_uxpbd_free_fall_trajectory,
     devices=get_test_devices(),
@@ -354,16 +359,18 @@ def test_uxpbd_pendulum_period(test, device):
 
     angles_np = np.array(angles)
     crossings = np.where(np.diff(np.signbit(angles_np)))[0]
-    test.assertGreater(len(crossings), 2, f"Not enough zero crossings: {len(crossings)}")
+    test.assertGreater(len(crossings), 2,
+                       f"Not enough zero crossings: {len(crossings)}")
     half_period_steps = float(crossings[2] - crossings[0]) / 2.0
     measured_T = half_period_steps * dt * 2.0
     expected_T = 2.0 * np.pi * np.sqrt(L / 9.81)
     relative_err = abs(measured_T - expected_T) / expected_T
-    test.assertLess(relative_err, 0.01, f"T={measured_T:.4f}, expected={expected_T:.4f}")
+    test.assertLess(relative_err, 0.01,
+                    f"T={measured_T:.4f}, expected={expected_T:.4f}")
 
 
 add_function_test(
-    TestSolverUXPBD,
+    TestSolverUXPBDPhase1,
     "test_uxpbd_pendulum_period",
     test_uxpbd_pendulum_period,
     devices=get_test_devices(),
@@ -385,7 +392,8 @@ def test_uxpbd_body_parent_f_revolute_to_world(test, device):
             child=link,
             axis=wp.vec3(0.0, 1.0, 0.0),
             parent_xform=wp.transform_identity(),
-            child_xform=wp.transform(p=wp.vec3(0.0, 0.0, L), q=wp.quat_identity()),
+            child_xform=wp.transform(
+                p=wp.vec3(0.0, 0.0, L), q=wp.quat_identity()),
         )
         builder.add_articulation([j], label="pendulum")
         builder.request_state_attributes("body_parent_f")
@@ -407,11 +415,12 @@ def test_uxpbd_body_parent_f_revolute_to_world(test, device):
     for i in range(6):
         denom = abs(xpbd_wrench[i]) + 1.0e-3
         rel_err = abs(uxpbd_wrench[i] - xpbd_wrench[i]) / denom
-        test.assertLess(rel_err, 0.05, f"body_parent_f[{i}] xpbd={xpbd_wrench[i]} uxpbd={uxpbd_wrench[i]}")
+        test.assertLess(
+            rel_err, 0.05, f"body_parent_f[{i}] xpbd={xpbd_wrench[i]} uxpbd={uxpbd_wrench[i]}")
 
 
 add_function_test(
-    TestSolverUXPBD,
+    TestSolverUXPBDPhase1,
     "test_uxpbd_body_parent_f_revolute_to_world",
     test_uxpbd_body_parent_f_revolute_to_world,
     devices=get_test_devices(),
@@ -447,7 +456,7 @@ def test_uxpbd_add_lattice_to_all_links_with_fallback(test, device):
 
 
 add_function_test(
-    TestSolverUXPBD,
+    TestSolverUXPBDPhase1,
     "test_uxpbd_add_lattice_to_all_links_with_fallback",
     test_uxpbd_add_lattice_to_all_links_with_fallback,
     devices=get_test_devices(),

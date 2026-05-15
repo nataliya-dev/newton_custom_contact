@@ -291,11 +291,12 @@ if particle_substrate[i] == LATTICE:
                       wp.cross(r_world, Δx_i),   # angular
                       Δx_i,                       # linear
                   ))
+    wp.atomic_add(body_contact_count[link], 1.0)  # ← see §5.7
 else:
     wp.atomic_add(particle_deltas[i], Δx_i)
 ```
 
-`apply_body_deltas` (XPBD existing) then consumes `body_deltas` using the body's true inertia tensor.
+`apply_body_deltas` (XPBD existing) consumes `body_deltas` using the body's true inertia tensor **and** divides the accumulated wrench by `body_contact_count[link]` via the existing `constraint_inv_weights` parameter. This is the UPPFRTA §4.2 constraint-averaging rule promoted to the body level (see §5.7 for the rationale and the regression it prevents).
 
 ### 5.5 CSLC v2 hook
 
@@ -315,6 +316,22 @@ The hook signature is fixed in v1. Enabling `SolverUXPBD(model, enable_cslc=True
 ### 5.6 Volume vs surface packing
 
 MorphIt packings can be volumetric or surface-only. Default: **volume-packed** for both articulated links and free shape-matched rigid bodies (matches existing `Box.add_morphit_spheres` behavior). Each sphere carries `lattice_is_surface` indicating whether it sits on the body boundary; v2 CSLC operates only on the surface subset. Interior spheres are pure collision probes in both versions.
+
+### 5.7 Per-body contact-count averaging (UPPFRTA §4.2 at the body level)
+
+**Problem.** The "naive" §5.4 routing — atomic-add each lattice contact's Δx into `body_deltas[link]` without any aggregation factor — is unstable under redundant simultaneous contacts. Symptom observed on `example_uxpbd_lattice_drop` with a 4×4×4 packing (16 bottom-face spheres sharing the same body-frame z): when the body's bottom face hits the ground, 16 lattice contacts fire in the same substep, each computing the same per-contact correction `Δx_i ≈ penetration_depth · ẑ`. The naive sum produces a body wrench 16× larger than the per-particle correction. `apply_body_deltas` converts that into a positive vertical velocity change far exceeding what gravity bleeds, and the body launches off the ground. The error is self-feeding: the launched body returns to the ground with higher velocity, triggers a deeper penetration, 16 more synchronized contacts, even larger upward kick. Empirically the lattice settles at z ≈ 173 m after 500 frames instead of the expected z ≈ 0.048 m.
+
+This is the per-body manifestation of the per-particle "redundant constraints sum, not average" failure mode UPPFRTA addresses in §4.2 (eq. 12): when n constraints touch one particle, they're averaged (`Δx̃_i = (1/n_i)·Σ Δx_i`), because redundant copies of the same physical constraint should resolve to one correction, not n of them.
+
+**Fix.** Maintain a `body_contact_count: wp.array[float]` of length `body_count`, zeroed alongside `body_deltas.zero_()` at the top of every iteration's contact phase. Every site that atomic-adds to `body_deltas[link]` also atomic-adds 1.0 to `body_contact_count[link]`. The PP kernel tracks a per-thread local counter incremented per cross-substrate contact in its inner loop, and atomic-adds the local total alongside its single wrench atomic-add.
+
+The buffer is passed to `apply_body_deltas` via the kernel's existing `constraint_inv_weights` parameter (`weight = 1/count` if count > 0, else 1). This was the XPBD per-body con-weighting mechanism that the design-doc-as-written wired up to `None`; populating it for the contact phase is the entire fix. The joint phase still passes `None` (joint constraints are not redundant copies of the same physical constraint and should not be averaged).
+
+**Layered alternatives considered.** Two additional layers were proposed as part of the same investigation (XPBD compliance for lattice contacts; SRXPBD-style impulse cap). Both are well-motivated but turned out unnecessary for the current Phase 1+2 scenes: Layer 1 alone restored the lattice drop, lattice stack, lattice push, and the new lift-test scenes, with all 48 SolverUXPBD unit tests passing. Layer 2 (compliance, accumulated λ) becomes load-bearing when `convert_lattice_contact_impulse_to_force` is implemented for paper-grade force traces (it needs λ-accumulation) and when controlled-restitution PBD-R tests land. Layer 3 (impulse cap) is reserved for deeper stacks (3+ bodies) where Layer 1's within-body averaging cannot bound cumulative cross-body load.
+
+**Related pitfall: `add_body(mass=m) + add_shape_box(...)` double-counts mass.** Surfaced while writing the lattice scenes. `add_body(mass=m)` adds m kg of *point* mass with `body_inertia` equal to `armature * I` (zero by default). The subsequent `add_shape_box` call accumulates the shape's `density × volume` mass AND the corresponding cuboid inertia tensor into the body via `_update_body_mass`. The body's final mass is `m + density × volume`, but its inertia tensor only reflects the shape's `density × volume` contribution — `body_inv_mass` and `body_inv_inertia` therefore correspond to different masses. `apply_body_deltas` uses both fields, so the linear/angular response ratio is wrong by a factor of `(m + density·volume) / (density·volume)`; under asymmetric contact loads, the body cannot settle.
+
+**Fix for users:** pass `mass=0.0` to `add_body` and let `add_shape_box`'s density carry both mass and inertia consistently. If you need to override the mass, set the shape's density explicitly (`ShapeConfig(density=target_mass / shape_volume)`) rather than splitting it across `add_body` and the shape. The example files `example_uxpbd_lattice_drop`, `example_uxpbd_lattice_stack`, `example_uxpbd_lift_test`, and `test_pbdr_t1_lattice_pushed_box` all use this pattern and carry a NOTE comment explaining the trap.
 
 ## 6 Cross-substrate contact dispatch
 
@@ -560,9 +577,10 @@ No new `State` fields. `Contacts.force` reused for both analytical-shape and lat
 
 ### 8.6 Test infrastructure
 
-- `newton/tests/test_solver_uxpbd.py` — primary unittest file, one `TestCase` class per phase.
-- `cslc_mujoco/uxpbd_comparison/` — extends MuJoCo harness for box-push, ball-drop.
-- `newton/examples/example_uxpbd_*.py` — four demos, registered in README per AGENTS.md with 320 × 320 jpg screenshots.
+- `newton/tests/test_solver_uxpbd_phase1.py` — Phase 1 unit tests (articulated rigid + lattice, CPU + CUDA).
+- `newton/tests/test_solver_uxpbd_phase2.py` — Phase 2 unit tests (SM-rigid + PBD-R analytical benchmarks). Includes `test_pbdr_t1_lattice_pushed_box`, the lattice-clad variant of PBD-R t1 using the same geometry as `example_uxpbd_lattice_stack` so the lattice contact path is exercised against an analytical reference.
+- `cslc_mujoco/uxpbd_comparison/` — extends MuJoCo harness for box-push.
+- `newton/examples/contacts/example_uxpbd_*.py` — currently 10 demos: Phase 1 (`pendulum`, `lattice_drop`) and Phase 2 (`lattice_stack`, `lift_test`, `box_push`, `box_torque`, `box_on_slope`, `bunny_push`, `particle_drop`, `pick_and_place`). Inventory in `docs/uxpbd_demos.md`.
 - `CHANGELOG.md` `[Unreleased]` entries per phase under `Added`.
 
 ## 9 Implementation strategy and risks
@@ -602,7 +620,7 @@ Public re-export at `newton.solvers.SolverUXPBD` via `newton/solvers.py`.
 
 | Risk | Mitigation |
 |---|---|
-| **Stiff lattice-vs-ground stacks oscillate** under UXPBD because UPPFRTA shock propagation is per-particle, not per-body | Increase `iterations`, document tuning; consider per-body height heuristic as a v2 follow-up if observed |
+| **Stiff lattice-vs-ground stacks oscillate / launch** because N synchronized bottom-face lattice contacts compound into N× the body wrench | **Mitigated** by per-body contact-count averaging in `apply_body_deltas` (UPPFRTA §4.2 promoted to body level — see §5.7). Verified against `example_uxpbd_lattice_drop`, `example_uxpbd_lattice_stack`, `example_uxpbd_lift_test` with the same 4×4×4 packing on both substrates. If deeper stacks (3+ bodies) ever expose a residual issue, Layer 2 (XPBD compliance for contacts) and Layer 3 (SRXPBD impulse cap) are reserved as follow-ups. |
 | **Cross-substrate momentum mismatch** at lattice ↔ SM-rigid contact (different momentum policies per side) | The hybrid Q6 policy already accepts this; SRXPBD's post-pass re-conserves SM-rigid side; document the asymmetry |
 | **MuJoCo comparison fails on box-push** due to friction model differences (regularized Coulomb in UXPBD vs. complementarity Coulomb in MuJoCo) | Use loose tolerance (10% trajectory L2); document as inherent to the solver class difference |
 | **Variable particle radii break neighbor-search** for very wide radius distributions (small + large spheres) | Cap radius ratio at 1:10 (UPPFRTA recommendation); document as a MorphIt configuration requirement |

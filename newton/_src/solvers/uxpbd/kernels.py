@@ -111,6 +111,7 @@ def solve_particle_shape_contacts_uxpbd(
     relaxation: float,
     # outputs
     body_delta: wp.array[wp.spatial_vector],
+    body_contact_count: wp.array[wp.float32],
     particle_deltas: wp.array[wp.vec3],
 ):
     """Phase 2 cross-substrate particle-shape contact.
@@ -120,6 +121,14 @@ def solve_particle_shape_contacts_uxpbd(
         skipped, same as Phase 1).
     Substrate 1 (SM-rigid): routes Δx into particle_deltas; the SRXPBD
         shape-matching pass at the end of the iteration re-enforces rigidity.
+
+    For each body that receives a wrench contribution, ``body_contact_count``
+    is atomically incremented by 1. ``apply_body_deltas`` reads this as
+    ``constraint_inv_weights`` and divides the accumulated wrench by the
+    count, implementing UPPFRTA §4.2 constraint averaging at the body
+    level. Without this, N synchronized lattice-particle penetrations
+    against a single shape produce N× the per-particle wrench on the
+    host body, which launches it off the ground (lattice drop regression).
     """
     tid = wp.tid()
     count = wp.min(contact_max, contact_count[0])
@@ -169,12 +178,25 @@ def solve_particle_shape_contacts_uxpbd(
     bv = body_v + wp.cross(body_w, r_shape) + wp.transform_vector(X_wb, contact_body_vel[tid])
     v = pv - bv
 
-    lambda_n = c / dt
+    # Position-level PBD contact: lambda_n is a signed normal *position* delta
+    # (negative when penetrating). apply_particle_deltas downstream expects a
+    # position delta and reconstructs v via v_new = vp + d/dt, so dividing by
+    # dt here would scale the response by 1/dt and explode the velocity.
+    lambda_n = c
     delta_n = n * lambda_n
     vn = wp.dot(n, v)
     vt = v - n * vn
-    lambda_f = wp.max(mu * lambda_n, -wp.length(vt))
-    delta_f = wp.normalize(vt) * lambda_f
+    # Coulomb cap is on the position-level normal magnitude; the tangential
+    # term is the position-level relative motion this step, vt * dt.
+    # Zero-guard: at pure-normal contact, vt is numerically ~0; wp.normalize(vt)
+    # would produce a noise-driven unit vector multiplied by the (non-zero)
+    # mu*lambda_n cap and inject an arbitrary-direction tangential kick. Skip
+    # the friction branch entirely when |vt| is below a numerical floor.
+    vt_mag = wp.length(vt)
+    delta_f = wp.vec3(0.0)
+    if vt_mag > 1.0e-6:
+        lambda_f = wp.max(mu * lambda_n, -vt_mag * dt)
+        delta_f = vt * (lambda_f / vt_mag)
 
     # Particle-side effective inverse mass.
     if is_lattice:
@@ -202,20 +224,27 @@ def solve_particle_shape_contacts_uxpbd(
     delta_total = (delta_f - delta_n) / denom * relaxation
 
     # Route particle-side correction.
+    # SM-rigid (particle_deltas) consumer treats deltas as POSITION (m).
+    # Body-side (body_delta) consumer treats spatial_top as IMPULSE (kg*m/s),
+    # so divide the position-scale delta_total by dt when routing to bodies.
     if is_lattice:
         host_link = lattice_link[particle_to_lattice[particle_index]]
         host_q = body_q[host_link]
         host_com_world = wp.transform_point(host_q, body_com[host_link])
         r_lat = px - host_com_world
-        t_lat = wp.cross(r_lat, delta_total)
-        wp.atomic_add(body_delta, host_link, wp.spatial_vector(delta_total, t_lat))
+        body_impulse = delta_total / dt
+        t_lat = wp.cross(r_lat, body_impulse)
+        wp.atomic_add(body_delta, host_link, wp.spatial_vector(body_impulse, t_lat))
+        wp.atomic_add(body_contact_count, host_link, 1.0)
     else:
         wp.atomic_add(particle_deltas, particle_index, delta_total * w_particle)
 
-    # Newton's 3rd law on the shape side.
+    # Newton's 3rd law on the shape side (impulse-scale).
     if shape_link >= 0:
-        t_shape = wp.cross(r_shape, delta_total)
-        wp.atomic_sub(body_delta, shape_link, wp.spatial_vector(delta_total, t_shape))
+        body_impulse = delta_total / dt
+        t_shape = wp.cross(r_shape, body_impulse)
+        wp.atomic_sub(body_delta, shape_link, wp.spatial_vector(body_impulse, t_shape))
+        wp.atomic_add(body_contact_count, shape_link, 1.0)
 
 
 @wp.kernel
@@ -242,12 +271,19 @@ def solve_particle_particle_contacts_uxpbd(
     # outputs
     particle_deltas: wp.array[wp.vec3],
     body_delta: wp.array[wp.spatial_vector],
+    body_contact_count: wp.array[wp.float32],
 ):
     """Cross-substrate particle-particle contact.
 
     For each cross-phase pair: lattice particles route corrections into body
     wrenches, SM-rigid particles route into particle_deltas. Same-group and
     same-lattice-host pairs are skipped.
+
+    Per UPPFRTA §4.2 constraint averaging: each contact that contributes to
+    a body's wrench also increments ``body_contact_count`` by 1. The count
+    is consumed by ``apply_body_deltas`` via its ``constraint_inv_weights``
+    parameter to divide the accumulated wrench, preventing redundant
+    co-located lattice contacts from compounding into a launch impulse.
     """
     tid = wp.tid()
     i = wp.hash_grid_point_id(grid, tid)
@@ -268,6 +304,7 @@ def solve_particle_particle_contacts_uxpbd(
     delta_acc = wp.vec3(0.0)
     body_delta_lin = wp.vec3(0.0)
     body_delta_ang = wp.vec3(0.0)
+    body_contact_n = float(0.0)
 
     while wp.hash_grid_query_next(query, index):
         if index == i:
@@ -321,26 +358,37 @@ def solve_particle_particle_contacts_uxpbd(
             continue
 
         vrel = v_i - particle_v[index]
-        lambda_n = err / dt
+        # Position-level constraint (same convention as the particle-shape kernel
+        # above). See comments there for the unit/consumer rationale.
+        lambda_n = err
         delta_n = n_unit * lambda_n
         vn = wp.dot(n_unit, vrel)
         vt = vrel - n_unit * vn
-        lambda_f = wp.max(k_mu * lambda_n, -wp.length(vt))
-        delta_f = wp.normalize(vt) * lambda_f
+        # Same zero-guard as solve_particle_shape_contacts_uxpbd: avoid
+        # wp.normalize(vt) on a numerically-zero tangential velocity.
+        vt_mag = wp.length(vt)
+        delta_f = wp.vec3(0.0)
+        if vt_mag > 1.0e-6:
+            lambda_f = wp.max(k_mu * lambda_n, -vt_mag * dt)
+            delta_f = vt * (lambda_f / vt_mag)
         d_total = (delta_f - delta_n) / denom * relaxation
 
         if is_lat_i:
             host_i = lattice_link[particle_to_lattice[i]]
             host_q = body_q[host_i]
             r_lat_i = x_i - wp.transform_point(host_q, body_com[host_i])
-            body_delta_lin += d_total
-            body_delta_ang += wp.cross(r_lat_i, d_total)
+            # Convert position-scale d_total to impulse-scale for body_delta.
+            body_impulse = d_total / dt
+            body_delta_lin += body_impulse
+            body_delta_ang += wp.cross(r_lat_i, body_impulse)
+            body_contact_n += 1.0
         else:
             delta_acc += d_total * w_i
 
     if is_lat_i:
         host_i = lattice_link[particle_to_lattice[i]]
         wp.atomic_add(body_delta, host_i, wp.spatial_vector(body_delta_lin, body_delta_ang))
+        wp.atomic_add(body_contact_count, host_i, body_contact_n)
     else:
         wp.atomic_add(particle_deltas, i, delta_acc)
 
