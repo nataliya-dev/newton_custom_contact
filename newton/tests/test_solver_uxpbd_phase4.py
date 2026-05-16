@@ -104,7 +104,7 @@ def test_uxpbd_pbf_density_isolated_particle(test, device):
 
     # particle_grid is None when particle_count <= 1; build one manually.
     if model.particle_grid is None:
-        model.particle_grid = wp.HashGrid(128, 128, 128)
+        model.particle_grid = wp.HashGrid(128, 128, 128, device=device)
     model.particle_grid.build(state.particle_q, model.particle_max_radius * 4.0)
     density_out = wp.zeros(model.particle_count, dtype=wp.float32, device=device)
     h = 2.0 * 0.005
@@ -161,7 +161,7 @@ def test_uxpbd_pbf_lambda_at_rest_density(test, device):
     model = builder.finalize(device=device)
     state = model.state()
     if model.particle_grid is None:
-        model.particle_grid = wp.HashGrid(128, 128, 128)
+        model.particle_grid = wp.HashGrid(128, 128, 128, device=device)
 
     n = model.particle_count
     density = wp.array([1000.0] * n, dtype=wp.float32, device=device)
@@ -214,7 +214,7 @@ def test_uxpbd_pbf_position_delta_separates_overdense(test, device):
     model = builder.finalize(device=device)
     state = model.state()
     if model.particle_grid is None:
-        model.particle_grid = wp.HashGrid(128, 128, 128)
+        model.particle_grid = wp.HashGrid(128, 128, 128, device=device)
 
     n = model.particle_count
     density = wp.zeros(n, dtype=wp.float32, device=device)
@@ -284,6 +284,90 @@ add_function_test(
     TestSolverUXPBDPhase4,
     "test_uxpbd_pbf_position_delta_separates_overdense",
     test_uxpbd_pbf_position_delta_separates_overdense,
+    devices=get_test_devices(),
+)
+
+
+def test_uxpbd_pbf_position_delta_bounded_under_realistic_mass(test, device):
+    """PBF position delta stays physically bounded with non-unit particle mass.
+
+    Regression test for the m_j factor in the constraint gradient of
+    compute_fluid_lambda / compute_fluid_position_delta. Prior to that fix,
+    the artificial-pressure term s_corr generated position corrections of
+    several hundred meters per substep for water-density particles
+    (mass ~4e-3 kg), because the gradient was computed for unit-mass
+    particles only.
+
+    Setup mirrors a real fluid block: cell ~= h * 2/3 so the kernel sees
+    face neighbors, mass = rho * cell^3 (~4 mg for r=0.008 m).
+    """
+    from newton._src.solvers.uxpbd.fluid import (  # noqa: PLC0415
+        compute_fluid_density,
+        compute_fluid_lambda,
+        compute_fluid_position_delta,
+    )
+
+    builder = newton.ModelBuilder()
+    builder.add_fluid_grid(
+        pos=wp.vec3(0.0, 0.0, 0.0),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0, 0.0, 0.0),
+        dim_x=3, dim_y=3, dim_z=3,
+        cell_x=0.016, cell_y=0.016, cell_z=0.016,
+        particle_radius=0.008,
+        rest_density=1000.0,
+        smoothing_radius_factor=3.0,  # h = 3r = 0.024 > cell, so PBF couples
+    )
+    model = builder.finalize(device=device)
+    state = model.state()
+    if model.particle_grid is None:
+        model.particle_grid = wp.HashGrid(128, 128, 128, device=device)
+
+    # Sanity: particle mass is non-unit (otherwise the bug doesn't manifest).
+    m_typical = float(model.particle_mass.numpy()[0])
+    test.assertLess(m_typical, 0.1, f"test fixture must use non-unit mass: {m_typical}")
+
+    n = model.particle_count
+    density = wp.zeros(n, dtype=wp.float32, device=device)
+    lambdas = wp.zeros(n, dtype=wp.float32, device=device)
+    deltas = wp.zeros(n, dtype=wp.vec3, device=device)
+
+    model.particle_grid.build(state.particle_q, model.particle_max_radius * 4.0)
+    wp.launch(compute_fluid_density, dim=n,
+              inputs=[model.particle_grid.id, state.particle_q, model.particle_mass,
+                      model.particle_substrate, model.particle_fluid_phase,
+                      model.fluid_smoothing_radius, model.fluid_solid_coupling_s],
+              outputs=[density], device=device)
+    wp.launch(compute_fluid_lambda, dim=n,
+              inputs=[model.particle_grid.id, state.particle_q, model.particle_mass,
+                      model.particle_substrate, model.particle_fluid_phase,
+                      model.fluid_rest_density, model.fluid_smoothing_radius,
+                      density, wp.float32(100.0)],
+              outputs=[lambdas], device=device)
+    wp.launch(compute_fluid_position_delta, dim=n,
+              inputs=[model.particle_grid.id, state.particle_q, model.particle_mass,
+                      model.particle_substrate, model.particle_fluid_phase,
+                      model.fluid_rest_density, model.fluid_smoothing_radius,
+                      lambdas, wp.float32(0.1), wp.float32(0.3), wp.float32(4.0)],
+              outputs=[deltas], device=device)
+
+    dx = deltas.numpy()
+    max_delta_norm = float(np.linalg.norm(dx, axis=1).max())
+    # A physically-reasonable PBF correction in this configuration is
+    # millimeters, not meters. Pre-fix this was ~480 m per neighbor for a
+    # corner particle, hitting the velocity cap on the very first substep.
+    test.assertLess(
+        max_delta_norm,
+        0.05,
+        f"PBF delta unphysically large ({max_delta_norm:.4f} m); "
+        "is the m_j factor in compute_fluid_lambda / compute_fluid_position_delta missing?",
+    )
+
+
+add_function_test(
+    TestSolverUXPBDPhase4,
+    "test_uxpbd_pbf_position_delta_bounded_under_realistic_mass",
+    test_uxpbd_pbf_position_delta_bounded_under_realistic_mass,
     devices=get_test_devices(),
 )
 
@@ -359,7 +443,7 @@ def test_uxpbd_xsph_viscosity_damps_relative_velocity(test, device):
     model = builder.finalize(device=device)
     state = model.state()
     if model.particle_grid is None:
-        model.particle_grid = wp.HashGrid(128, 128, 128)
+        model.particle_grid = wp.HashGrid(128, 128, 128, device=device)
 
     n = model.particle_count
     density = wp.array([1000.0] * n, dtype=wp.float32, device=device)
@@ -412,7 +496,7 @@ def test_uxpbd_cohesion_pulls_neighbors_together(test, device):
     model = builder.finalize(device=device)
     state = model.state()
     if model.particle_grid is None:
-        model.particle_grid = wp.HashGrid(128, 128, 128)
+        model.particle_grid = wp.HashGrid(128, 128, 128, device=device)
 
     n = model.particle_count
     forces = wp.zeros(n, dtype=wp.vec3, device=device)

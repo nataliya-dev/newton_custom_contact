@@ -192,7 +192,12 @@ def compute_fluid_lambda(
     sum_grad_sq = wp.float32(0.0)
 
     # Accumulate squared gradient contributions from neighbor particles j != i.
-    # grad_j C_i = (1/rho_0) * grad_W(x_i - x_j, h)
+    # For the mass-weighted density rho_i = sum_j m_j W(x_i - x_j, h), the
+    # constraint gradient is grad_p_j C_i = (m_j / rho_0) * grad_W. Macklin &
+    # Muller 2013 derive this with unit mass and drop the m_j factor; for
+    # variable-mass particles the m_j must be carried, otherwise both lambda
+    # and the position delta are wrong by a factor of m_j (which can be very
+    # small in SI units, e.g. 4e-3 kg for a 1 cm^3 water particle).
     query = wp.hash_grid_query(grid, x_i, h)
     j = int(0)
     while wp.hash_grid_query_next(query, j):
@@ -200,7 +205,7 @@ def compute_fluid_lambda(
             continue
         r = x_i - particle_x[j]
         grad_w = spiky_gradient(r, h)
-        g_j = grad_w / rho0
+        g_j = particle_mass[j] * grad_w / rho0
         sum_grad_sq += wp.dot(g_j, g_j)
         grad_i_sum += g_j
 
@@ -269,6 +274,14 @@ def compute_fluid_position_delta(
     dq_vec = wp.vec3(dq_factor * h, 0.0, 0.0)
     w_dq = poly6_kernel(dq_vec, h)
 
+    # Macklin's artificial pressure s_corr is meant to fix *tensile*
+    # instability (the spiky-gradient pulls particles into clumps when
+    # they're already over-dense). For UNDER-dense (lam_i == 0 in our
+    # unilateral formulation), there is no clumping force to counter
+    # and firing s_corr just pumps spurious outward velocity each
+    # iteration. Gate the artificial pressure on lam_i being active.
+    s_corr_active = lam_i < wp.float32(0.0)
+
     query = wp.hash_grid_query(grid, x_i, h)
     j = int(0)
     while wp.hash_grid_query_next(query, j):
@@ -280,14 +293,32 @@ def compute_fluid_position_delta(
         grad_w = spiky_gradient(r, h)
 
         # Artificial pressure s_corr prevents tensile instability (clumping).
-        w_r = poly6_kernel(r, h)
+        # Only fire when this particle is over-dense (lam_i < 0); see comment
+        # at s_corr_active definition above.
         s_corr = wp.float32(0.0)
-        if w_dq > wp.float32(1.0e-12):
+        if s_corr_active and w_dq > wp.float32(1.0e-12):
+            w_r = poly6_kernel(r, h)
             ratio = w_r / w_dq
             s_corr = -k_corr * wp.pow(ratio, n_corr)
 
         lam_j = lambdas[j]
-        delta += (lam_i + lam_j + s_corr) * grad_w
+        # m_j factor: textbook PBD derivation says m cancels here for uniform
+        # mass (since w_i = 1/m and grad_p_i C_j = (m/rho_0) grad_W gives
+        # w_i * grad_p_i C_j = grad_W / rho_0). BUT: Macklin & Muller 2013
+        # use a fixed regularizer epsilon = 100 calibrated for normalized
+        # units (m = rho_0 = 1). In SI units with water-density particles
+        # (m_j ~= 4e-3 kg), sum_grad_sq >> epsilon, so the regularizer is
+        # ineffective and lambda stays undamped. The Macklin position-delta
+        # formula then produces meter-scale corrections per neighbor.
+        #
+        # Multiplying by m_j here mass-scales the position correction to
+        # millimeter scale in SI, matching the magnitudes Macklin gets in
+        # his normalized examples. This is a unit-system calibration, not
+        # a textbook PBD derivation. The alternative (scaling epsilon with
+        # sum_grad_sq magnitude) would also work but requires per-scenario
+        # tuning; the m_j scaling is automatic and dimensionally analogous
+        # to the constraint-gradient fix in compute_fluid_lambda.
+        delta += (lam_i + lam_j + s_corr) * particle_mass[j] * grad_w
 
     deltas[i] = delta / rho0
 
