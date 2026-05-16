@@ -52,6 +52,28 @@ The SM-rigid path uses SRXPBD tile-reduce primitives that require a CUDA-enabled
 | `uv run python -m newton.examples uxpbd_particle_drop` | A free SM-rigid sphere-packed cube falls onto the ground and settles. Sanity check for the SM-rigid + ground-contact path on its own. |
 | `uv run python -m newton.examples uxpbd_pick_and_place` | A Franka arm with lattice-shelled finger pads friction-grasps a 64-sphere SM-rigid cube, lifts, translates, and releases on a stack. APPROACH → SQUEEZE → LIFT → HOLD phases. |
 
+### Phase 4 demos (PBF fluid)
+
+PBF density solve + Akinci cohesion + XSPH viscosity. Run on CPU and CUDA (no SRXPBD tile primitives required for fluid-only scenes).
+
+| Command | What you'll see |
+|---|---|
+| `uv run python -m newton.examples uxpbd_fluid_drop` | A 5×5×5 = 125-particle fluid block falls from `z = 0.20 m` onto the ground and spreads into a puddle. `test_final` asserts `z_min > -0.02 m` (no ground penetration) and `x_extent > 1.2× initial` (the block spread). Smallest scene for PBF + ground-contact regression. |
+| `uv run python -m newton.examples uxpbd_fluid_column_collapse` | A 3×3×12 = 108-particle tall narrow column collapses onto the ground (dam-break lite). `test_final` asserts the column got shorter (`z_max < 0.5 × initial`), the footprint widened (`x_extent > 1.5× initial`), and no ground penetration. |
+| `uv run python -m newton.examples uxpbd_fluid_cohesive_blob` | A 5×5×5 fluid block with Akinci cohesion `kc = 5 N` (the empirical stability sweet spot for SI water at this scale — bigger values compound through the contact-PBF chain). `test_final` asserts the blob stayed compact (bounding-box diagonal < 3× initial). |
+
+### Cross-substrate combo demos
+
+Multi-substrate scenes that exercise more than one of {lattice, SM-rigid, fluid, loose-particle} simultaneously. All require CUDA when SM-rigid is involved.
+
+| Command | What you'll see |
+|---|---|
+| `uv run python -m newton.examples uxpbd_combo` | Side-by-side stress test of every substrate: a lattice-clad rigid body, a free SM-rigid cube, a sphere-masked SM-rigid ball (via `add_particle_volume`), and a 4×4×4 PBF fluid block, all on one ground plane. `test_final` asserts each substrate reached its expected rest height with `|v| < 0.5 m/s` and the fluid did not launch above its spawn height. **CUDA only** (SM-rigid path). |
+| `uv run python -m newton.examples uxpbd_lattice_into_fluid` | A lattice-clad cube drops from `z = 0.30 m` into an 8×8×5 = 320-particle PBF pool. Tests lattice ↔ fluid coupling: lattice contact deltas route into the host body wrench, fluid density estimation includes lattice spheres as "solid" per UPPFRTA eq. 27. `test_final` asserts the cube sank/displaced fluid, did not pierce the ground, and the fluid did not splash above the spawn height. Runs on CPU + CUDA. |
+| `uv run python -m newton.examples uxpbd_volume_into_fluid` | A 2000 kg/m³ sphere-masked SM-rigid ball (`add_particle_volume`) sinks through a 1000 kg/m³ PBF pool. Tests SM-rigid ↔ fluid coupling with the shape-matching post-pass keeping the ball rigid through the splash. **CUDA only**. |
+| `uv run python -m newton.examples uxpbd_multi_fluid` | Two fluid phases with different rest densities (heavy ρ₀ = 1500 kg/m³ stacked above light ρ₀ = 1000 kg/m³). Tests UPPFRTA §7.1.1 mass-weighted PBF buoyancy / Rayleigh-Taylor inversion. `test_final` asserts the heavy phase migrated downward (mean z dropped or inter-phase gap shrank). Runs on CPU + CUDA. |
+| `uv run python -m newton.examples uxpbd_raining_on_stack` | A 5×5×3 = 75-particle grid of loose particles (`add_particle_grid`) rains down from `z = 0.40 m` onto a lattice-clad cube resting on the ground. Tests lattice ↔ loose-particle PP contact: rain hits route into the host body's wrench without launching it off the ground. `test_final` asserts the lattice body stayed in `0.02 < z < 0.10 m` and no rain particle launched above its spawn height. Runs on CPU + CUDA. |
+
 ### Useful demo invocations
 
 ```bash
@@ -141,6 +163,23 @@ uv run --extra dev -m newton.tests -k test_uxpbd_pendulum_period
 | `test_pbdr_t5_bunny_torque` | Same as t2 on bunny, 10% tolerance | **CUDA only** |
 | `test_pbdr_t1_lattice_pushed_box` | PBD-R t1 with the box replaced by a **lattice-clad articulated body** that shares its geometry with `example_uxpbd_lattice_stack` (half-extent 0.04, sphere_r 0.012, 4×4×4 packing). Force F scaled to preserve F/M so the analytical reference matches t1's SM-rigid variant. Within 5%. | **CUDA only** |
 
+**Phase 4** (`newton/tests/test_solver_uxpbd_phase4.py`):
+
+PBF fluid path. Each test runs on both CPU and CUDA (10 tests × 2 devices = 20 cases).
+
+| Test | Validates |
+|---|---|
+| `test_uxpbd_empty_model_has_zero_fluid` | A model with no fluids has `fluid_phase_count == 0` and empty fluid arrays |
+| `test_uxpbd_add_fluid_grid_creates_phase_and_particles` | `add_fluid_grid` registers a new phase, allocates particles, sets `particle_substrate == 3` and `particle_fluid_phase` |
+| `test_uxpbd_pbf_density_isolated_particle` | An isolated fluid particle has density = `m · W(0, h)` (self-contribution only) |
+| `test_uxpbd_pbf_lambda_at_rest_density` | When density equals `ρ_0` (C = 0), the unilateral constraint cuts off and `lambda = 0` |
+| `test_uxpbd_pbf_position_delta_separates_overdense` | Over-dense particles get a position delta pointing away from neighbours (correct repulsion direction) |
+| `test_uxpbd_pbf_position_delta_bounded_under_realistic_mass` | Position deltas stay bounded for SI water-mass particles; regression for the mass-weighting bug that produced metre-scale corrections |
+| `test_uxpbd_fluid_block_settles` | A 3×3×3 fluid block falls without collapsing to a point (PBF incompressibility keeps inter-particle distance ≳ radius) |
+| `test_uxpbd_xsph_viscosity_damps_relative_velocity` | XSPH reduces neighbour velocity differences; regression for the missing-`m_j` over-amplification |
+| `test_uxpbd_cohesion_pulls_neighbors_together` | Akinci cohesion pair force attracts same-phase fluid neighbours |
+| `test_uxpbd_fluid_on_ground_no_penetration` | A fluid block on the ground does not penetrate below `z = -0.02`; regression for the contact-PBF launch (s_corr gate + position-delta clamp) |
+
 ### Run the entire Newton test suite (regression check)
 
 ```bash
@@ -176,7 +215,7 @@ When you want to confirm nothing is broken locally:
 # All UXPBD unit tests
 uv run --extra dev -m newton.tests -k SolverUXPBD
 
-# Every viewer demo to 100 frames, headless, with test_final asserted
+# Every viewer demo to 400 frames, headless, with test_final asserted
 for demo in \
     uxpbd_pendulum \
     uxpbd_lattice_drop \
@@ -187,13 +226,21 @@ for demo in \
     uxpbd_box_on_slope \
     uxpbd_bunny_push \
     uxpbd_particle_drop \
-    uxpbd_pick_and_place; do
+    uxpbd_pick_and_place \
+    uxpbd_fluid_drop \
+    uxpbd_fluid_column_collapse \
+    uxpbd_fluid_cohesive_blob \
+    uxpbd_combo \
+    uxpbd_lattice_into_fluid \
+    uxpbd_volume_into_fluid \
+    uxpbd_multi_fluid \
+    uxpbd_raining_on_stack; do
     echo "=== $demo ==="
     uv run python -m newton.examples $demo --viewer null --test --num-frames 400 || break
 done
 ```
 
-Expected: every demo exit code 0; UXPBD test suite passes (Phase 1 on CPU+CUDA, Phase 2 SM-rigid tests skip on CPU and pass on CUDA).
+Expected: every demo exit code 0; UXPBD test suite passes (Phase 1 + Phase 4 on CPU+CUDA, Phase 2 SM-rigid tests skip on CPU and pass on CUDA, combo demos involving SM-rigid skip on CPU).
 
 ---
 

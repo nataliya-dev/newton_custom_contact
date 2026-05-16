@@ -34,6 +34,7 @@ from .fluid import (
     compute_fluid_position_delta,
 )
 from .kernels import (
+    apply_particle_deltas_position_only,
     compute_mass_scale,
     solve_particle_particle_contacts_uxpbd,
     solve_particle_shape_contacts_uxpbd,
@@ -311,6 +312,96 @@ class SolverUXPBD(SolverBase):
             inv_mass_for_contact = self._scaled_inv_mass
         else:
             inv_mass_for_contact = model.particle_inv_mass
+
+        # ──── 3.5 UPPFRTA §4.4 stabilization sub-loop ────────────────────
+        # Resolve initial contact penetration BEFORE the main loop, applying
+        # only POSITION corrections (no velocity update) so the substep's
+        # final v = (q_final - q_init)/dt naturally cancels the stabilization
+        # correction. Without this pass, a fluid block landing on the ground
+        # injects a velocity impulse equal to penetration_depth/dt at the
+        # first contact iteration; the PBF density solver then opposes the
+        # contact correction and the contact-PBF pair pumps energy into the
+        # stack until particles launch. Per UPPFRTA Algorithm 1 lines 10-15.
+        #
+        # Currently restricted to PARTICLE-only stabilization: body wrench
+        # accumulated by the contact kernel is intentionally discarded here.
+        # For pure-particle scenes (fluid block on ground, SM-rigid stacks)
+        # this is sufficient. Lattice-bound articulated rigid bodies still
+        # rely on the body-level contact-count averaging from design spec
+        # §5.7 to avoid the "lattice launch" failure mode; their main-loop
+        # corrections converge regardless of stabilization. A future
+        # apply_body_deltas_position_only kernel would extend §4.4 to the
+        # lattice path and is left as a follow-up.
+        if (self.stabilization_iterations > 0
+                and contacts is not None
+                and model.particle_count > 0):
+            _body_q_stab = (
+                state_out.body_q
+                if state_out.body_q is not None
+                else wp.zeros(0, dtype=wp.transform, device=model.device)
+            )
+            _body_qd_stab = (
+                state_out.body_qd
+                if state_out.body_qd is not None
+                else wp.zeros(0, dtype=wp.spatial_vector, device=model.device)
+            )
+            for _stab_iter in range(self.stabilization_iterations):
+                body_deltas.zero_()
+                body_contact_count.zero_()
+                particle_deltas_stab = wp.zeros(
+                    model.particle_count, dtype=wp.vec3, device=model.device)
+                wp.launch(
+                    kernel=solve_particle_shape_contacts_uxpbd,
+                    dim=contacts.soft_contact_max,
+                    inputs=[
+                        state_out.particle_q,
+                        state_out.particle_qd,
+                        inv_mass_for_contact,
+                        model.particle_radius,
+                        model.particle_flags,
+                        model.particle_substrate,
+                        model.particle_to_lattice,
+                        model.lattice_link,
+                        _body_q_stab,
+                        _body_qd_stab,
+                        model.body_com,
+                        self.body_inv_mass_effective,
+                        self.body_inv_inertia_effective,
+                        model.shape_body,
+                        model.shape_material_mu,
+                        model.soft_contact_mu,
+                        model.particle_adhesion,
+                        contacts.soft_contact_count,
+                        contacts.soft_contact_particle,
+                        contacts.soft_contact_shape,
+                        contacts.soft_contact_body_pos,
+                        contacts.soft_contact_body_vel,
+                        contacts.soft_contact_normal,
+                        contacts.soft_contact_max,
+                        dt,
+                        self.soft_contact_relaxation,
+                    ],
+                    outputs=[body_deltas, body_contact_count, particle_deltas_stab],
+                    device=model.device,
+                )
+                # Apply position-only (no velocity update) per §4.4.
+                new_q_stab = wp.empty_like(state_out.particle_q)
+                wp.launch(
+                    kernel=apply_particle_deltas_position_only,
+                    dim=model.particle_count,
+                    inputs=[
+                        state_out.particle_q,
+                        model.particle_flags,
+                        model.particle_mass,
+                        particle_deltas_stab,
+                    ],
+                    outputs=[new_q_stab],
+                    device=model.device,
+                )
+                state_out.particle_q = new_q_stab
+                # Re-sync lattice particle positions from the (unchanged)
+                # body_q so the next stabilization iter sees consistent state.
+                self.update_lattice_world_positions(state_out)
 
         for _ in range(self.iterations):
             if body_deltas is not None:

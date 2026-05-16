@@ -275,12 +275,28 @@ def compute_fluid_position_delta(
     w_dq = poly6_kernel(dq_vec, h)
 
     # Macklin's artificial pressure s_corr is meant to fix *tensile*
-    # instability (the spiky-gradient pulls particles into clumps when
-    # they're already over-dense). For UNDER-dense (lam_i == 0 in our
-    # unilateral formulation), there is no clumping force to counter
-    # and firing s_corr just pumps spurious outward velocity each
-    # iteration. Gate the artificial pressure on lam_i being active.
-    s_corr_active = lam_i < wp.float32(0.0)
+    # instability (the spiky gradient pulls particles into clumps when
+    # they are already over-dense). With Macklin & Muller's BILATERAL
+    # density constraint (rho_i / rho_0 - 1 = 0), s_corr always fires
+    # because lambda is always non-zero. UPPFRTA section 7 (and our
+    # compute_fluid_lambda) clamps to a UNILATERAL constraint that is
+    # inactive when rho_i < rho_0 (lam_i == 0). In that regime there
+    # is no clumping force to counter, so firing s_corr just pumps
+    # spurious outward velocity each iteration.
+    #
+    # SECOND failure mode: even when lam_i is barely-active (e.g.
+    # 1e-8 from a slightly over-dense moment), the s_corr term scales
+    # as (W(r,h)/W(dq,h))^n_corr * |grad_W|, both of which diverge
+    # at near-overlap (r -> 0). With m_j weighting in SI water (m
+    # ~= 4e-3 kg) and Spiky |grad_W| ~ 4e+7 at r ~= 1 mm, a single
+    # neighbour pair generates a position correction on the order of
+    # tens of metres per pass, even though lambda is 1e-8.
+    #
+    # Gate on `lam_i < threshold` rather than just `lam_i < 0` so
+    # numerically-tiny lambdas (from particles right at the unilateral
+    # threshold) do not trigger s_corr. Threshold chosen so lam_i must
+    # represent at least ~1% over-density (C >= 0.01).
+    s_corr_active = lam_i < wp.float32(-1.0e-5)
 
     query = wp.hash_grid_query(grid, x_i, h)
     j = int(0)
@@ -320,7 +336,24 @@ def compute_fluid_position_delta(
         # to the constraint-gradient fix in compute_fluid_lambda.
         delta += (lam_i + lam_j + s_corr) * particle_mass[j] * grad_w
 
-    deltas[i] = delta / rho0
+    delta_out = delta / rho0
+
+    # Clamp the per-iteration position correction. PBF + Spiky gradient
+    # diverges at small r (|grad_W| ~ (h-r)^2 / h^6 prefactor blows up as
+    # r -> 0), so when two particles approach overlap, a single iteration
+    # can ask for METRES of correction. Clamp the per-pass move to a
+    # fraction of the particle radius (= h / smoothing_radius_factor /
+    # 2.0; here we use 0.1 * h ~ 0.4 * particle_radius), matching the
+    # PBF rule of thumb that no particle should jump more than a small
+    # fraction of its radius per constraint pass (Macklin & Muller 2013
+    # sect. 4 implementation notes; Akinci 2012 DFSPH uses the same
+    # heuristic).
+    h_clamp = wp.float32(0.1) * h
+    d_mag = wp.length(delta_out)
+    if d_mag > h_clamp:
+        delta_out = delta_out * (h_clamp / d_mag)
+
+    deltas[i] = delta_out
 
 
 @wp.kernel
@@ -342,9 +375,20 @@ def apply_xsph_viscosity(
     Smooths velocities between neighbors once per main iteration after the
     PBF sub-iteration loop:
 
-        v_i_new = v_i + c * sum_j (v_j - v_i) * W(x_i - x_j, h) / rho_j
+        v_i_new = v_i + c * sum_j m_j * (v_j - v_i) * W(x_i - x_j, h) / rho_j
 
-    Reference: Macklin and Muller 2013, "Position Based Fluids", eq. 17.
+    The m_j factor is the SPH "particle volume" V_j = m_j / rho_j. Macklin
+    and Muller 2013 eq. 17 omits it because their derivation uses unit
+    particle mass; for SI water-density particles (m_j ~= 4e-3 kg) the
+    omission turns the kernel from a damping operator into an amplifier
+    (per-neighbor gain ~ c * W / rho_j ~= 1 instead of c * V_j ~= 1e-3),
+    which causes velocity differences to OVER-shoot and flip sign each
+    pass. Multiplying by m_j is the same calibration applied to the PBF
+    constraint gradients in compute_fluid_lambda /
+    compute_fluid_position_delta and recovers the textbook XSPH operator.
+
+    Reference: Macklin and Muller 2013, "Position Based Fluids", eq. 17;
+    Monaghan 1989 / 2005 SPH review for the variable-mass form.
 
     Args:
         grid: Warp hash grid id built from particle positions.
@@ -388,7 +432,8 @@ def apply_xsph_viscosity(
         w = poly6_kernel(r, h)
         rho_j = density[j]
         if rho_j > wp.float32(1.0e-12):
-            delta_v += (particle_v[j] - v_i) * (w / rho_j)
+            # m_j * W / rho_j == V_j (particle volume); see docstring.
+            delta_v += (particle_v[j] - v_i) * (particle_mass[j] * w / rho_j)
 
     new_v[i] = v_i + c * delta_v
 

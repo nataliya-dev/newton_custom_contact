@@ -397,6 +397,47 @@ def solve_particle_particle_contacts_uxpbd(
 
 
 @wp.kernel
+def apply_particle_deltas_position_only(
+    x_pred: wp.array[wp.vec3],
+    particle_flags: wp.array[wp.int32],
+    particle_mass: wp.array[wp.float32],
+    delta: wp.array[wp.vec3],
+    # output
+    x_out: wp.array[wp.vec3],
+):
+    """UPPFRTA section 4.4 stabilization sub-loop position-only update.
+
+    Updates ``x`` only -- velocity is left untouched. Used during the
+    pre-main-loop stabilization pass to fix initial penetration without
+    injecting kinetic energy. Per UPPFRTA Algorithm 1 lines 10-15:
+
+        while iter < stabilizationIterations do
+            Delta_x <- 0
+            solve contact constraints for Delta_x
+            update x_i  <- x_i + Delta_x
+            update x*   <- x* + Delta_x      <-- this kernel
+        end while
+
+    The paper updates BOTH the original x_i AND the predicted x* so that
+    the eventual v = (x* - x_i)/dt naturally cancels the stabilization
+    correction. UXPBD's per-iteration apply_particle_deltas instead does
+    v_new = vp + d/dt incrementally, so the equivalent is to apply only
+    the position component during stabilization (vp is left unchanged,
+    so future iterations' v_new computes from the unmodified vp).
+
+    Static (mass=0) and inactive particles are passthrough.
+    """
+    tid = wp.tid()
+    if particle_mass[tid] == 0.0:
+        x_out[tid] = x_pred[tid]
+        return
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        x_out[tid] = x_pred[tid]
+        return
+    x_out[tid] = x_pred[tid] + delta[tid]
+
+
+@wp.kernel
 def compute_mass_scale(
     particle_q: wp.array[wp.vec3],
     particle_mass: wp.array[wp.float32],
