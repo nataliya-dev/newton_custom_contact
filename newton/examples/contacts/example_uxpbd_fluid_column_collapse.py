@@ -13,6 +13,7 @@
 # Command: python -m newton.examples uxpbd_fluid_column_collapse
 ###########################################################################
 
+import numpy as np
 import warp as wp
 
 import newton
@@ -94,19 +95,44 @@ class Example:
 
     def test_final(self):
         pos = self.state_0.particle_q.numpy()
+        vel = self.state_0.particle_qd.numpy()
+
+        # 0. Numerical sanity first — PBF / contact-PBF instability
+        #    manifests as NaN/Inf or runaway velocities.
+        assert np.isfinite(pos).all(), "NaN/Inf in particle positions"
+        assert np.isfinite(vel).all(), "NaN/Inf in particle velocities"
+
+        # 1. No particle escaped the simulation domain.
+        q_abs_max = float(np.abs(pos).max())
+        assert q_abs_max < 2.0, f"Particle escaped: |q|_max={q_abs_max:.3f} m"
+
+        # 2. Max velocity is bounded. The column's top starts at z=0.20 m,
+        #    so peak free-fall v is ~2 m/s; by 4 s of settling the puddle
+        #    should be near rest. >3 m/s flags PBF instability.
+        v_max = float(np.linalg.norm(vel, axis=1).max())
+        assert v_max < 3.0, f"Fluid moving too fast: v_max={v_max:.3f} m/s"
+
         z_max = float(pos[:, 2].max())
         z_min = float(pos[:, 2].min())
         x_extent = float(pos[:, 0].max() - pos[:, 0].min())
 
-        # 1. Column got shorter (collapsed).
+        # 3. Column got shorter (collapsed).
         assert z_max < 0.5 * self._z_max_0, (
             f"column did not collapse: z_max={z_max:.4f} vs initial {self._z_max_0:.4f}"
         )
-        # 2. Footprint widened.
+        # 4. Footprint widened.
         assert x_extent > self._x_extent_0 * 1.5, (
             f"fluid did not spread: x_extent={x_extent:.4f} vs initial {self._x_extent_0:.4f}"
         )
-        # 3. No ground penetration.
+        # 5. ... but did NOT over-spread catastrophically. The 3x3
+        #    column footprint dam-breaks to a 0.4-0.5 m puddle over 4 s
+        #    (the unmodeled-cohesion + low-viscosity equilibrium for
+        #    108 particles of this radius). >18x initial means particles
+        #    are popping through each other (clear instability).
+        assert x_extent < self._x_extent_0 * 18.0, (
+            f"fluid over-spread (likely instability): x_extent={x_extent:.4f}"
+        )
+        # 6. No ground penetration.
         assert z_min > -0.02, f"fluid penetrated ground: z_min={z_min:.4f}"
 
     @staticmethod

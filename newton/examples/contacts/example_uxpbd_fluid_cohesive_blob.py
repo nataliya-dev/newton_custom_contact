@@ -99,11 +99,30 @@ class Example:
 
     def test_final(self):
         pos = self.state_0.particle_q.numpy()
+        vel = self.state_0.particle_qd.numpy()
+
+        # 0. Numerical sanity. Cohesion + PBF is a known instability
+        #    pair (the Akinci force can compound through contact-PBF
+        #    iterations and produce NaN if cohesion is too high — see
+        #    add_fluid_grid call above for the kc=5 sweet spot).
+        assert np.isfinite(pos).all(), "NaN/Inf in particle positions"
+        assert np.isfinite(vel).all(), "NaN/Inf in particle velocities"
+
+        # 1. No particle escaped the simulation domain.
+        q_abs_max = float(np.abs(pos).max())
+        assert q_abs_max < 2.0, f"Particle escaped: |q|_max={q_abs_max:.3f} m"
+
+        # 2. Velocity bound. A 0.20 m drop gives v ~ 2 m/s at impact;
+        #    cohesion can briefly boost local velocities during contraction
+        #    but should not exceed 4 m/s in a stable run.
+        v_max = float(np.linalg.norm(vel, axis=1).max())
+        assert v_max < 4.0, f"Blob moving too fast: v_max={v_max:.3f} m/s"
+
         bbox = pos.max(axis=0) - pos.min(axis=0)
         diag = float(np.linalg.norm(bbox))
         z_min = float(pos[:, 2].min())
 
-        # 1. Blob stayed compact (bounding-box diagonal did not blow up).
+        # 3. Blob stayed compact (bounding-box diagonal did not blow up).
         # A loose, no-cohesion drop spreads to ~5-7x its initial diagonal
         # by frame 100 (puddle on the ground); the cohesive blob with
         # cohesion=5 (the empirical stability sweet spot for SI water at
@@ -115,7 +134,15 @@ class Example:
         assert diag < 3.0 * self._diag_0, (
             f"blob lost cohesion: diag={diag:.4f} vs initial {self._diag_0:.4f}"
         )
-        # 2. No ground penetration.
+
+        # 4. ... but also did NOT collapse to a point (cohesion gone
+        #    runaway-inward). A point-collapse means PBF density solve
+        #    failed to oppose the cohesion pair force.
+        assert diag > 0.2 * self._diag_0, (
+            f"blob collapsed to a point: diag={diag:.4f} vs initial {self._diag_0:.4f}"
+        )
+
+        # 5. No ground penetration.
         assert z_min > -0.02, f"fluid penetrated ground: z_min={z_min:.4f}"
 
     @staticmethod

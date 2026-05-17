@@ -198,6 +198,18 @@ class Example:
         self.viewer.set_camera(pos=wp.vec3(0.0, -1.2, 0.5),
                                pitch=-25.0, yaw=90.0)
 
+        # Capture the full substep loop into a CUDA graph (perf #3). On CUDA
+        # this replays ~16 substeps × ~220 kernel launches per frame as a
+        # single graph launch, cutting Python+driver launch overhead.
+        # Warmup once first so any first-call lazy state is realized before
+        # capture (matches the pattern in example_pyramid / example_robot_*).
+        self.graph = None
+        if wp.get_device().is_cuda:
+            self.simulate()
+            with wp.ScopedCapture() as capture:
+                self.simulate()
+            self.graph = capture.graph
+
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -208,7 +220,10 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        self.simulate()
+        if self.graph is not None:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
         self.sim_time += self.frame_dt
 
     def render(self):
@@ -220,9 +235,26 @@ class Example:
     def test_final(self):
         # Each substrate must reach a physically sensible final state.
 
+        # 0. Numerical sanity across the whole scene. Combo exercises
+        #    every substrate path (lattice, SM-rigid x2, PBF) plus
+        #    cross-substrate PP contacts; a NaN here usually means a
+        #    cross-substrate kernel disagrees about a particle's class.
+        all_body_q = self.state_0.body_q.numpy()
+        all_body_qd = self.state_0.body_qd.numpy()
+        all_part_q = self.state_0.particle_q.numpy()
+        all_part_v = self.state_0.particle_qd.numpy()
+        assert np.isfinite(all_body_q).all(), "NaN/Inf in body_q"
+        assert np.isfinite(all_body_qd).all(), "NaN/Inf in body_qd"
+        assert np.isfinite(all_part_q).all(), "NaN/Inf in particle positions"
+        assert np.isfinite(all_part_v).all(), "NaN/Inf in particle velocities"
+
+        # 1. No particle escaped (scene spans < 1.5 m in any direction).
+        q_abs_max = float(np.abs(all_part_q).max())
+        assert q_abs_max < 3.0, f"Particle escaped: |q|_max={q_abs_max:.3f} m"
+
         # Substrate 0: lattice body at rest near LATTICE_REST_Z.
-        body_q = self.state_0.body_q.numpy()[0]
-        body_qd = self.state_0.body_qd.numpy()[0]
+        body_q = all_body_q[0]
+        body_qd = all_body_qd[0]
         body_z = float(body_q[2])
         assert abs(body_z - self.LATTICE_REST_Z) < 5.0e-2, (
             f"Lattice body did not settle: z={body_z:.4f}, "
@@ -230,6 +262,10 @@ class Example:
         )
         body_v = float(np.linalg.norm(body_qd[:3]))
         assert body_v < 0.5, f"Lattice body still moving: |v|={body_v:.3f} m/s"
+        body_omega = float(np.linalg.norm(body_qd[3:]))
+        assert body_omega < 2.0, (
+            f"Lattice body spinning: |omega|={body_omega:.3f} rad/s"
+        )
 
         # Substrate 1: SM cube COM near rest height, near-stationary.
         sm_cube_q = self.state_0.particle_q.numpy()[self._sm_cube_idx]

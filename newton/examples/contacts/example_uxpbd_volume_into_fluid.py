@@ -122,6 +122,15 @@ class Example:
         self.viewer.set_camera(pos=wp.vec3(0.5, -0.5, 0.30),
                                pitch=-25.0, yaw=135.0)
 
+        # CUDA graph capture (perf #3): replay the full substep loop as a
+        # single graph launch on CUDA.
+        self.graph = None
+        if wp.get_device().is_cuda:
+            self.simulate()
+            with wp.ScopedCapture() as capture:
+                self.simulate()
+            self.graph = capture.graph
+
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -132,7 +141,10 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        self.simulate()
+        if self.graph is not None:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
         self.sim_time += self.frame_dt
 
     def render(self):
@@ -142,25 +154,53 @@ class Example:
         self.viewer.end_frame()
 
     def test_final(self):
-        # Ball: settled (sank through fluid), near rest.
-        ball_q = self.state_0.particle_q.numpy()[self._ball_idx]
-        ball_v = self.state_0.particle_qd.numpy()[self._ball_idx]
+        all_q = self.state_0.particle_q.numpy()
+        all_v = self.state_0.particle_qd.numpy()
+
+        # 0. Numerical sanity. SM-rigid + PBF coupling is the most
+        #    fragile path in UXPBD (shape-matching post-pass interacts
+        #    with PBF density iteration), so NaN/Inf check first.
+        assert np.isfinite(all_q).all(), "NaN/Inf in particle positions"
+        assert np.isfinite(all_v).all(), "NaN/Inf in particle velocities"
+
+        # 1. No particle escaped.
+        q_abs_max = float(np.abs(all_q).max())
+        assert q_abs_max < 3.0, f"Particle escaped: |q|_max={q_abs_max:.3f} m"
+
+        # Ball (SM-rigid): settled, near rest, not spinning wildly.
+        ball_q = all_q[self._ball_idx]
+        ball_v = all_v[self._ball_idx]
         ball_com_z = float(ball_q[:, 2].mean())
-        ball_v_mag = float(np.linalg.norm(ball_v.mean(axis=0)))
+        ball_v_mean = float(np.linalg.norm(ball_v.mean(axis=0)))
+        ball_v_max = float(np.linalg.norm(ball_v, axis=1).max())
+
         assert ball_com_z < self.BALL_SPAWN_Z - 0.10, (
             f"Ball did not fall significantly: com_z={ball_com_z:.4f}"
         )
         assert ball_com_z > 0.02, f"Ball penetrated ground: com_z={ball_com_z:.4f}"
-        assert ball_v_mag < 1.0, f"Ball still moving: |v|={ball_v_mag:.3f} m/s"
+        assert ball_v_mean < 1.0, f"Ball COM still moving: |v|={ball_v_mean:.3f} m/s"
+        # Per-particle velocity can be a bit higher during shape-matching
+        # corrections; >5 m/s = SM-rigid blowing up.
+        assert ball_v_max < 5.0, (
+            f"Ball particle moving too fast: v_max={ball_v_max:.3f} m/s"
+        )
 
-        # Fluid: didn't launch, didn't penetrate.
-        fluid_q = self.state_0.particle_q.numpy()[self._fluid_idx]
+        # Fluid: didn't launch, didn't penetrate, didn't go unstable.
+        fluid_q = all_q[self._fluid_idx]
+        fluid_v = all_v[self._fluid_idx]
         z_max_fluid = float(fluid_q[:, 2].max())
+        z_min_fluid = float(fluid_q[:, 2].min())
+        v_max_fluid = float(np.linalg.norm(fluid_v, axis=1).max())
+
         assert z_max_fluid < self.BALL_SPAWN_Z + 0.10, (
             f"Fluid splashed too high: z_max={z_max_fluid:.4f}"
         )
-        z_min_fluid = float(fluid_q[:, 2].min())
         assert z_min_fluid > -0.02, f"Fluid penetrated ground: z_min={z_min_fluid:.4f}"
+        # Ball sinking through fluid produces transient velocities ~ 2 m/s;
+        # >5 m/s flags PBF instability.
+        assert v_max_fluid < 5.0, (
+            f"Fluid moving too fast: v_max={v_max_fluid:.3f} m/s"
+        )
 
 
 if __name__ == "__main__":

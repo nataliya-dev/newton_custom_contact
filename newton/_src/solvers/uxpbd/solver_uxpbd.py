@@ -138,6 +138,89 @@ class SolverUXPBD(SolverBase):
         else:
             self.particle_q_rest = wp.empty(0, dtype=wp.vec3, device=model.device)
 
+        # ---- Pre-allocated scratch buffers (perf #2) ------------------------
+        # Avoid per-iteration wp.zeros / wp.empty_like / wp.clone churn in
+        # step(). Buffers are sized to model and reused across substeps;
+        # accumulators are .zero_()-d before each use, ping-pong scratches
+        # are swapped via _alt_particle_q / _alt_body_q helpers.
+        N_p = model.particle_count
+        N_b = model.body_count
+        N_j = model.joint_count
+        N_g = self._num_dynamic_groups
+        dev = model.device
+
+        # Particle position/velocity ping-pong scratches. Two buffers each so
+        # input/output of srxpbd_apply_particle_deltas etc. never alias.
+        if N_p > 0:
+            self._particle_q_scratch_a = wp.empty(N_p, dtype=wp.vec3, device=dev)
+            self._particle_q_scratch_b = wp.empty(N_p, dtype=wp.vec3, device=dev)
+            self._particle_qd_scratch_a = wp.empty(N_p, dtype=wp.vec3, device=dev)
+            self._particle_qd_scratch_b = wp.empty(N_p, dtype=wp.vec3, device=dev)
+            # Reusable particle-delta accumulator (.zero_() between phases).
+            # All four contact phases (stab, shape-contact, PP, SM-rigid) use
+            # this same buffer because they consume it before the next phase
+            # zeros it again.
+            self._particle_deltas = wp.zeros(N_p, dtype=wp.vec3, device=dev)
+            # XSPH viscosity writes into this buffer in place of an
+            # empty_like(particle_qd) per main iteration.
+            self._xsph_v = wp.empty(N_p, dtype=wp.vec3, device=dev)
+            # Scaled inverse mass for shock propagation (was lazily allocated).
+            self._scaled_inv_mass = wp.zeros(N_p, dtype=wp.float32, device=dev)
+
+        # PBF scratch (fluid density / lambda / position-delta).
+        if model.fluid_phase_count > 0 and N_p > 0:
+            self._fluid_density = wp.zeros(N_p, dtype=wp.float32, device=dev)
+            self._fluid_lambdas = wp.zeros(N_p, dtype=wp.float32, device=dev)
+            self._fluid_deltas = wp.zeros(N_p, dtype=wp.vec3, device=dev)
+
+        # Body-side scratches.
+        if N_b > 0:
+            self._body_deltas = wp.zeros(N_b, dtype=wp.spatial_vector, device=dev)
+            self._body_contact_count = wp.zeros(N_b, dtype=wp.float32, device=dev)
+            # Two ping-pong body_q/body_qd buffers so apply_body_deltas never
+            # aliases input/output.
+            self._body_q_scratch_a = wp.empty(N_b, dtype=wp.transform, device=dev)
+            self._body_q_scratch_b = wp.empty(N_b, dtype=wp.transform, device=dev)
+            self._body_qd_scratch_a = wp.empty(N_b, dtype=wp.spatial_vector, device=dev)
+            self._body_qd_scratch_b = wp.empty(N_b, dtype=wp.spatial_vector, device=dev)
+            # body_f scratch used when joint feedforward is added (was wp.clone).
+            if N_j > 0:
+                self._body_f_scratch = wp.empty(N_b, dtype=wp.spatial_vector, device=dev)
+        else:
+            # Dummy 1-element buffers for fluid-only / particle-only scenes:
+            # the particle-shape contact kernel signature still takes a body
+            # delta buffer, but its writes are gated by is_lattice / shape_link>=0.
+            self._body_deltas_dummy = wp.zeros(1, dtype=wp.spatial_vector, device=dev)
+            self._body_contact_count_dummy = wp.zeros(1, dtype=wp.float32, device=dev)
+
+        # Joint impulse accumulator (always preallocated when joints exist;
+        # serves both the body_parent_f-reporting path and the per-iter
+        # impulse_out temporary).
+        if N_j > 0:
+            self._joint_impulse_scratch = wp.zeros(N_j, dtype=wp.spatial_vector, device=dev)
+
+        # SM-rigid group momentum scratches.
+        if N_g > 0:
+            self._P_b4 = wp.zeros(N_g, dtype=wp.vec3, device=dev)
+            self._L_b4 = wp.zeros(N_g, dtype=wp.vec3, device=dev)
+
+        # Empty placeholders used when state has no body_q/body_qd (for the
+        # stabilization pass on fluid-only scenes). Allocated once on device.
+        self._empty_body_q = wp.zeros(0, dtype=wp.transform, device=dev)
+        self._empty_body_qd = wp.zeros(0, dtype=wp.spatial_vector, device=dev)
+
+    # ------- ping-pong helpers (perf #2) -------------------------------
+    def _alt_particle_q(self, state_out):
+        """Return the OTHER preallocated particle_q scratch buffer."""
+        if state_out.particle_q is self._particle_q_scratch_a:
+            return self._particle_q_scratch_b
+        return self._particle_q_scratch_a
+
+    def _alt_particle_qd(self, state_out):
+        if state_out.particle_qd is self._particle_qd_scratch_a:
+            return self._particle_qd_scratch_b
+        return self._particle_qd_scratch_a
+
     def step(
         self,
         state_in: State,
@@ -159,6 +242,39 @@ class SolverUXPBD(SolverBase):
 
         if control is None:
             control = model.control(clone_variables=False)
+
+        # Adopt state_out into our pre-allocated ping-pong scratches (perf #2).
+        # This ensures every per-iteration srxpbd_apply_particle_deltas /
+        # apply_particle_deltas_position_only / apply_body_deltas can pick the
+        # opposite scratch as its output without aliasing the input.
+        # We pick whichever scratch is NOT currently held by state_in, so the
+        # subsequent integrate_particles / integrate_bodies read-write pair is
+        # race-free. On the very first step state_in points to user buffers,
+        # in which case we arbitrarily seed state_out with scratch_a.
+        if model.particle_count > 0:
+            if state_in.particle_q is self._particle_q_scratch_a:
+                state_out.particle_q = self._particle_q_scratch_b
+            else:
+                state_out.particle_q = self._particle_q_scratch_a
+            if state_in.particle_qd is self._particle_qd_scratch_a:
+                state_out.particle_qd = self._particle_qd_scratch_b
+            else:
+                state_out.particle_qd = self._particle_qd_scratch_a
+        if model.body_count > 0:
+            if state_in.body_q is self._body_q_scratch_a:
+                state_out.body_q = self._body_q_scratch_b
+            else:
+                state_out.body_q = self._body_q_scratch_a
+            if state_in.body_qd is self._body_qd_scratch_a:
+                state_out.body_qd = self._body_qd_scratch_b
+            else:
+                state_out.body_qd = self._body_qd_scratch_a
+
+        # Zero the joint-impulse accumulator at step start; solve_body_joints
+        # atomic-adds into it across iterations, and convert_joint_impulse_to_parent_f
+        # reads the sum at end-of-step when body_parent_f reporting is on.
+        if model.joint_count > 0:
+            self._joint_impulse_scratch.zero_()
 
         # Akinci cohesion: accumulate cohesion forces into state_in.particle_f
         # before the predict step so the integrator sees them as external forces.
@@ -188,7 +304,11 @@ class SolverUXPBD(SolverBase):
         if model.body_count:
             body_f_local = state_in.body_f
             if model.joint_count:
-                body_f_local = wp.clone(state_in.body_f)
+                # Copy state_in.body_f into pre-allocated scratch (was wp.clone,
+                # perf #5). apply_joint_forces writes into body_f_local on top
+                # of the copy, so we cannot use state_in.body_f directly.
+                body_f_local = self._body_f_scratch
+                wp.copy(body_f_local, state_in.body_f)
                 wp.launch(
                     kernel=apply_joint_forces,
                     dim=model.joint_count,
@@ -232,14 +352,19 @@ class SolverUXPBD(SolverBase):
         # apply_body_deltas requires distinct input and output arrays (no aliasing).
         # We keep a scratch buffer pair and ping-pong with state_out so that
         # cur_(q|qd) -> nxt_(q|qd) always refer to different allocations.
-        # Allocate joint impulse accumulator only if the user requested body_parent_f reporting.
+        # joint_impulse accumulates the spatial impulse atomic_added by
+        # solve_body_joints across iterations; convert_joint_impulse_to_parent_f
+        # reads it at end-of-step when body_parent_f reporting is enabled.
+        # We always zero the preallocated scratch at step start (above) so this
+        # alias is safe even when reporting is off (kernel still writes, we just
+        # don't read the result).
         if state_out.body_parent_f is not None and model.joint_count > 0:
-            joint_impulse = wp.zeros(model.joint_count, dtype=wp.spatial_vector, device=model.device)
+            joint_impulse = self._joint_impulse_scratch
         else:
             joint_impulse = None
 
         if model.body_count:
-            body_deltas = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
+            body_deltas = self._body_deltas
             # Per-body contact count (UPPFRTA §4.2 constraint averaging at the
             # body level). Populated by the contact kernels alongside the
             # atomic_add into body_deltas; consumed by apply_body_deltas via
@@ -247,17 +372,28 @@ class SolverUXPBD(SolverBase):
             # accumulated wrench by max(count, 0). Zeroed between phases.
             # See the lattice-launch incident write-up in
             # docs/superpowers/specs/2026-05-13-uxpbd-design.md §9.4.
-            body_contact_count = wp.zeros(model.body_count, dtype=wp.float32, device=model.device)
-            _body_q = [state_out.body_q, wp.clone(state_out.body_q)]
-            _body_qd = [state_out.body_qd, wp.clone(state_out.body_qd)]
+            body_contact_count = self._body_contact_count
+            # state_out.body_q now holds one of our scratches (set above). Pick
+            # the OTHER scratch as the ping-pong partner so apply_body_deltas's
+            # input and output never alias (perf #2, was wp.clone).
+            if state_out.body_q is self._body_q_scratch_a:
+                _alt_body_q = self._body_q_scratch_b
+            else:
+                _alt_body_q = self._body_q_scratch_a
+            if state_out.body_qd is self._body_qd_scratch_a:
+                _alt_body_qd = self._body_qd_scratch_b
+            else:
+                _alt_body_qd = self._body_qd_scratch_a
+            _body_q = [state_out.body_q, _alt_body_q]
+            _body_qd = [state_out.body_qd, _alt_body_qd]
             _cur = 0  # index into _body_q/_body_qd that holds the current state
         else:
             # Dummy 1-element buffer so the particle-shape contact kernel signature
             # is satisfied even with zero rigid bodies. The kernel only writes to
             # body_deltas when is_lattice (no lattices without bodies) or
             # shape_link >= 0 (ground is -1), so no writes actually hit this buffer.
-            body_deltas = wp.zeros(1, dtype=wp.spatial_vector, device=model.device)
-            body_contact_count = wp.zeros(1, dtype=wp.float32, device=model.device)
+            body_deltas = self._body_deltas_dummy
+            body_contact_count = self._body_contact_count_dummy
             _body_q = None
             _body_qd = None
             _cur = 0
@@ -294,9 +430,8 @@ class SolverUXPBD(SolverBase):
             state_out.body_qd = _body_qd[_cur]
 
         # Compute scaled inverse mass for contact kernels (UPPFRTA §5.2).
+        # _scaled_inv_mass is preallocated in __init__ (perf #2).
         if self.shock_propagation_k > 0.0 and model.particle_count > 0:
-            if not hasattr(self, "_scaled_inv_mass") or self._scaled_inv_mass.shape[0] != model.particle_count:
-                self._scaled_inv_mass = wp.zeros(model.particle_count, dtype=wp.float32, device=model.device)
             wp.launch(
                 kernel=compute_mass_scale,
                 dim=model.particle_count,
@@ -338,18 +473,19 @@ class SolverUXPBD(SolverBase):
             _body_q_stab = (
                 state_out.body_q
                 if state_out.body_q is not None
-                else wp.zeros(0, dtype=wp.transform, device=model.device)
+                else self._empty_body_q
             )
             _body_qd_stab = (
                 state_out.body_qd
                 if state_out.body_qd is not None
-                else wp.zeros(0, dtype=wp.spatial_vector, device=model.device)
+                else self._empty_body_qd
             )
             for _stab_iter in range(self.stabilization_iterations):
                 body_deltas.zero_()
                 body_contact_count.zero_()
-                particle_deltas_stab = wp.zeros(
-                    model.particle_count, dtype=wp.vec3, device=model.device)
+                # Reuse the shared particle-deltas accumulator (perf #2).
+                self._particle_deltas.zero_()
+                particle_deltas_stab = self._particle_deltas
                 wp.launch(
                     kernel=solve_particle_shape_contacts_uxpbd,
                     dim=contacts.soft_contact_max,
@@ -385,7 +521,7 @@ class SolverUXPBD(SolverBase):
                     device=model.device,
                 )
                 # Apply position-only (no velocity update) per §4.4.
-                new_q_stab = wp.empty_like(state_out.particle_q)
+                new_q_stab = self._alt_particle_q(state_out)
                 wp.launch(
                     kernel=apply_particle_deltas_position_only,
                     dim=model.particle_count,
@@ -421,14 +557,16 @@ class SolverUXPBD(SolverBase):
                 _body_q_ps = (
                     state_out.body_q
                     if state_out.body_q is not None
-                    else wp.zeros(0, dtype=wp.transform, device=model.device)
+                    else self._empty_body_q
                 )
                 _body_qd_ps = (
                     state_out.body_qd
                     if state_out.body_qd is not None
-                    else wp.zeros(0, dtype=wp.spatial_vector, device=model.device)
+                    else self._empty_body_qd
                 )
-                particle_deltas_contact = wp.zeros(model.particle_count, dtype=wp.vec3, device=model.device)
+                # Reuse the shared particle-deltas accumulator (perf #2).
+                self._particle_deltas.zero_()
+                particle_deltas_contact = self._particle_deltas
                 wp.launch(
                     kernel=solve_particle_shape_contacts_uxpbd,
                     dim=contacts.soft_contact_max,
@@ -478,8 +616,8 @@ class SolverUXPBD(SolverBase):
 
                 # Apply particle-side deltas from shape contact (SM-rigid path).
                 if model.particle_count > 0:
-                    new_q = wp.empty_like(state_out.particle_q)
-                    new_qd = wp.empty_like(state_out.particle_qd)
+                    new_q = self._alt_particle_q(state_out)
+                    new_qd = self._alt_particle_qd(state_out)
                     wp.launch(
                         kernel=srxpbd_apply_particle_deltas,
                         dim=model.particle_count,
@@ -510,7 +648,9 @@ class SolverUXPBD(SolverBase):
                 search_radius = model.particle_max_radius * 2.0 + model.particle_cohesion
                 with wp.ScopedDevice(model.device):
                     model.particle_grid.build(state_out.particle_q, radius=search_radius)
-                pp_particle_deltas = wp.zeros(model.particle_count, dtype=wp.vec3, device=model.device)
+                # Reuse the shared particle-deltas accumulator (perf #2).
+                self._particle_deltas.zero_()
+                pp_particle_deltas = self._particle_deltas
                 wp.launch(
                     kernel=solve_particle_particle_contacts_uxpbd,
                     dim=model.particle_count,
@@ -539,8 +679,8 @@ class SolverUXPBD(SolverBase):
                     device=model.device,
                 )
                 _apply_deltas_flip(constraint_inv_weights=body_contact_count)
-                new_q = wp.empty_like(state_out.particle_q)
-                new_qd = wp.empty_like(state_out.particle_qd)
+                new_q = self._alt_particle_q(state_out)
+                new_qd = self._alt_particle_qd(state_out)
                 wp.launch(
                     kernel=srxpbd_apply_particle_deltas,
                     dim=model.particle_count,
@@ -564,20 +704,27 @@ class SolverUXPBD(SolverBase):
             # Position-Based Fluids pipeline (Macklin and Muller 2013).
             # Runs fluid_iterations sub-iterations per main iteration.
             if model.fluid_phase_count > 0 and model.particle_count > 0:
-                fluid_density = wp.zeros(model.particle_count, dtype=wp.float32, device=model.device)
-                fluid_lambdas = wp.zeros(model.particle_count, dtype=wp.float32, device=model.device)
-                fluid_deltas = wp.zeros(model.particle_count, dtype=wp.vec3, device=model.device)
+                # PBF scratches are preallocated in __init__ (perf #2).
+                fluid_density = self._fluid_density
+                fluid_lambdas = self._fluid_lambdas
+                fluid_deltas = self._fluid_deltas
                 epsilon = wp.float32(100.0)
                 k_corr = wp.float32(0.1)
                 dq_factor = wp.float32(0.3)
                 n_corr = wp.float32(4.0)
 
-                for _ in range(self.fluid_iterations):
-                    with wp.ScopedDevice(model.device):
-                        model.particle_grid.build(
-                            state_out.particle_q,
-                            model.particle_max_radius * 4.0,
-                        )
+                for _pbf_iter in range(self.fluid_iterations):
+                    # Halve the hash-grid rebuilds (perf #4): particles only
+                    # drift by ~r·dt between consecutive sub-iterations, so
+                    # rebuilding every other iteration with the same query
+                    # radius is safe. Always rebuild on the first iter so we
+                    # have a fresh grid on entry.
+                    if _pbf_iter % 2 == 0:
+                        with wp.ScopedDevice(model.device):
+                            model.particle_grid.build(
+                                state_out.particle_q,
+                                model.particle_max_radius * 4.0,
+                            )
                     fluid_density.zero_()
                     fluid_lambdas.zero_()
                     fluid_deltas.zero_()
@@ -636,8 +783,8 @@ class SolverUXPBD(SolverBase):
                         device=model.device,
                     )
 
-                    new_q = wp.empty_like(state_out.particle_q)
-                    new_qd = wp.empty_like(state_out.particle_qd)
+                    new_q = self._alt_particle_q(state_out)
+                    new_qd = self._alt_particle_qd(state_out)
                     wp.launch(
                         kernel=srxpbd_apply_particle_deltas,
                         dim=model.particle_count,
@@ -656,10 +803,19 @@ class SolverUXPBD(SolverBase):
                     )
                     state_out.particle_q = new_q
                     state_out.particle_qd = new_qd
-                    self.update_lattice_world_positions(state_out)
+                    # NOTE (perf #1): the lattice projection that previously
+                    # ran here every PBF sub-iteration is moved OUT of the
+                    # loop. body_q is unchanged within the PBF loop, so the
+                    # lattice particle positions derived from body_q are also
+                    # unchanged; re-projecting them was pure waste (~7%/frame
+                    # on combo). The trailing projection below restores
+                    # lattice particle_q / particle_qd before XSPH (which
+                    # reads particle_qd) and the next main-iter consumer.
+                # End of PBF sub-iteration loop.
+                self.update_lattice_world_positions(state_out)
 
                 # XSPH viscosity (one pass per main iteration).
-                xsph_v = wp.empty_like(state_out.particle_qd)
+                xsph_v = self._xsph_v
                 wp.launch(
                     kernel=apply_xsph_viscosity,
                     dim=model.particle_count,
@@ -682,11 +838,12 @@ class SolverUXPBD(SolverBase):
             # Joints
             if model.joint_count and body_deltas is not None:
                 body_deltas.zero_()
-                if joint_impulse is not None:
-                    impulse_out = joint_impulse
-                else:
-                    # Need a temp buffer because solve_body_joints requires an output array.
-                    impulse_out = wp.zeros(model.joint_count, dtype=wp.spatial_vector, device=model.device)
+                # impulse_out always points to the preallocated joint scratch
+                # (perf #2). When body_parent_f reporting is on it is the same
+                # buffer as joint_impulse and accumulates across iterations;
+                # otherwise it is a per-iter throwaway target (we never read
+                # the result).
+                impulse_out = self._joint_impulse_scratch
                 wp.launch(
                     kernel=solve_body_joints,
                     dim=model.joint_count,
@@ -725,9 +882,13 @@ class SolverUXPBD(SolverBase):
 
             # SM-rigid groups: shape matching + momentum-conservation post-pass.
             if self._num_dynamic_groups > 0 and model.particle_count > 0:
-                particle_deltas = wp.zeros(model.particle_count, dtype=wp.vec3, device=model.device)
-                P_b4 = wp.zeros(self._num_dynamic_groups, dtype=wp.vec3, device=model.device)
-                L_b4 = wp.zeros(self._num_dynamic_groups, dtype=wp.vec3, device=model.device)
+                # Reuse the shared particle-deltas accumulator (perf #2).
+                self._particle_deltas.zero_()
+                particle_deltas = self._particle_deltas
+                self._P_b4.zero_()
+                self._L_b4.zero_()
+                P_b4 = self._P_b4
+                L_b4 = self._L_b4
                 bd = self._shape_match_block_dim
 
                 wp.launch(
@@ -748,8 +909,8 @@ class SolverUXPBD(SolverBase):
                     device=model.device,
                 )
 
-                new_q = wp.empty_like(state_out.particle_q)
-                new_qd = wp.empty_like(state_out.particle_qd)
+                new_q = self._alt_particle_q(state_out)
+                new_qd = self._alt_particle_qd(state_out)
                 wp.launch(
                     kernel=srxpbd_apply_particle_deltas,
                     dim=model.particle_count,
@@ -775,8 +936,12 @@ class SolverUXPBD(SolverBase):
                 # non-group particles (lattice, static, ungrouped) with uninitialized
                 # memory. Without this, the next iteration's contact pass reads
                 # garbage lattice positions and routes junk wrenches into body_deltas.
-                final_q = wp.clone(state_out.particle_q)
-                final_qd = wp.clone(state_out.particle_qd)
+                # Use the OTHER ping-pong scratch and wp.copy the seed (perf #5,
+                # was wp.clone — saved 240 clones/frame on combo).
+                final_q = self._alt_particle_q(state_out)
+                final_qd = self._alt_particle_qd(state_out)
+                wp.copy(final_q, state_out.particle_q)
+                wp.copy(final_qd, state_out.particle_qd)
                 wp.launch(
                     kernel=enforce_momemntum_conservation_tiled,
                     dim=(self._num_dynamic_groups, bd),

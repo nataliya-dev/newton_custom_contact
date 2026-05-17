@@ -92,6 +92,54 @@ class Example:
         self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
 
+    def test_final(self):
+        """Verify the sphere-packed cube settled on the ground without
+        blowing up.
+
+        The cube is a 4x4x4 packing of r=0.012 m spheres inscribed in a
+        0.08 m cube, spawned with its center at z=0.05 m (lowest sphere
+        center at z=0.022 m). After ~400 frames it should settle with the
+        bottom layer resting on the ground, i.e. lowest sphere center at
+        z ~ sphere_r = 0.012 m, and stop moving.
+        """
+        cube_idx = self.model.particle_groups[self.cube_group]
+        if hasattr(cube_idx, "numpy"):
+            cube_idx = cube_idx.numpy()
+        cube_idx = np.asarray(list(cube_idx), dtype=np.int32)
+
+        pos = self.state_0.particle_q.numpy()[cube_idx]
+        vel = self.state_0.particle_qd.numpy()[cube_idx]
+
+        # 1. NaN/Inf check — first line of defense against PBF/SM-rigid
+        #    instability before any other assertion can fire misleadingly.
+        assert np.isfinite(pos).all(), "NaN/Inf in particle positions"
+        assert np.isfinite(vel).all(), "NaN/Inf in particle velocities"
+
+        # 2. Lowest sphere center settled near ground (within ~5 mm of
+        #    the sphere radius, allowing for slight compression / chatter).
+        z_min = float(pos[:, 2].min())
+        assert 0.005 < z_min < 0.030, (
+            f"Cube did not settle on ground: z_min={z_min:.4f}, "
+            f"expected near sphere_r = 0.012"
+        )
+
+        # 3. COM stays inside the original horizontal footprint (no
+        #    lateral runaway).
+        com_xy = pos[:, :2].mean(axis=0)
+        assert float(np.linalg.norm(com_xy - np.array([0.55, 0.0]))) < 0.10, (
+            f"Cube drifted laterally: com_xy={com_xy}"
+        )
+
+        # 4. No particle exceeds a sane positional bound (catch escapes).
+        q_abs_max = float(np.abs(pos).max())
+        assert q_abs_max < 2.0, (
+            f"Particle escaped: |q|_max={q_abs_max:.3f} m"
+        )
+
+        # 5. Velocity small (cube near rest after ~4 s of simulation).
+        v_max = float(np.linalg.norm(vel, axis=1).max())
+        assert v_max < 0.5, f"Cube still moving: v_max={v_max:.3f} m/s"
+
 
 if __name__ == "__main__":
     viewer, args = newton.examples.init()

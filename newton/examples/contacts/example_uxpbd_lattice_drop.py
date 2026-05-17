@@ -106,6 +106,15 @@ class Example:
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True
 
+        # CUDA graph capture (perf #3): replay the full substep loop as a
+        # single graph launch on CUDA.
+        self.graph = None
+        if wp.get_device().is_cuda:
+            self.simulate()
+            with wp.ScopedCapture() as capture:
+                self.simulate()
+            self.graph = capture.graph
+
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -115,7 +124,10 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        self.simulate()
+        if self.graph is not None:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
         self.sim_time += self.frame_dt
 
     def test_final(self):

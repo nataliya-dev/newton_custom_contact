@@ -248,21 +248,47 @@ class Example:
         self.sim_time += self.frame_dt
 
     def test_final(self):
-        """Verify the cube was lifted above the table surface.
+        """Verify the cube was lifted above the table surface and the
+        whole grasp pipeline stayed numerically stable.
 
         Reads mean Z of all cube particles. The cube rests at Z ~ 0.05 m
         before grasping; a successful lift must reach > 0.02 m (in case
         the cube settles on the ground) and not be ejected (< 1.5 m).
         Full grasp validation requires CUDA (Warp tile-reduce limitation).
         """
-        cube_q = self.state_0.particle_q.numpy()
+        # model.particle_groups[i] may be a wp.array; .numpy() and then
+        # list() to get a plain Python iterable (wp.array does not
+        # support Python item indexing or iteration).
         cube_idx = self.model.particle_groups[self.cube_group]
+        if hasattr(cube_idx, "numpy"):
+            cube_idx = cube_idx.numpy()
         cube_idx_arr = np.asarray(list(cube_idx), dtype=np.int32)
-        cube_z = float(np.mean(cube_q[cube_idx_arr, 2]))
+
+        cube_q = self.state_0.particle_q.numpy()[cube_idx_arr]
+        cube_v = self.state_0.particle_qd.numpy()[cube_idx_arr]
+
+        # 1. Numerical sanity — must hold before any height assertion.
+        assert np.isfinite(cube_q).all(), "NaN/Inf in cube particle positions"
+        assert np.isfinite(cube_v).all(), "NaN/Inf in cube particle velocities"
+
+        # 2. Lift / ejection bound.
+        cube_z = float(np.mean(cube_q[:, 2]))
         if cube_z < 0.02:
             raise RuntimeError(f"Cube not lifted; z={cube_z:.4f}")
         if cube_z > 1.5:
             raise RuntimeError(f"Cube ejected; z={cube_z:.4f}")
+
+        # 3. Cube hasn't shot off horizontally (stays within a 1 m radius
+        #    of its spawn).
+        com_xy = cube_q[:, :2].mean(axis=0)
+        assert float(np.linalg.norm(com_xy - np.array([0.55, 0.0]))) < 1.0, (
+            f"Cube drifted out of workspace: com_xy={com_xy}"
+        )
+
+        # 4. No catastrophic velocity (the grasp + lift should not impart
+        #    > a few m/s; >10 m/s indicates contact-PBF instability).
+        v_max = float(np.linalg.norm(cube_v, axis=1).max())
+        assert v_max < 5.0, f"Cube particle moving too fast: v_max={v_max:.3f} m/s"
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)

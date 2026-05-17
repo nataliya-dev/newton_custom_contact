@@ -140,6 +140,15 @@ class Example:
         self.viewer.set_camera(pos=wp.vec3(0.5, -0.5, 0.30),
                                pitch=-25.0, yaw=135.0)
 
+        # CUDA graph capture (perf #3): replay the full substep loop as a
+        # single graph launch on CUDA.
+        self.graph = None
+        if wp.get_device().is_cuda:
+            self.simulate()
+            with wp.ScopedCapture() as capture:
+                self.simulate()
+            self.graph = capture.graph
+
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -150,7 +159,10 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        self.simulate()
+        if self.graph is not None:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
         self.sim_time += self.frame_dt
 
     def render(self):
@@ -160,8 +172,26 @@ class Example:
         self.viewer.end_frame()
 
     def test_final(self):
-        # 1. Lattice body is still on the ground (rain didn't launch it).
-        body_z = float(self.state_0.body_q.numpy()[0, 2])
+        body_q = self.state_0.body_q.numpy()
+        body_qd = self.state_0.body_qd.numpy()
+        all_part_q = self.state_0.particle_q.numpy()
+        all_part_v = self.state_0.particle_qd.numpy()
+
+        # 0. Numerical sanity. Loose-particle-onto-lattice contact is
+        #    a known fragile path: each rain impact routes a wrench into
+        #    the host body via UPPFRTA per-body averaging, and an
+        #    averaging bug would NaN-propagate within a couple of frames.
+        assert np.isfinite(body_q).all(), "NaN/Inf in body_q"
+        assert np.isfinite(body_qd).all(), "NaN/Inf in body_qd"
+        assert np.isfinite(all_part_q).all(), "NaN/Inf in particle positions"
+        assert np.isfinite(all_part_v).all(), "NaN/Inf in particle velocities"
+
+        # 1. No particle escaped.
+        q_abs_max = float(np.abs(all_part_q).max())
+        assert q_abs_max < 3.0, f"Particle escaped: |q|_max={q_abs_max:.3f} m"
+
+        # 2. Lattice body is still on the ground (rain didn't launch it).
+        body_z = float(body_q[0, 2])
         # The cube's lattice rest height is z = 0.04. Allow tolerance for
         # rain pile pressing it slightly down (numerical compression in
         # the contact-PBF chain) -- it should NOT have flown off the
@@ -169,20 +199,34 @@ class Example:
         assert 0.02 < body_z < 0.10, (
             f"Lattice body off ground or sunk: z={body_z:.4f}"
         )
-        # 2. Rain particles all came down (no rain still floating above
+        # 3. Lattice body roughly at rest.
+        body_v = float(np.linalg.norm(body_qd[0, :3]))
+        assert body_v < 1.0, f"Lattice body still moving: |v|={body_v:.3f} m/s"
+
+        rain_q = all_part_q[self._rain_idx]
+        rain_v = all_part_v[self._rain_idx]
+        # 4. Rain particles all came down (no rain still floating above
         #    its initial spawn height, which would mean a launch event).
-        rain_q = self.state_0.particle_q.numpy()[self._rain_idx]
         z_max_rain = float(rain_q[:, 2].max())
         spawn_top = self.RAIN_BASE_Z + self.RAIN_LAYERS * self.RAIN_CELL
         assert z_max_rain < spawn_top, (
             f"Rain particle launched above spawn: z_max={z_max_rain:.4f} "
             f"vs spawn_top={spawn_top:.4f}"
         )
-        # 3. Rain accumulated above ground (some rest on lattice top
+        # 5. Rain accumulated above ground (some rest on lattice top
         #    or ground around it).
         z_min_rain = float(rain_q[:, 2].min())
         assert z_min_rain > -0.02, (
             f"Rain particle penetrated ground: z_min={z_min_rain:.4f}"
+        )
+        # 6. Rain velocity bounded. Free fall from RAIN_BASE_Z = 0.40 m
+        #    gives terminal v ~ 2.8 m/s; the rain pile is mildly
+        #    chaotic (PP contacts on a rough lattice top), so individual
+        #    particles can chatter up to ~5-8 m/s transiently. >10 m/s
+        #    flags a launch event / contact-PBF blowup.
+        v_max_rain = float(np.linalg.norm(rain_v, axis=1).max())
+        assert v_max_rain < 10.0, (
+            f"Rain moving too fast: v_max={v_max_rain:.3f} m/s"
         )
 
 

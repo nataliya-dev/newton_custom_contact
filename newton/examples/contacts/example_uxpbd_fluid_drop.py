@@ -12,6 +12,7 @@
 # Command: python -m newton.examples uxpbd_fluid_drop
 ###########################################################################
 
+import numpy as np
 import warp as wp
 
 import newton
@@ -93,14 +94,44 @@ class Example:
 
     def test_final(self):
         pos = self.state_0.particle_q.numpy()
-        z_min = float(pos[:, 2].min())
-        x_extent = float(pos[:, 0].max() - pos[:, 0].min())
+        vel = self.state_0.particle_qd.numpy()
 
-        # 1. Fluid did not pass through the ground.
+        # 0. Numerical sanity first — PBF instabilities tend to produce
+        #    NaN/Inf or runaway velocities before any positional assertion
+        #    can fire meaningfully.
+        assert np.isfinite(pos).all(), "NaN/Inf in particle positions"
+        assert np.isfinite(vel).all(), "NaN/Inf in particle velocities"
+
+        # 1. No particle escaped the simulation domain. The scene is < 0.1 m
+        #    across in any direction at spawn; >2 m in any coord means a
+        #    particle exploded out.
+        q_abs_max = float(np.abs(pos).max())
+        assert q_abs_max < 2.0, f"Particle escaped: |q|_max={q_abs_max:.3f} m"
+
+        # 2. Max velocity is bounded. Free-fall from 0.20 m hits v ~ 2 m/s
+        #    at impact; after settling on the ground for ~4 s the puddle
+        #    should be near rest. A cap of 3 m/s catches PBF-induced
+        #    velocity explosions while leaving room for the impact frame.
+        v_max = float(np.linalg.norm(vel, axis=1).max())
+        assert v_max < 3.0, f"Fluid moving too fast: v_max={v_max:.3f} m/s"
+
+        # 3. Fluid did not pass through the ground.
+        z_min = float(pos[:, 2].min())
         assert z_min > -0.02, f"fluid penetrated ground: z_min={z_min:.4f}"
-        # 2. Fluid spread out under PBF + gravity (puddle wider than initial cube).
+
+        # 4. Fluid spread out under PBF + gravity (puddle wider than initial cube).
+        x_extent = float(pos[:, 0].max() - pos[:, 0].min())
         assert x_extent > self._x_extent_0 * 1.2, (
             f"fluid did not spread: x_extent={x_extent:.4f} vs initial {self._x_extent_0:.4f}"
+        )
+
+        # 5. Fluid did not over-spread catastrophically. A no-cohesion,
+        #    low-viscosity drop forms a thin film over the ground; for
+        #    this 125-particle, 0.5 L block the equilibrium puddle is
+        #    ~0.4-0.8 m (very thin spread of unmodeled-cohesion water).
+        #    >15x initial extent is pop-through / explosion territory.
+        assert x_extent < self._x_extent_0 * 15.0, (
+            f"fluid over-spread (likely PBF instability): x_extent={x_extent:.4f}"
         )
 
     @staticmethod

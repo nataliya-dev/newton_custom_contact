@@ -143,6 +143,15 @@ class Example:
         self.viewer.set_camera(pos=wp.vec3(0.5, -0.5, 0.30),
                                pitch=-25.0, yaw=135.0)
 
+        # CUDA graph capture (perf #3): replay the full substep loop as a
+        # single graph launch on CUDA.
+        self.graph = None
+        if wp.get_device().is_cuda:
+            self.simulate()
+            with wp.ScopedCapture() as capture:
+                self.simulate()
+            self.graph = capture.graph
+
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -153,7 +162,10 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        self.simulate()
+        if self.graph is not None:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
         self.sim_time += self.frame_dt
 
     def render(self):
@@ -163,28 +175,59 @@ class Example:
         self.viewer.end_frame()
 
     def test_final(self):
-        # 1. Cube settled below its spawn height (it sank/displaced fluid).
-        body_z = float(self.state_0.body_q.numpy()[0, 2])
+        body_q = self.state_0.body_q.numpy()
+        body_qd = self.state_0.body_qd.numpy()
+        all_q = self.state_0.particle_q.numpy()
+        all_v = self.state_0.particle_qd.numpy()
+
+        # 0. Numerical sanity for everything (body + all particles)
+        #    before any physics assertion — lattice + PBF coupling has a
+        #    known fragility (the contact-PBF feedback loop) and NaN
+        #    propagates fast.
+        assert np.isfinite(body_q).all(), "NaN/Inf in body_q"
+        assert np.isfinite(body_qd).all(), "NaN/Inf in body_qd"
+        assert np.isfinite(all_q).all(), "NaN/Inf in particle positions"
+        assert np.isfinite(all_v).all(), "NaN/Inf in particle velocities"
+
+        # 1. No particle escaped (cube + fluid live in a < 1 m box).
+        q_abs_max = float(np.abs(all_q).max())
+        assert q_abs_max < 3.0, f"Particle escaped: |q|_max={q_abs_max:.3f} m"
+
+        body_z = float(body_q[0, 2])
+
+        # 2. Cube settled below its spawn height (it sank/displaced fluid).
         assert body_z < self.CUBE_SPAWN_Z - 0.10, (
             f"Cube did not fall significantly: z={body_z:.4f} "
             f"vs spawn {self.CUBE_SPAWN_Z}"
         )
-        # 2. Cube did not pierce the ground.
+        # 3. Cube did not pierce the ground.
         assert body_z > 0.02, f"Cube penetrated ground: z={body_z:.4f}"
-        # 3. Cube near rest.
-        body_v = float(np.linalg.norm(self.state_0.body_qd.numpy()[0, :3]))
+        # 4. Cube near rest.
+        body_v = float(np.linalg.norm(body_qd[0, :3]))
         assert body_v < 1.0, f"Cube still moving: |v|={body_v:.3f} m/s"
 
-        # 4. Fluid did not launch (no particle above 2x spawn pool top).
-        fluid_q = self.state_0.particle_q.numpy()[self._fluid_idx]
+        # 5. Cube angular velocity bounded (lattice contact should not
+        #    spin it up wildly).
+        body_omega = float(np.linalg.norm(body_qd[0, 3:]))
+        assert body_omega < 5.0, f"Cube spinning: |omega|={body_omega:.3f} rad/s"
+
+        # 6. Fluid did not launch (no particle above 2x spawn pool top).
+        fluid_q = all_q[self._fluid_idx]
+        fluid_v = all_v[self._fluid_idx]
         z_max_fluid = float(fluid_q[:, 2].max())
         assert z_max_fluid < self.CUBE_SPAWN_Z + 0.10, (
             f"Fluid splashed too high: z_max={z_max_fluid:.4f}"
         )
-        # 5. Fluid did not penetrate ground.
+        # 7. Fluid did not penetrate ground.
         z_min_fluid = float(fluid_q[:, 2].min())
         assert z_min_fluid > -0.02, (
             f"Fluid penetrated ground: z_min={z_min_fluid:.4f}"
+        )
+        # 8. Fluid velocity bounded. Cube impact gives transient v ~ 2 m/s,
+        #    after settling should be < 2 m/s. >5 m/s = instability.
+        v_max_fluid = float(np.linalg.norm(fluid_v, axis=1).max())
+        assert v_max_fluid < 5.0, (
+            f"Fluid moving too fast: v_max={v_max_fluid:.3f} m/s"
         )
 
 

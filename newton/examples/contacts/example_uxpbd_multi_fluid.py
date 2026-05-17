@@ -122,6 +122,15 @@ class Example:
         self.viewer.set_camera(pos=wp.vec3(0.4, -0.4, 0.20),
                                pitch=-20.0, yaw=135.0)
 
+        # CUDA graph capture (perf #3): replay the full substep loop as a
+        # single graph launch on CUDA.
+        self.graph = None
+        if wp.get_device().is_cuda:
+            self.simulate()
+            with wp.ScopedCapture() as capture:
+                self.simulate()
+            self.graph = capture.graph
+
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -132,7 +141,10 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        self.simulate()
+        if self.graph is not None:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
         self.sim_time += self.frame_dt
 
     def render(self):
@@ -143,18 +155,36 @@ class Example:
 
     def test_final(self):
         pos = self.state_0.particle_q.numpy()
+        vel = self.state_0.particle_qd.numpy()
+
+        # 0. Numerical sanity. Multi-phase PBF buoyancy couples two
+        #    fluid kernels with different rest densities; a wrong sign
+        #    or unscaled mass term blows up to NaN within ~100 frames.
+        assert np.isfinite(pos).all(), "NaN/Inf in particle positions"
+        assert np.isfinite(vel).all(), "NaN/Inf in particle velocities"
+
+        # 1. No particle escaped the simulation domain.
+        q_abs_max = float(np.abs(pos).max())
+        assert q_abs_max < 3.0, f"Particle escaped: |q|_max={q_abs_max:.3f} m"
+
+        # 2. Bounded velocities. Stratification flows are gentle —
+        #    Rayleigh-Taylor in this size class drives v ~ 0.1-0.5 m/s.
+        #    >3 m/s = density solver instability.
+        v_max = float(np.linalg.norm(vel, axis=1).max())
+        assert v_max < 3.0, f"Fluid moving too fast: v_max={v_max:.3f} m/s"
+
         z_light = float(pos[self._light_idx, 2].mean())
         z_heavy = float(pos[self._heavy_idx, 2].mean())
 
-        # 1. No phase exploded upward.
+        # 3. No phase exploded upward.
         z_max = float(pos[:, 2].max())
         assert z_max < self.HEAVY_BASE_Z + (self.DIMS[2] * self.CELL) * 2, (
             f"A fluid launched: z_max={z_max:.4f}"
         )
-        # 2. No fluid penetrated the ground.
+        # 4. No fluid penetrated the ground.
         z_min = float(pos[:, 2].min())
         assert z_min > -0.02, f"Fluid penetrated ground: z_min={z_min:.4f}"
-        # 3. The heavy fluid moved down relative to its initial mean z, OR
+        # 5. The heavy fluid moved down relative to its initial mean z, OR
         #    the heavy and light fluids show some intermixing (heavy mean
         #    is no longer cleanly above light mean by the original gap).
         #    Either is evidence of buoyancy / stratification dynamics.
