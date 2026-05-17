@@ -119,16 +119,16 @@ class Example:
         # t_hat_i = (-r_iy, r_ix, 0) / ||r_i,xy||. Then
         #   tau_z = sum_i (r_i x f_i)_z = (TAU / sum_j ||r_j,xy||) * sum_i ||r_i,xy|| = TAU.
         # Net force is zero by the (x,y) -> (-y,x) symmetry of the pattern.
+        #
+        # This pattern must be recomputed every substep from the CURRENT particle
+        # positions: f_i is a world-frame vector and as the body rotates by theta,
+        # the world-frame moment arm rotates with it. If we held f_i fixed (as
+        # initial code did), tau_z would decay as TAU * cos(theta) and the
+        # rotation would slow / reverse past theta = pi/2. Recomputing every
+        # substep keeps tau_z = TAU regardless of orientation, matching the
+        # analytical reference theta(t) = 0.5 * (TAU / I_zz) * t^2.
         initial_pos = self.state_0.particle_q.numpy()
-        com = initial_pos.mean(axis=0)
-        r = initial_pos - com
-        tangent = np.stack([-r[:, 1], r[:, 0], np.zeros_like(r[:, 0])], axis=1)
-        tan_norm = np.linalg.norm(tangent, axis=1, keepdims=True)
-        tan_norm = np.where(tan_norm > 1e-9, tan_norm, 1.0)
-        tangent = tangent / tan_norm
-        r_xy = np.linalg.norm(r[:, :2], axis=1)
-        f_mag = self.TAU / float(np.sum(r_xy))
-        self._force_np = (tangent * f_mag).astype(np.float32)
+        initial_com = initial_pos.mean(axis=0)
 
         # ----- True principal inertia, computed directly from particle layout -----
         self._I_zz = _compute_principal_inertia_zz(
@@ -137,7 +137,7 @@ class Example:
         self._alpha = self.TAU / self._I_zz  # rad/s^2
 
         # Reference particle (index 0, a corner sphere) tracked for angle readout.
-        self._p0_init_rel = (initial_pos[0] - com).astype(np.float64)
+        self._p0_init_rel = (initial_pos[0] - initial_com).astype(np.float64)
         self._theta_init = float(np.arctan2(self._p0_init_rel[1], self._p0_init_rel[0]))
 
         print(
@@ -152,10 +152,29 @@ class Example:
         # Look down the +z axis from a tilted angle so the rotation is obvious.
         self.viewer.set_camera(pos=wp.vec3(1.2, -1.2, 5.8), pitch=-25.0, yaw=135.0)
 
+    def _compute_force_pattern(self):
+        """Recompute the per-particle tangential force from current positions.
+
+        See class docstring section "Force pattern" for why this must run every
+        substep instead of using a cached force array.
+        """
+        pos = self.state_0.particle_q.numpy()
+        com = pos.mean(axis=0)
+        r = pos - com
+        tangent = np.stack([-r[:, 1], r[:, 0], np.zeros_like(r[:, 0])], axis=1)
+        tan_norm = np.linalg.norm(tangent, axis=1, keepdims=True)
+        tan_norm = np.where(tan_norm > 1e-9, tan_norm, 1.0)
+        tangent = tangent / tan_norm
+        r_xy = np.linalg.norm(r[:, :2], axis=1)
+        f_mag = self.TAU / float(np.sum(r_xy))
+        return (tangent * f_mag).astype(np.float32)
+
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
-            self.state_0.particle_f.assign(self._force_np)
+            # Recompute the force pattern every substep so the applied torque
+            # remains TAU regardless of body orientation (see _compute_force_pattern).
+            self.state_0.particle_f.assign(self._compute_force_pattern())
             # No model.collide(): no ground, no shapes, so contacts are unused.
             self.solver.step(self.state_0, self.state_1, None, None, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0

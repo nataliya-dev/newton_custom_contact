@@ -140,6 +140,7 @@ def compute_fluid_lambda(
     particle_fluid_phase: wp.array[wp.int32],
     fluid_rest_density: wp.array[wp.float32],
     fluid_smoothing_radius: wp.array[wp.float32],
+    fluid_solid_coupling_s: wp.array[wp.float32],
     density: wp.array[wp.float32],
     epsilon: wp.float32,
     # output
@@ -156,6 +157,12 @@ def compute_fluid_lambda(
     for the kernel). epsilon ~ 100 is Macklin and Muller's relaxation.
 
     Reference: Macklin and Muller 2013, "Position Based Fluids", eq. 11.
+    Solid neighbors are scaled by the UPPFRTA eq.27 coupling factor s, matching
+    the same s factor applied in :func:`compute_fluid_density`. Without this
+    symmetry, lambda's numerator (C, from s-scaled density) and denominator
+    (sum_grad_sq, from un-scaled gradient) used inconsistent definitions of
+    rho_i, which inflated lambda at fluid-solid contact boundaries and drove
+    fluid-particle launches when heavy SM-rigid particles impacted the pool.
 
     Args:
         grid: Warp hash grid id built from particle positions.
@@ -165,6 +172,9 @@ def compute_fluid_lambda(
         particle_fluid_phase: Fluid phase index per particle; -1 for non-fluid.
         fluid_rest_density: Rest density rho_0 per fluid phase [kg/m^3].
         fluid_smoothing_radius: Smoothing radius h per fluid phase [m].
+        fluid_solid_coupling_s: Solid density contribution scale s per phase
+            (UPPFRTA eq.27). Applied to solid neighbors' gradients so the
+            constraint Jacobian matches the density formulation.
         density: Current density rho_i per particle [kg/m^3].
         epsilon: Relaxation regularizer to prevent division by zero [dimensionless].
         lambdas: Output Lagrange multiplier per particle [dimensionless].
@@ -180,6 +190,7 @@ def compute_fluid_lambda(
 
     rho0 = fluid_rest_density[phase]
     h = fluid_smoothing_radius[phase]
+    s_scale = fluid_solid_coupling_s[phase]
 
     # Unilateral constraint: only active when over-dense (C_i > 0).
     c = density[i] / rho0 - wp.float32(1.0)
@@ -198,6 +209,10 @@ def compute_fluid_lambda(
     # variable-mass particles the m_j must be carried, otherwise both lambda
     # and the position delta are wrong by a factor of m_j (which can be very
     # small in SI units, e.g. 4e-3 kg for a 1 cm^3 water particle).
+    #
+    # Solid neighbors are scaled by s_scale to keep the gradient consistent
+    # with the s-scaled density contribution from the same neighbors (UPPFRTA
+    # eq.27). Skipping this scaling inflated lambda at solid-fluid contact.
     query = wp.hash_grid_query(grid, x_i, h)
     j = int(0)
     while wp.hash_grid_query_next(query, j):
@@ -205,7 +220,12 @@ def compute_fluid_lambda(
             continue
         r = x_i - particle_x[j]
         grad_w = spiky_gradient(r, h)
-        g_j = particle_mass[j] * grad_w / rho0
+        m_eff = particle_mass[j]
+        if particle_substrate[j] != wp.uint8(3) or particle_fluid_phase[j] != phase:
+            # Non-fluid (lattice / SM-rigid / static-rigid) or different-phase
+            # fluid: scale by the coupling factor s to match compute_fluid_density.
+            m_eff = m_eff * s_scale
+        g_j = m_eff * grad_w / rho0
         sum_grad_sq += wp.dot(g_j, g_j)
         grad_i_sum += g_j
 
@@ -225,6 +245,7 @@ def compute_fluid_position_delta(
     particle_fluid_phase: wp.array[wp.int32],
     fluid_rest_density: wp.array[wp.float32],
     fluid_smoothing_radius: wp.array[wp.float32],
+    fluid_solid_coupling_s: wp.array[wp.float32],
     lambdas: wp.array[wp.float32],
     k_corr: wp.float32,
     dq_factor: wp.float32,
@@ -250,6 +271,10 @@ def compute_fluid_position_delta(
         particle_fluid_phase: Fluid phase index per particle; -1 for non-fluid.
         fluid_rest_density: Rest density rho_0 per fluid phase [kg/m^3].
         fluid_smoothing_radius: Smoothing radius h per fluid phase [m].
+        fluid_solid_coupling_s: Solid density contribution scale s per phase
+            (UPPFRTA eq.27). Applied to solid neighbors' position-delta terms
+            so the fluid particle is pushed back when an SM-rigid or lattice
+            particle penetrates its smoothing-kernel support.
         lambdas: Lagrange multipliers from compute_fluid_lambda [dimensionless].
         k_corr: Artificial pressure magnitude coefficient [dimensionless].
         dq_factor: Reference distance as fraction of h for s_corr [dimensionless].
@@ -265,6 +290,7 @@ def compute_fluid_position_delta(
 
     rho0 = fluid_rest_density[phase]
     h = fluid_smoothing_radius[phase]
+    s_scale = fluid_solid_coupling_s[phase]
     lam_i = lambdas[i]
 
     x_i = particle_x[i]
@@ -303,21 +329,29 @@ def compute_fluid_position_delta(
     while wp.hash_grid_query_next(query, j):
         if j == i:
             continue
-        if particle_substrate[j] != wp.uint8(3) or particle_fluid_phase[j] != phase:
-            continue
+        same_phase_fluid = (particle_substrate[j] == wp.uint8(3)
+                            and particle_fluid_phase[j] == phase)
+        # Skip neighbors that contribute nothing to fluid density (different
+        # fluid phase, or substrate not handled by Eq.27). Solid neighbors
+        # (lattice / SM-rigid / static) DO contribute via the s-scaled term.
+        # Different-phase fluid is also folded into the solid path so a
+        # heavy phase pushes a lighter one through the same s coupling.
         r = x_i - particle_x[j]
         grad_w = spiky_gradient(r, h)
 
         # Artificial pressure s_corr prevents tensile instability (clumping).
         # Only fire when this particle is over-dense (lam_i < 0); see comment
-        # at s_corr_active definition above.
+        # at s_corr_active definition above. Solid neighbors carry no
+        # tensile-instability contribution: lam_j = 0 for them (compute_fluid_lambda
+        # returns 0 for non-fluid particles), and s_corr is a fluid-self-clumping
+        # fix that does not apply to a fluid-solid pair. Restricting s_corr to
+        # same-phase fluid neighbors avoids amplifying the impact pressure.
         s_corr = wp.float32(0.0)
-        if s_corr_active and w_dq > wp.float32(1.0e-12):
+        if same_phase_fluid and s_corr_active and w_dq > wp.float32(1.0e-12):
             w_r = poly6_kernel(r, h)
             ratio = w_r / w_dq
             s_corr = -k_corr * wp.pow(ratio, n_corr)
 
-        lam_j = lambdas[j]
         # m_j factor: textbook PBD derivation says m cancels here for uniform
         # mass (since w_i = 1/m and grad_p_i C_j = (m/rho_0) grad_W gives
         # w_i * grad_p_i C_j = grad_W / rho_0). BUT: Macklin & Muller 2013
@@ -329,26 +363,41 @@ def compute_fluid_position_delta(
         #
         # Multiplying by m_j here mass-scales the position correction to
         # millimeter scale in SI, matching the magnitudes Macklin gets in
-        # his normalized examples. This is a unit-system calibration, not
-        # a textbook PBD derivation. The alternative (scaling epsilon with
-        # sum_grad_sq magnitude) would also work but requires per-scenario
-        # tuning; the m_j scaling is automatic and dimensionally analogous
-        # to the constraint-gradient fix in compute_fluid_lambda.
-        delta += (lam_i + lam_j + s_corr) * particle_mass[j] * grad_w
+        # his normalized examples. For SOLID neighbors, the mass is further
+        # scaled by s (UPPFRTA eq.27) so the position-delta Jacobian matches
+        # the density formulation and compute_fluid_lambda. Without the s
+        # symmetry, a heavy SM-rigid particle would push a fluid particle
+        # disproportionately and a single impact pass would saturate the
+        # per-pass clamp, launching the fluid particle at clamp/dt m/s.
+        if same_phase_fluid:
+            m_eff = particle_mass[j]
+            lam_j = lambdas[j]
+        else:
+            m_eff = particle_mass[j] * s_scale
+            # lam_j for solid neighbors is 0 (compute_fluid_lambda gates on
+            # substrate == 3). Read it anyway for code symmetry; this is
+            # semantically just adding 0.
+            lam_j = lambdas[j]
+        delta += (lam_i + lam_j + s_corr) * m_eff * grad_w
 
     delta_out = delta / rho0
 
     # Clamp the per-iteration position correction. PBF + Spiky gradient
     # diverges at small r (|grad_W| ~ (h-r)^2 / h^6 prefactor blows up as
     # r -> 0), so when two particles approach overlap, a single iteration
-    # can ask for METRES of correction. Clamp the per-pass move to a
-    # fraction of the particle radius (= h / smoothing_radius_factor /
-    # 2.0; here we use 0.1 * h ~ 0.4 * particle_radius), matching the
-    # PBF rule of thumb that no particle should jump more than a small
-    # fraction of its radius per constraint pass (Macklin & Muller 2013
-    # sect. 4 implementation notes; Akinci 2012 DFSPH uses the same
-    # heuristic).
-    h_clamp = wp.float32(0.1) * h
+    # can ask for METRES of correction. We clamp the per-pass move to a
+    # small fraction of the smoothing radius.
+    #
+    # Why 0.02 * h (not Macklin & Muller's looser 0.1 * h): with the velocity
+    # update v_new = v_pred + dx/dt (srxpbd apply_particle_deltas), each
+    # saturated position-delta pass injects dx/dt into the particle velocity.
+    # At dt ~ 1e-3 s, h = 0.024 m: 0.1*h/dt = 2.4 m/s vs 0.02*h/dt = 0.48 m/s
+    # per pass. With ~24 PBF passes per substep and a heavy SM-rigid neighbor
+    # driving the delta direction consistently outward, the looser clamp let
+    # fluid particles reach 10+ m/s at cross-substrate impact. The 0.02
+    # factor caps per-substep injection at a few m/s even in the worst case
+    # and matches Akinci 2012 DFSPH's stricter clamp recommendation.
+    h_clamp = wp.float32(0.02) * h
     d_mag = wp.length(delta_out)
     if d_mag > h_clamp:
         delta_out = delta_out * (h_clamp / d_mag)

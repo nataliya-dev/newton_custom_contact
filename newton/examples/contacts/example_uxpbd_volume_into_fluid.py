@@ -56,6 +56,14 @@ class Example:
         # ----- Fluid pool -----
         x_min = -(self.FLUID_DIMS[0] - 1) * self.FLUID_CELL / 2
         y_min = -(self.FLUID_DIMS[1] - 1) * self.FLUID_CELL / 2
+        # solid_coupling_s = 0.5: this fluid pool is impacted by a ~2x denser
+        # SM-rigid ball whose 4x4x4 packing samples solid mass at a higher
+        # spatial density than the fluid grid samples water. Per UPPFRTA
+        # section 7.1.1 "If solids are sampled more densely than fluids then
+        # it should be set < 1." Default s = 1 caused fluid particles to
+        # launch at the cross-substrate impact moment (frame ~50); s = 0.5
+        # damps the solid->fluid density-constraint contribution while still
+        # producing buoyancy/displacement.
         builder.add_fluid_grid(
             pos=wp.vec3(x_min, y_min, self.FLUID_BASE_Z),
             rot=wp.quat_identity(),
@@ -71,6 +79,7 @@ class Example:
             smoothing_radius_factor=3.0,
             viscosity=0.05,
             cohesion=0.0,
+            solid_coupling_s=0.5,
         )
 
         # ----- SM-rigid ball (sphere-masked particle volume) -----
