@@ -179,6 +179,7 @@ def test_uxpbd_pbf_lambda_at_rest_density(test, device):
             model.particle_fluid_phase,
             model.fluid_rest_density,
             model.fluid_smoothing_radius,
+            model.fluid_solid_coupling_s,
             density,
             wp.float32(100.0),
         ],
@@ -248,6 +249,7 @@ def test_uxpbd_pbf_position_delta_separates_overdense(test, device):
             model.particle_fluid_phase,
             model.fluid_rest_density,
             model.fluid_smoothing_radius,
+            model.fluid_solid_coupling_s,
             density,
             wp.float32(100.0),
         ],
@@ -265,6 +267,7 @@ def test_uxpbd_pbf_position_delta_separates_overdense(test, device):
             model.particle_fluid_phase,
             model.fluid_rest_density,
             model.fluid_smoothing_radius,
+            model.fluid_solid_coupling_s,
             lambdas,
             wp.float32(0.1),
             wp.float32(0.3),
@@ -342,12 +345,14 @@ def test_uxpbd_pbf_position_delta_bounded_under_realistic_mass(test, device):
               inputs=[model.particle_grid.id, state.particle_q, model.particle_mass,
                       model.particle_substrate, model.particle_fluid_phase,
                       model.fluid_rest_density, model.fluid_smoothing_radius,
+                      model.fluid_solid_coupling_s,
                       density, wp.float32(100.0)],
               outputs=[lambdas], device=device)
     wp.launch(compute_fluid_position_delta, dim=n,
               inputs=[model.particle_grid.id, state.particle_q, model.particle_mass,
                       model.particle_substrate, model.particle_fluid_phase,
                       model.fluid_rest_density, model.fluid_smoothing_radius,
+                      model.fluid_solid_coupling_s,
                       lambdas, wp.float32(0.1), wp.float32(0.3), wp.float32(4.0)],
               outputs=[deltas], device=device)
 

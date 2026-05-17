@@ -287,8 +287,7 @@ class CSLCHandler:
         # docstring).  contact_fraction=0.3 is a generic moderate prior;
         # geometry-specific tuning (e.g. cf=0.46 for the squeeze pad/sphere
         # geometry) is exposed via `recalibrate_cslc_kc_per_pad` in
-        # squeeze_test.py.  See TODOs in cslc_v1/convo_april_19.md for
-        # the iterative bootstrap that would replace this prior.
+        # squeeze_test.py.
         ke_bulk = float(shape_ke[first_cslc])
         kc = calibrate_kc(ke_bulk, pads, ka=ka, contact_fraction=0.3, per_pad=True)
 

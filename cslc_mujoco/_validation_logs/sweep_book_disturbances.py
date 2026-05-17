@@ -3,8 +3,8 @@ import sys, math
 sys.path.insert(0, "/home/nataliya/newton_custom_contact")
 import warp as wp; wp.config.quiet = True
 import numpy as np, newton
-from cslc_v1 import squeeze_test as st
-from cslc_v1.common import make_solver, apply_external_wrench, recalibrate_cslc_kc_per_pad
+from cslc_mujoco import squeeze_test as st
+from cslc_mujoco.common import make_solver, apply_external_wrench, recalibrate_cslc_kc_per_pad
 
 def build_sphere_pad_box_book(p):
     b = newton.ModelBuilder()

@@ -13,9 +13,6 @@ import warp as wp
 from ...sim import Contacts, Control, Model, State
 from ..solver import SolverBase
 from ..srxpbd.kernels import (
-    apply_particle_deltas as srxpbd_apply_particle_deltas,
-)
-from ..srxpbd.kernels import (
     enforce_momemntum_conservation_tiled,
     solve_shape_matching_batch_tiled,
 )
@@ -29,12 +26,12 @@ from ..xpbd.kernels import (
 from .fluid import (
     apply_cohesion_forces,
     apply_xsph_viscosity,
-    compute_fluid_density,
-    compute_fluid_lambda,
+    compute_fluid_density_and_lambda,
     compute_fluid_position_delta,
 )
 from .kernels import (
     apply_particle_deltas_position_only,
+    apply_particle_deltas_uxpbd,
     compute_mass_scale,
     solve_particle_particle_contacts_uxpbd,
     solve_particle_shape_contacts_uxpbd,
@@ -615,11 +612,17 @@ class SolverUXPBD(SolverBase):
                 self.update_lattice_world_positions(state_out)
 
                 # Apply particle-side deltas from shape contact (SM-rigid path).
+                # Uses apply_particle_deltas_uxpbd which passes through v for
+                # mass-0 lattice particles (instead of zeroing it like the
+                # SRXPBD variant); the prior projection at line 629 already
+                # set lattice x/qd to body-consistent values, and preserving
+                # them through the apply eliminates the need for a redundant
+                # projection here.
                 if model.particle_count > 0:
                     new_q = self._alt_particle_q(state_out)
                     new_qd = self._alt_particle_qd(state_out)
                     wp.launch(
-                        kernel=srxpbd_apply_particle_deltas,
+                        kernel=apply_particle_deltas_uxpbd,
                         dim=model.particle_count,
                         inputs=[
                             self.particle_q_rest,
@@ -636,7 +639,6 @@ class SolverUXPBD(SolverBase):
                     )
                     state_out.particle_q = new_q
                     state_out.particle_qd = new_qd
-                    self.update_lattice_world_positions(state_out)
 
             # Cross-substrate particle-particle contact pass.
             if model.particle_count > 1 and model.particle_grid is not None and body_deltas is not None:
@@ -679,10 +681,15 @@ class SolverUXPBD(SolverBase):
                     device=model.device,
                 )
                 _apply_deltas_flip(constraint_inv_weights=body_contact_count)
+                # PP-contact body apply moved bodies, so lattice particles
+                # (whose x/qd are body-derived) are now stale. The post-apply
+                # projection at the end of this block re-syncs them. Using
+                # apply_particle_deltas_uxpbd avoids ALSO needing to restore
+                # lattice qd that the SRXPBD variant would have zeroed.
                 new_q = self._alt_particle_q(state_out)
                 new_qd = self._alt_particle_qd(state_out)
                 wp.launch(
-                    kernel=srxpbd_apply_particle_deltas,
+                    kernel=apply_particle_deltas_uxpbd,
                     dim=model.particle_count,
                     inputs=[
                         self.particle_q_rest,
@@ -729,24 +736,12 @@ class SolverUXPBD(SolverBase):
                     fluid_lambdas.zero_()
                     fluid_deltas.zero_()
 
+                    # Fused density + lambda kernel (perf #B). Computes both
+                    # in a single neighbor traversal. lambda only needs rho_i
+                    # (not rho_j), so density can be computed inline; saves
+                    # one grid query per fluid particle per sub-iteration.
                     wp.launch(
-                        kernel=compute_fluid_density,
-                        dim=model.particle_count,
-                        inputs=[
-                            model.particle_grid.id,
-                            state_out.particle_q,
-                            model.particle_mass,
-                            model.particle_substrate,
-                            model.particle_fluid_phase,
-                            model.fluid_smoothing_radius,
-                            model.fluid_solid_coupling_s,
-                        ],
-                        outputs=[fluid_density],
-                        device=model.device,
-                    )
-
-                    wp.launch(
-                        kernel=compute_fluid_lambda,
+                        kernel=compute_fluid_density_and_lambda,
                         dim=model.particle_count,
                         inputs=[
                             model.particle_grid.id,
@@ -757,10 +752,9 @@ class SolverUXPBD(SolverBase):
                             model.fluid_rest_density,
                             model.fluid_smoothing_radius,
                             model.fluid_solid_coupling_s,
-                            fluid_density,
                             epsilon,
                         ],
-                        outputs=[fluid_lambdas],
+                        outputs=[fluid_density, fluid_lambdas],
                         device=model.device,
                     )
 
@@ -788,7 +782,7 @@ class SolverUXPBD(SolverBase):
                     new_q = self._alt_particle_q(state_out)
                     new_qd = self._alt_particle_qd(state_out)
                     wp.launch(
-                        kernel=srxpbd_apply_particle_deltas,
+                        kernel=apply_particle_deltas_uxpbd,
                         dim=model.particle_count,
                         inputs=[
                             self.particle_q_rest,
@@ -810,13 +804,23 @@ class SolverUXPBD(SolverBase):
                     # loop. body_q is unchanged within the PBF loop, so the
                     # lattice particle positions derived from body_q are also
                     # unchanged; re-projecting them was pure waste (~7%/frame
-                    # on combo). The trailing projection below restores
-                    # lattice particle_q / particle_qd before XSPH (which
-                    # reads particle_qd) and the next main-iter consumer.
+                    # on combo).
                 # End of PBF sub-iteration loop.
-                self.update_lattice_world_positions(state_out)
+                # NOTE (perf 9-prime): trailing lattice projection removed.
+                # The PBF loop does not move bodies (body_q is unchanged), and
+                # apply_particle_deltas_uxpbd preserves lattice qd (instead of
+                # zeroing it like the SRXPBD variant). Lattice particle_q /
+                # particle_qd therefore remain valid through the entire PBF
+                # loop without an explicit re-projection.
 
-                # XSPH viscosity (one pass per main iteration).
+                # XSPH viscosity once per main iteration. Kept inside the loop
+                # (not hoisted out of step()) because XSPH composes
+                # non-linearly: applying it N times with coefficient c is NOT
+                # equivalent to one pass with N*c when velocities are large
+                # (e.g. fluid-solid impact). Moving it out caused volumes to
+                # bounce on fluid impact and inflated x_extent on fluid_drop.
+                # Kept here for behavior parity with the paper's PBF Algorithm
+                # 1, which applies XSPH after each density-solve pass.
                 xsph_v = self._xsph_v
                 wp.launch(
                     kernel=apply_xsph_viscosity,
@@ -830,7 +834,7 @@ class SolverUXPBD(SolverBase):
                         model.particle_fluid_phase,
                         model.fluid_smoothing_radius,
                         model.fluid_viscosity,
-                        fluid_density,
+                        self._fluid_density,
                     ],
                     outputs=[xsph_v],
                     device=model.device,
@@ -914,7 +918,7 @@ class SolverUXPBD(SolverBase):
                 new_q = self._alt_particle_q(state_out)
                 new_qd = self._alt_particle_qd(state_out)
                 wp.launch(
-                    kernel=srxpbd_apply_particle_deltas,
+                    kernel=apply_particle_deltas_uxpbd,
                     dim=model.particle_count,
                     inputs=[
                         self.particle_q_rest,
@@ -966,12 +970,13 @@ class SolverUXPBD(SolverBase):
                 state_out.particle_q = final_q
                 state_out.particle_qd = final_qd
 
-                # Re-sync lattice particle positions and velocities from body_q/qd.
-                # The intermediate srxpbd_apply_particle_deltas above zeroes the
-                # velocity of any mass-0 particle (lattice spheres carry mass on the
-                # host body, not the particle), so we must restore particle_qd[lattice]
-                # = v_lin + omega x r before the next iteration reads it.
-                self.update_lattice_world_positions(state_out)
+                # NOTE (perf 9-prime): trailing lattice projection removed.
+                # SM-rigid shape matching does not move bodies (body_q is
+                # unchanged), and apply_particle_deltas_uxpbd preserves
+                # lattice qd through the apply. enforce_momemntum_conservation
+                # only writes to group (SM-rigid) particles, and the wp.copy
+                # seed carries correct lattice values from state_out into
+                # final_q/final_qd untouched.
 
         # 5. Populate state_out.body_parent_f from joint_impulse (XPBD convention).
         if state_out.body_parent_f is not None:

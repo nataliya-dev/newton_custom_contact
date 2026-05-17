@@ -70,7 +70,7 @@ import warp as wp
 
 import newton
 
-from cslc_v1.common import (
+from cslc_mujoco.common import (
     CSLC_FLAG,
     count_active_contacts,
     inspect_model,
@@ -556,10 +556,10 @@ def stage1_demo(scene: T2Scene, *, delta_indenter_mm: float = 1.0):
                  f"(F_total = {res['F_total_anchor']:.3f} N)")
     ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
-    fig.savefig("cslc_v1/validation/figures/t2_stage1_heatmap.png", dpi=140)
+    fig.savefig("cslc_mujoco/validation/figures/t2_stage1_heatmap.png", dpi=140)
     plt.close(fig)
     print()
-    print(f"  Wrote cslc_v1/validation/figures/t2_stage1_heatmap.png")
+    print(f"  Wrote cslc_mujoco/validation/figures/t2_stage1_heatmap.png")
     return res
 
 
@@ -631,9 +631,9 @@ def sweep_delta(scene: T2Scene, deltas_mm: list[float]) -> dict:
                  f"spacing={scene.cslc_spacing*1e3:.1f} mm, "
                  f"kc_cal={rows[0]['kc_calibrated']:.1f} N/m")
     fig.tight_layout()
-    fig.savefig("cslc_v1/validation/figures/t2_stage1_F_vs_delta.png", dpi=140)
+    fig.savefig("cslc_mujoco/validation/figures/t2_stage1_F_vs_delta.png", dpi=140)
     plt.close(fig)
-    print(f"\n  Wrote cslc_v1/validation/figures/t2_stage1_F_vs_delta.png")
+    print(f"\n  Wrote cslc_mujoco/validation/figures/t2_stage1_F_vs_delta.png")
 
     # Empirical power-law fit on the log-log.  Restrict to deltas above
     # the spacing scale so we are out of the "single-cell" regime.
@@ -980,7 +980,7 @@ def main() -> None:
     np.set_printoptions(precision=6, suppress=True)
     deltas = [0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
               1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0]
-    out_dir = "cslc_v1/validation/figures"
+    out_dir = "cslc_mujoco/validation/figures"
 
     # Smoke-test the point and hydro baselines before any sweep.
     baseline_smoke(T2Scene(), delta_mm=1.0)

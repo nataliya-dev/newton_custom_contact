@@ -11,7 +11,7 @@ al. 2021 (PFC-V eq 23) and Castro et al. 2022 (SAP emission stage).
 
 Run with:
 
-    uv run --extra dev -m unittest cslc_v1.test_h1_compliance -v
+    uv run --extra dev -m unittest cslc_mujoco.test_h1_compliance -v
 
 Tests run without a GPU; they validate the analytical math, not the
 kernel runtime. Kernel-level integration tests (against actual

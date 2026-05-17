@@ -75,7 +75,7 @@ class SceneParams:
     cslc_contact_fraction: float | None = 0.025
 
     # Hydroelastic modulus [Pa] for the hydro contact model.  See section 9
-    # in cslc_v1/convo_april_19.md for the kh stability sweep — 1e8 is
+    # in cslc_mujoco/convo_april_19.md for the kh stability sweep — 1e8 is
     # silicone-rubber-stiff and stable; 1e10 ejects the sphere.
     kh: float = 1.0e8
     sdf_resolution: int = 64
@@ -94,7 +94,7 @@ class SceneParams:
     def dump(self):
         """Print the active scene knobs (mirror of lift_test.SceneParams.dump)."""
         # Local import avoids a top-level cycle (utils imports SceneParams).
-        from cslc_v1.robot_example.utils import _log, _section
+        from cslc_mujoco.robot_example.utils import _log, _section
 
         _section("SCENE PARAMETERS")
         m = self.sphere_mass

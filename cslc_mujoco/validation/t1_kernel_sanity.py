@@ -52,8 +52,8 @@ Run at BOTH parameter regimes from Tier 0:
 Outputs
 -------
 - stdout: PASS/FAIL with numerical evidence
-- cslc_v1/validation/figures/t1_convergence_{A,B}.png  (error vs n_iter)
-- cslc_v1/validation/figures/t1_partial_contact_{A,B}.png (closed-form vs iterative)
+- cslc_mujoco/validation/figures/t1_convergence_{A,B}.png  (error vs n_iter)
+- cslc_mujoco/validation/figures/t1_partial_contact_{A,B}.png (closed-form vs iterative)
 """
 
 from __future__ import annotations
@@ -417,7 +417,7 @@ def main() -> None:
     wp.init()
     device = wp.get_device()
     np.set_printoptions(precision=6, suppress=True)
-    out_dir = "cslc_v1/validation/figures"
+    out_dir = "cslc_mujoco/validation/figures"
 
     N = 15
     regimes = [

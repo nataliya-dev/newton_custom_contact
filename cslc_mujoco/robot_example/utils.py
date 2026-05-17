@@ -5,7 +5,7 @@ from newton.solvers import SolverMuJoCo
 import newton
 from newton._src.geometry.types import GeoType
 
-from cslc_v1.robot_example.config import SceneParams
+from cslc_mujoco.robot_example.config import SceneParams
 
 
 

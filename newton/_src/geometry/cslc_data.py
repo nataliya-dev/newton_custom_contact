@@ -320,7 +320,7 @@ def calibrate_kc(
     if per_pad:
         # Average n_surface across pads — assumes pads are roughly uniform
         # in size. For mixed pad sizes, promote to per-shape kc storage
-        # in CSLCData (see TODOs in cslc_v1/convo_april_19.md).
+        # in CSLCData.
         n_surface = int(np.mean([p.n_surface for p in pads]))
     else:
         n_surface = sum(p.n_surface for p in pads)
@@ -383,12 +383,11 @@ class CSLCData:
     # CSLCData.from_pads(..., build_A_inv=True); used by the tape-compatible
     # `lattice_solve_equilibrium` kernel as a one-shot drop-in replacement
     # for the iterative jacobi_step (which can't be backprop'd through
-    # because of src/dst buffer aliasing — see cslc_v1/diff_test.py
-    # Phase-2 diagnostic).  Solves (K + kc·I) δ = kc·φ in closed form as
-    # δ = kc · A_inv · φ — preserves full lattice physics (ka, kl, kc) in
-    # the differentiable path.  O(n_spheres²) memory; for n > ~1000 a
-    # future follow-up should replace this with a GPU sparse Cholesky
-    # factorisation plus two triangular solves.
+    # because of src/dst buffer aliasing).  Solves (K + kc·I) δ = kc·φ
+    # in closed form as δ = kc · A_inv · φ — preserves full lattice
+    # physics (ka, kl, kc) in the differentiable path.  O(n_spheres²)
+    # memory; for n > ~1000 a future follow-up should replace this with
+    # a GPU sparse Cholesky factorisation plus two triangular solves.
     A_inv: wp.array | None = None
     device: str | None = None
 
@@ -423,7 +422,7 @@ class CSLCData:
                 ``kl`` is used directly and the correlation length in
                 lattice-spacing units is ``√(kl/ka)``, which shrinks under
                 refinement — see Finding A in
-                ``cslc_v1/validation/FINDINGS.md``.  Assumes uniform
+                ``cslc_mujoco/validation/FINDINGS.md``.  Assumes uniform
                 spacing across all pads (uses ``pads[0].spacing``); a
                 future per-pad extension would index by pad.
         """

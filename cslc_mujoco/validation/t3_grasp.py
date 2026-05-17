@@ -57,10 +57,10 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
 # Re-use the Tier 0 K-matrix builder for the eigenvalue extraction.
-from cslc_v1.validation.t0_modal_analysis import build_K
+from cslc_mujoco.validation.t0_modal_analysis import build_K
 
 
-# Empirical data from cslc_v1/docs/summary.md, "Disturbance magnitude
+# Empirical data from cslc_mujoco/docs/summary.md, "Disturbance magnitude
 # sweep -- failure curves" section.  Trade-paperback book scene,
 # mu = 0.5, weight 4.42 N, 1 s HOLD.  CSLC = 378 active surface spheres.
 # Numbers are (magnitude_Nm, tilt_deg) at the linear part of the curve.

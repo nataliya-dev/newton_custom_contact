@@ -397,6 +397,73 @@ def solve_particle_particle_contacts_uxpbd(
 
 
 @wp.kernel
+def apply_particle_deltas_uxpbd(
+    x_orig: wp.array[wp.vec3],
+    x_pred: wp.array[wp.vec3],
+    v_pred: wp.array[wp.vec3],
+    particle_flags: wp.array[wp.int32],
+    particle_mass: wp.array[wp.float32],
+    delta: wp.array[wp.vec3],
+    dt: float,
+    v_max: float,
+    # output
+    x_out: wp.array[wp.vec3],
+    v_out: wp.array[wp.vec3],
+):
+    """UXPBD particle-delta apply that preserves v for mass-0 particles.
+
+    Like :func:`newton._src.solvers.srxpbd.kernels.apply_particle_deltas` but
+    passes through ``v_pred`` (instead of zeroing it) for mass==0 particles.
+
+    Rationale: in UXPBD, lattice spheres have ``particle_mass == 0`` because
+    their inertia is carried by the host body, not the particle. Their
+    ``particle_qd`` is the projected body-frame point velocity
+    ``v_lin + omega x r`` (computed by :func:`update_lattice_world_positions`).
+    The SRXPBD apply kernel writes ``v_out = 0`` for mass-0 particles, which
+    destroys this body-projected velocity and forces the solver to re-run
+    :func:`update_lattice_world_positions` after every particle-delta apply
+    just to restore qd. By passing through ``v_pred`` here, lattice qd is
+    preserved across apply calls and the post-apply projection is no longer
+    needed (only post-apply-body-deltas projections remain).
+
+    For mass==0 particles whose v_pred is genuinely zero (true statics),
+    behavior is unchanged: v_out == v_pred == 0.
+
+    See :mod:`newton._src.solvers.uxpbd` design notes on lattice-qd
+    preservation.
+    """
+    tid = wp.tid()
+
+    if particle_mass[tid] == 0.0:
+        # Mass-0 particle: preserve position and velocity from prediction.
+        # For lattice particles, v_pred is the body-projected velocity from
+        # update_lattice_world_positions and must not be overwritten.
+        x_out[tid] = x_pred[tid]
+        v_out[tid] = v_pred[tid]
+        return
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        return
+
+    x0 = x_orig[tid]
+    xp = x_pred[tid]
+    vp = v_pred[tid]
+    d = delta[tid]
+
+    # See srxpbd.apply_particle_deltas docstring for the v_new = vp + d/dt
+    # rationale (long-horizon accuracy vs (x_new - x0)/dt).
+    v_new = vp + d / dt
+    x_new = xp + d
+
+    v_new_mag = wp.length(v_new)
+    if v_new_mag > v_max:
+        v_new *= v_max / v_new_mag
+
+    x_out[tid] = x_new
+    v_out[tid] = v_new
+
+
+@wp.kernel
 def apply_particle_deltas_position_only(
     x_pred: wp.array[wp.vec3],
     particle_flags: wp.array[wp.int32],

@@ -136,8 +136,8 @@ def compute_cslc_penetration_sphere(
 #      δ_i = kc · Σ_j  A_inv[i, j] · φ[j]
 #  as a pure matvec.  This is a tape-differentiable drop-in replacement for
 #  jacobi_step + src/dst swap — the Python-side ping-pong buffer alias
-#  breaks wp.Tape backward (see cslc_v1/diff_test.py Phase-2 diagnostic),
-#  but a single matvec is linear and backprops correctly.
+#  breaks wp.Tape backward, but a single matvec is linear and backprops
+#  correctly.
 #
 #  Differences vs the iterative Jacobi:
 #    – Ungated: treats all surface spheres as contributing.  For inactive
@@ -528,8 +528,7 @@ def write_cslc_contacts(
     # H1: harmonic-mean (series-spring) composition of lattice stiffness
     # cslc_kc and target material stiffness target_ke.  Recovers cslc_kc
     # in the rigid-target limit (target_ke ≫ cslc_kc); the eps² floor
-    # guards against 0/0 when both stiffnesses are zero.  See
-    # cslc_v1/test_h1_compliance.py for the math contract.
+    # guards against 0/0 when both stiffnesses are zero.
     kc_series = (cslc_kc * target_ke) / (cslc_kc + target_ke + eps * eps)
 
     # Gated stiffness with a smooth lower floor so MuJoCo's
@@ -942,8 +941,7 @@ def write_cslc_contacts_box(
     out_tids[buf_idx] = 0
 
     # H1: harmonic-mean (series-spring) composition of lattice and target
-    # stiffness; recovers cslc_kc when target_ke ≫ cslc_kc.  See
-    # cslc_v1/test_h1_compliance.py for the math contract.
+    # stiffness; recovers cslc_kc when target_ke ≫ cslc_kc.
     kc_series = (cslc_kc * target_ke) / (cslc_kc + target_ke + eps * eps)
 
     out_stiffness[buf_idx] = smooth_relu(

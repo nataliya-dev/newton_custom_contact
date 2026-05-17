@@ -99,9 +99,9 @@ margin shrinks.
 ## Files written
 
 ```
-cslc_v1/validation/figures/t1_convergence_{A,B}.png
-cslc_v1/validation/figures/t1_partial_contact_{A,B}.png
-cslc_v1/validation/t1_results.md
+cslc_mujoco/validation/figures/t1_convergence_{A,B}.png
+cslc_mujoco/validation/figures/t1_partial_contact_{A,B}.png
+cslc_mujoco/validation/t1_results.md
 ```
 
 ## Next: Tier 2 — single-indenter scenario

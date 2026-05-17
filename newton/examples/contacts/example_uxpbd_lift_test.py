@@ -121,7 +121,7 @@ class SceneParams:
     # --- Integration ---
     fps: int = 100
     sim_substeps: int = 16
-    solver_iterations: int = 6
+    solver_iterations: int = 4
 
     @property
     def frame_dt(self) -> float:

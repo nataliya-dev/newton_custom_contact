@@ -29,8 +29,8 @@ import warp as wp  # noqa: E402
 wp.config.quiet = True
 import numpy as np  # noqa: E402
 
-from cslc_v1 import squeeze_test as st  # noqa: E402
-from cslc_v1.common import (  # noqa: E402
+from cslc_mujoco import squeeze_test as st  # noqa: E402
+from cslc_mujoco.common import (  # noqa: E402
     apply_external_wrench,
     make_solver,
     recalibrate_cslc_kc_per_pad,

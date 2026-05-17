@@ -20,7 +20,7 @@ None``), which routes the kernel through the gated iterative
 Jacobi spectral radius approaches 1 and convergence slows.
 
 Run with:
-    uv run python -m cslc_v1.validation.t2_fine_grid_jacobi
+    uv run python -m cslc_mujoco.validation.t2_fine_grid_jacobi
 
 If the iterative path produces meaningful weak-vs-strong kl differences
 in the CSLC pressure profile shape, we have a smoking gun:
@@ -37,7 +37,7 @@ import sys
 
 import numpy as np
 
-from cslc_v1.validation.t2_indenter import (
+from cslc_mujoco.validation.t2_indenter import (
     T2Scene,
     build_t2_model_cslc,
     measure_one,

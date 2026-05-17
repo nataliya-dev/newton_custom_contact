@@ -237,6 +237,114 @@ def compute_fluid_lambda(
 
 
 @wp.kernel
+def compute_fluid_density_and_lambda(
+    grid: wp.uint64,
+    particle_x: wp.array[wp.vec3],
+    particle_mass: wp.array[wp.float32],
+    particle_substrate: wp.array[wp.uint8],
+    particle_fluid_phase: wp.array[wp.int32],
+    fluid_rest_density: wp.array[wp.float32],
+    fluid_smoothing_radius: wp.array[wp.float32],
+    fluid_solid_coupling_s: wp.array[wp.float32],
+    epsilon: wp.float32,
+    # outputs
+    density: wp.array[wp.float32],
+    lambdas: wp.array[wp.float32],
+):
+    """Fused density + lambda computation for PBF (perf opportunity #B).
+
+    Mathematically equivalent to running :func:`compute_fluid_density`
+    followed by :func:`compute_fluid_lambda`. lambda_i depends only on
+    rho_i and neighbor positions (NOT on neighbor densities), so density
+    can be computed inline within the lambda kernel and the global
+    density read in the second pass is eliminated. Saves one neighbor
+    traversal per fluid particle per PBF sub-iteration (3 traversals -> 2;
+    position-delta still requires a separate kernel because it reads all
+    lambda_j after they are written).
+
+    Density follows :func:`compute_fluid_density` (UPPFRTA eq.27 with
+    s-scaled solid contributions). Lambda follows
+    :func:`compute_fluid_lambda` (Macklin and Muller 2013 eq.11 with the
+    same s-scaling on solid neighbor gradients for Jacobian symmetry).
+    Both outputs are still written globally: density for the downstream
+    XSPH viscosity pass and lambda for compute_fluid_position_delta.
+
+    Args:
+        grid: Warp hash grid id built from particle positions.
+        particle_x: Particle positions [m].
+        particle_mass: Particle masses [kg].
+        particle_substrate: Substrate type; value 3 denotes fluid.
+        particle_fluid_phase: Fluid phase index per particle; -1 for non-fluid.
+        fluid_rest_density: Rest density rho_0 per fluid phase [kg/m^3].
+        fluid_smoothing_radius: Smoothing radius h per fluid phase [m].
+        fluid_solid_coupling_s: Solid density coupling factor per phase
+            (UPPFRTA eq.27).
+        epsilon: Macklin & Muller relaxation regularizer.
+        density: Output density rho_i per particle [kg/m^3].
+        lambdas: Output Lagrange multiplier per particle [dimensionless].
+    """
+    i = wp.tid()
+    if particle_substrate[i] != wp.uint8(3):
+        # Non-fluid: density not meaningful, lambda zero.
+        lambdas[i] = wp.float32(0.0)
+        return
+    phase = particle_fluid_phase[i]
+    if phase < 0:
+        lambdas[i] = wp.float32(0.0)
+        return
+
+    rho0 = fluid_rest_density[phase]
+    h = fluid_smoothing_radius[phase]
+    s_scale = fluid_solid_coupling_s[phase]
+
+    x_i = particle_x[i]
+    rho = wp.float32(0.0)
+    grad_i_sum = wp.vec3(0.0, 0.0, 0.0)
+    sum_grad_sq = wp.float32(0.0)
+
+    # Single neighbor traversal: accumulate density (Poly6 W) and gradient
+    # contributions (Spiky gradient) simultaneously. Self contributes to
+    # density (W at r=0 is finite) but not to gradient (Spiky gradient is
+    # zero at r=0; skip the self term explicitly to match the unfused
+    # kernels' behavior).
+    query = wp.hash_grid_query(grid, x_i, h)
+    j = int(0)
+    while wp.hash_grid_query_next(query, j):
+        r = x_i - particle_x[j]
+        w = poly6_kernel(r, h)
+        if particle_substrate[j] == wp.uint8(3) and particle_fluid_phase[j] == phase:
+            # Same-phase fluid: full mass for both density and gradient.
+            rho += particle_mass[j] * w
+            if j != i:
+                grad_w = spiky_gradient(r, h)
+                g_j = particle_mass[j] * grad_w / rho0
+                sum_grad_sq += wp.dot(g_j, g_j)
+                grad_i_sum += g_j
+        elif particle_substrate[j] != wp.uint8(3):
+            # Non-fluid (solid) neighbor: s-scaled contributions to both
+            # density and gradient, per UPPFRTA eq.27.
+            rho += s_scale * particle_mass[j] * w
+            grad_w = spiky_gradient(r, h)
+            g_j = (s_scale * particle_mass[j]) * grad_w / rho0
+            sum_grad_sq += wp.dot(g_j, g_j)
+            grad_i_sum += g_j
+
+    density[i] = rho
+
+    # Unilateral constraint: C = rho/rho_0 - 1, active only when overdense.
+    c = rho / rho0 - wp.float32(1.0)
+    if c <= wp.float32(0.0):
+        lambdas[i] = wp.float32(0.0)
+        return
+
+    # Self-gradient closes the gradient sum via Newton's 3rd law.
+    grad_i = -grad_i_sum
+    sum_grad_sq += wp.dot(grad_i, grad_i)
+
+    lambdas[i] = -c / (sum_grad_sq + epsilon)
+
+
+@wp.kernel
 def compute_fluid_position_delta(
     grid: wp.uint64,
     particle_x: wp.array[wp.vec3],

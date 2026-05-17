@@ -51,9 +51,9 @@ by anchor stiffness and the lateral coupling barely smooths anything.
 
 Outputs
 -------
-- cslc_v1/validation/figures/t0_mode_gallery_{A,B}.png   (6-panel heatmap)
-- cslc_v1/validation/figures/t0_impulse_response_{A,B}.png
-- cslc_v1/validation/figures/t0_modal_energy_{A,B}.png
+- cslc_mujoco/validation/figures/t0_mode_gallery_{A,B}.png   (6-panel heatmap)
+- cslc_mujoco/validation/figures/t0_impulse_response_{A,B}.png
+- cslc_mujoco/validation/figures/t0_modal_energy_{A,B}.png
 - stdout: H0.1, H0.2, H0.3 PASS/FAIL with the relevant numbers
 """
 
@@ -440,7 +440,7 @@ def run_regime(regime: Regime, N: int, out_dir: str) -> dict:
 
 def main() -> None:
     np.set_printoptions(precision=6, suppress=True)
-    out_dir = "cslc_v1/validation/figures"
+    out_dir = "cslc_mujoco/validation/figures"
 
     # Regime A: paper-prescribed parameters from squeeze_test.py.
     # ka/kl = 30, so l_c = sqrt(1/30) ~ 0.18 lattice spacings -- sub-grid.

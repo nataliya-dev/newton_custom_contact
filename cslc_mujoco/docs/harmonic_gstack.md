@@ -220,7 +220,7 @@ as the `target_ke` argument.
 
 
 
-### Rung 1 + 2 — Unit tests (`cslc_v1/test_h1_compliance.py`)
+### Rung 1 + 2 — Unit tests (`cslc_mujoco/test_h1_compliance.py`)
 
 
 
@@ -258,7 +258,7 @@ Run:
 
 ```bash
 
-uv run --extra dev -m unittest cslc_v1.test_h1_compliance -v
+uv run --extra dev -m unittest cslc_mujoco.test_h1_compliance -v
 
 ```
 
@@ -268,7 +268,7 @@ uv run --extra dev -m unittest cslc_v1.test_h1_compliance -v
 
 
 
-**Test:** `uv run cslc_v1/lift_test.py --mode headless --contact-models cslc`
+**Test:** `uv run cslc_mujoco/lift_test.py --mode headless --contact-models cslc`
 
 
 

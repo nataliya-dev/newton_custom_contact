@@ -47,7 +47,7 @@ The CSLC lattice stiffness matrix `K_ii = k_a + k_ℓ|N(i)|`, `K_ij = -k_ℓ if 
 - Top 5 modes carry > 95% of energy for the three test loads.
 
 ### Deliverable
-- `cslc_v1/validation/t0_modal_analysis.py` (standalone numpy script, no Newton dep)
+- `cslc_mujoco/validation/t0_modal_analysis.py` (standalone numpy script, no Newton dep)
 - Figure: 6-panel mode-shape gallery + impulse-response radial profile + modal energy bar chart
 - This figure goes in the paper as **the lateral-coupling explanation figure** — the impulse-response panel alone shows what hydroelastic cannot capture (no lateral coupling → no spread).
 
@@ -76,7 +76,7 @@ The Newton CSLC kernel (`jacobi_step` iterative path and `lattice_solve_equilibr
 - Warm-start convergence: residual at iteration 5 is ≥ 2× lower than cold start.
 
 ### Deliverable
-- `cslc_v1/validation/t1_kernel_sanity.py`
+- `cslc_mujoco/validation/t1_kernel_sanity.py`
 - Table: relative error vs n_iter for both solver paths
 - This tier is a regression-test foundation. Failures here block everything downstream.
 
@@ -121,7 +121,7 @@ Run three contact models on the same scene:
 - H2.4: error vs asymptote (largest-N CSLC result) at fixed δ decreases as N is refined; fitted convergence order > 0.8.
 
 ### Deliverable
-- `cslc_v1/validation/t2_indenter.py`
+- `cslc_mujoco/validation/t2_indenter.py`
 - Figure A: F-vs-δ on log-log axes, three models, with Hertzian asymptote line
 - Figure B: pressure profile p(r) at δ = 1 mm, three models overlaid; **this is the lateral-coupling-vs-hydroelastic comparison figure**
 - Figure C: convergence-with-N plot
@@ -180,8 +180,8 @@ CSLC's force-vs-penetration curve and pressure profile from T2 converge to the F
 - Material-parameter mapping (H2.5.3) recovered to within 30% by fitting `k_a` and `k_ℓ` to the convergence-extrapolated CSLC results.
 
 ### Deliverable
-- `cslc_v1/validation/t2_5_fem_comparison.py`
-- FEniCS scripts in `cslc_v1/validation/fem/`
+- `cslc_mujoco/validation/t2_5_fem_comparison.py`
+- FEniCS scripts in `cslc_mujoco/validation/fem/`
 - Convergence table: rows = N, columns = (e_force, e_pressure_L2, e_pressure_Linf)
 - Figure: error vs h log-log plot with theoretical slopes overlaid
 - **This is the scientific anchor of the paper.** Newton's hydroelastic paper has no equivalent — they do not show convergence to PDE ground truth.
@@ -217,7 +217,7 @@ For each torque axis, fit `K = τ / θ` in the linear regime. Compare against th
 - Per-sphere force distribution under bending visibly activates the linear-gradient mode (Mode 1) identified in T0.
 
 ### Deliverable
-- `cslc_v1/validation/t3_grasp_consequences.py`
+- `cslc_mujoco/validation/t3_grasp_consequences.py`
 - Three plots: τ_y vs θ_y, τ_z vs θ_z, per-sphere force heatmaps at three torque levels
 - Connection back to T0: caption each heatmap with the dominant mode index by projection.
 
@@ -263,7 +263,7 @@ T0 ──→ T1 ──→ T2 ──→ T2.5 ──→ T3 ──→ T4
         └────→ Paper figure A (modal analysis)
 ```
 
-Each tier produces a self-contained validation script in `cslc_v1/validation/tN_*.py` and a figure or table directly usable in the paper.
+Each tier produces a self-contained validation script in `cslc_mujoco/validation/tN_*.py` and a figure or table directly usable in the paper.
 
 ## What this plan does NOT cover
 

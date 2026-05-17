@@ -10,17 +10,17 @@ Focus: WHY does the sphere slip, and how fast?
 Usage
 -----
   # Both models (point + cslc), MuJoCo solver, 1000 steps (default):
-  uv run cslc_v1/squeeze_test.py --solver mujoco --mode squeeze --steps 1000
+  uv run cslc_mujoco/squeeze_test.py --solver mujoco --mode squeeze --steps 1000
 
   # Interactive viewer (CSLC model, renders in real time):
-  uv run cslc_v1/squeeze_test.py --contact-model cslc --solver mujoco
+  uv run cslc_mujoco/squeeze_test.py --contact-model cslc --solver mujoco
   # NOTE: --mode squeeze is headless. Pass --viewer to auto-switch to viewer mode.
 
   # Calibration diagnostic (no simulation — just geometry + stiffness):
-  uv run cslc_v1/squeeze_test.py --mode calibrate
+  uv run cslc_mujoco/squeeze_test.py --mode calibrate
 
   # Step-by-step contact/body dump (N steps):
-  uv run cslc_v1/squeeze_test.py --mode inspect --steps 10
+  uv run cslc_mujoco/squeeze_test.py --mode inspect --steps 10
 
 Modes
 -----
@@ -50,7 +50,7 @@ import warp as wp
 import newton
 import newton.examples
 
-from cslc_v1.common import (
+from cslc_mujoco.common import (
     CSLC_FLAG,
     GEO_NAMES,
     HAS_MUJOCO,
@@ -84,7 +84,8 @@ def _parse_xyz(s: str, label: str) -> tuple[float, float, float]:
     except ValueError as e:
         raise ValueError(f"--{label} expects 'x,y,z' floats, got {s!r}") from e
     if len(parts) != 3:
-        raise ValueError(f"--{label} expects exactly 3 values, got {len(parts)} ({s!r})")
+        raise ValueError(
+            f"--{label} expects exactly 3 values, got {len(parts)} ({s!r})")
     return parts[0], parts[1], parts[2]
 
 
@@ -169,7 +170,7 @@ class SceneParams:
     # gap_initial=59mm ⇒ initial pen = 0.5 mm/side; squeeze adds 0.5 mm
     # over 0.5 s → 1 mm/side at HOLD start.  This puts both tests in the
     # same operating point as the §2 fair-calibration derivation in
-    # cslc_v1/summary.md, where CSLC's distributed-constraint advantage
+    # cslc_mujoco/summary.md, where CSLC's distributed-constraint advantage
     # is unambiguous (vs the previous 12.5 mm "deep-deformation" regime
     # in which hydro happened to win on creep).
     pad_gap_initial: float = 0.059       # 0.5 mm initial pen / side
@@ -186,14 +187,14 @@ class SceneParams:
     # ── CSLC tuning (matched to lift_test.py fair calibration) ──
     cslc_spacing: float = 0.005
     cslc_ka: float = 25000.0  # H1-aware fair-cal: with the three-spring
-                              # chain 1/keff = 1/ka + 1/kc + 1/ke_target,
-                              # ka must exceed ke_bulk/(N - ke_bulk/ke_target)
-                              # for `recalibrate_cslc_kc_per_pad` to find
-                              # a positive kc instead of falling back to
-                              # kc = ke_bulk/N.  At ke_bulk=5e4, ke_target=5e4,
-                              # N=4: ka_min ≈ 16667; ka=25000 leaves a
-                              # comfortable margin and solves to kc=50000,
-                              # keff=12500, agg=50000 ✓.
+    # chain 1/keff = 1/ka + 1/kc + 1/ke_target,
+    # ka must exceed ke_bulk/(N - ke_bulk/ke_target)
+    # for `recalibrate_cslc_kc_per_pad` to find
+    # a positive kc instead of falling back to
+    # kc = ke_bulk/N.  At ke_bulk=5e4, ke_target=5e4,
+    # N=4: ka_min ≈ 16667; ka=25000 leaves a
+    # comfortable margin and solves to kc=50000,
+    # keff=12500, agg=50000 ✓.
     cslc_kl: float = 500.0
     cslc_dc: float = 2.0
     cslc_n_iter: int = 20
@@ -204,7 +205,7 @@ class SceneParams:
     # active patch — cf=0.025 reflects that.  With ka=25000 and
     # ke_bulk=ke_target=5e4 the H1-aware calibration solves to kc=50000,
     # keff=12500, aggregate per pad = 50000 N/m = ke_bulk ✓.  See §2 in
-    # cslc_v1/summary.md for the full derivation.
+    # cslc_mujoco/summary.md for the full derivation.
     # Use None to keep the built-in default from `calibrate_kc` (0.15).
     cslc_contact_fraction: float | None = 0.025
 
@@ -221,7 +222,7 @@ class SceneParams:
     #     kh = 2 · ke_bulk / A_patch
     #
     # At r=30 mm the patch area A_patch = π·(2·r·pen) ≈ 188 mm²,
-    # so kh = 2·5e4 / 1.88e-4 = 5.3e8 Pa.  See §2 in cslc_v1/summary.md.
+    # so kh = 2·5e4 / 1.88e-4 = 5.3e8 Pa.  See §2 in cslc_mujoco/summary.md.
     # At kh=1e10 the solver ejects the
     # sphere; the §1 stability sweep documents the safe range.
     kh: float = 5.3e8
@@ -239,7 +240,7 @@ class SceneParams:
     # `--external-force 0,0,-5` adds an extra 5 N pulling the sphere
     # downward (≈1× the sphere weight) so the friction constraints have
     # to fight harder; a non-zero torque exercises the rotational
-    # stiffness paper claim (§4.2 in cslc_v1/overleaf_theory_cslc_icra.txt).
+    # stiffness paper claim (§4.2 in cslc_mujoco/overleaf_theory_cslc_icra.txt).
     # Default zero → no perturbation.
     external_force: tuple = (0.0, 0.0, 0.0)
     external_torque: tuple = (0.0, 0.0, 0.0)
@@ -322,7 +323,8 @@ class Metrics:
     # the sphere and book objects.  Used to compute `max_tilt_deg` for
     # the rotational-stability claim (book tests measure how far the
     # body rotated from rest under an external torque).
-    sphere_quat: list[tuple[float, float, float, float]] = field(default_factory=list)
+    sphere_quat: list[tuple[float, float, float, float]
+                      ] = field(default_factory=list)
     active_contacts: list[int] = field(default_factory=list)
     cslc_max_delta: list[float] = field(default_factory=list)
     cslc_active_surface: list[int] = field(default_factory=list)
@@ -626,13 +628,11 @@ def set_kinematic_pads(state, step, p, debug=False):
              f"gap={gap*1e3:.2f}mm  vx=({qd[0, 3]:+.4f}, {qd[1, 3]:+.4f})")
 
 
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 #  Contact inspection
 # ═══════════════════════════════════════════════════════════════════════════
 
-# `count_active_contacts` lives in cslc_v1.common.
+# `count_active_contacts` lives in cslc_mujoco.common.
 
 def dump_contacts(contacts, label="", max_show=20):
     """Print the contact buffer in detail."""
@@ -744,7 +744,7 @@ def inspect_cslc_handler(model, label=""):
     return handler
 
 
-# `read_cslc_state` lives in cslc_v1.common.
+# `read_cslc_state` lives in cslc_mujoco.common.
 
 def print_cslc_state(model, step=-1, inline=False):
     info = read_cslc_state(model)
@@ -794,9 +794,9 @@ def inspect_model(model, label=""):
     _log(f"rigid_contact_max: {getattr(model, 'rigid_contact_max', '?')}")
 
 
-# Solver factory and per-pad CSLC calibration both live in cslc_v1.common.
+# Solver factory and per-pad CSLC calibration both live in cslc_mujoco.common.
 # Lattice visualisation helpers (`_quat_rotate`, `get_cslc_lattice_viz_data`)
-# also live in cslc_v1.common.
+# also live in cslc_mujoco.common.
 
 
 def _reset_cslc(model):
@@ -859,7 +859,7 @@ def run_squeeze(name, model, solver, p, verbose=1):
     is_cslc = "cslc" in name.lower()
 
     m_sphere = float(model.body_mass.numpy()[2])
-    g_accel  = float(np.linalg.norm(model.gravity.numpy()))
+    g_accel = float(np.linalg.norm(model.gravity.numpy()))
     weight_N = m_sphere * g_accel
     PRINT_INTERVAL = 50   # print every N HOLD steps
 
@@ -870,7 +870,8 @@ def run_squeeze(name, model, solver, p, verbose=1):
     sphere_body_idx = 2
 
     for step in range(p.n_total_steps):
-        set_kinematic_pads(s0, step, p, debug=(verbose >= 3 and step % 100 == 0))
+        set_kinematic_pads(s0, step, p, debug=(
+            verbose >= 3 and step % 100 == 0))
         s0.clear_forces()
 
         if has_external and step >= p.n_squeeze_steps:
@@ -883,7 +884,7 @@ def run_squeeze(name, model, solver, p, verbose=1):
         solver.step(s0, s1, ctrl, con, p.dt)
         wp.synchronize()
 
-        q  = s1.body_q.numpy()
+        q = s1.body_q.numpy()
         sz = float(q[2, 2])
         sx = float(q[2, 0])
         # body_q layout: (px, py, pz, qx, qy, qz, qw) — pull the four
@@ -916,12 +917,12 @@ def run_squeeze(name, model, solver, p, verbose=1):
             vz_fd = 0.0
         if n_hist >= 3:
             vz_prev = (met.sphere_z[-2] - met.sphere_z[-3]) / p.dt
-            az_fd   = (vz_fd - vz_prev) / p.dt
-            Fz_est  = m_sphere * (az_fd + g_accel)
+            az_fd = (vz_fd - vz_prev) / p.dt
+            Fz_est = m_sphere * (az_fd + g_accel)
         else:
             Fz_est = float("nan")
 
-        in_hold   = step >= p.n_squeeze_steps
+        in_hold = step >= p.n_squeeze_steps
         hold_step = step - p.n_squeeze_steps
 
         # MuJoCo dist readout at hold start and periodic intervals.
@@ -956,8 +957,6 @@ def run_squeeze(name, model, solver, p, verbose=1):
     return met
 
 
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 #  Test orchestrators
 # ═══════════════════════════════════════════════════════════════════════════
@@ -987,7 +986,6 @@ def test_squeeze(p, solver_name="mujoco", contact_models=None):
             f"creep-rate={m.hold_creep_rate_mm_per_s:+.3f}mm/s  "
             f"peak_contacts={m.peak_contacts}")
     return results
-
 
 
 def test_calibrate(p):
@@ -1129,7 +1127,8 @@ class Example:
         if getattr(args, "initial_pen", None) is not None:
             target_half = (self.p.book_hx if self.p.object_kind == "book"
                            else self.p.sphere_radius)
-            self.p.pad_gap_initial = 2.0 * (target_half - float(args.initial_pen))
+            self.p.pad_gap_initial = 2.0 * \
+                (target_half - float(args.initial_pen))
         if getattr(args, "mu", None) is not None:
             self.p.mu = float(args.mu)
         self.p.dump()

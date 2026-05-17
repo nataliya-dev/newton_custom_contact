@@ -31,7 +31,7 @@ Layout
    to "out of the box face").  The smooth-step gate then closes
    wrongly during HOLD, producing zero contact force and the held
    body falling under gravity.  See
-   `cslc_v1/contact_solver_walkthrough.tex` §6 for the analogous
+   `cslc_mujoco/contact_solver_walkthrough.tex` §6 for the analogous
    sign-preserving discussion in the sphere kernel.
 
    The fix uses the box centroid for the gate
@@ -49,7 +49,7 @@ Layout
 
 Run
 ---
-    uv run --extra dev -m unittest cslc_v1.cslc_box_test -v
+    uv run --extra dev -m unittest cslc_mujoco.cslc_box_test -v
 """
 
 from __future__ import annotations
@@ -441,8 +441,8 @@ class TestBoxAggregate(unittest.TestCase):
 
     def test_per_sphere_force_matches_keff_phi(self):
         # Import here so pure-helper tests above don't pay the import cost.
-        from cslc_v1.common import recalibrate_cslc_kc_per_pad
-        from cslc_v1.squeeze_test import SceneParams, build_cslc_scene
+        from cslc_mujoco.common import recalibrate_cslc_kc_per_pad
+        from cslc_mujoco.squeeze_test import SceneParams, build_cslc_scene
 
         p = SceneParams()
         p.object_kind = "book"

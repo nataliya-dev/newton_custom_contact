@@ -96,13 +96,13 @@ modes or proper spatial resolution.
 ## Reproducibility
 
 ```
-python cslc_v1/validation/t0_modal_analysis.py
+python cslc_mujoco/validation/t0_modal_analysis.py
 ```
 
 Outputs:
-- `cslc_v1/validation/figures/t0_mode_gallery_{A,B}.png` — 6-panel mode heatmap
-- `cslc_v1/validation/figures/t0_impulse_response_{A,B}.png` — radial decay + fit
-- `cslc_v1/validation/figures/t0_modal_energy_{A,B}.png` — |c_k|^2 vs k for all loads
+- `cslc_mujoco/validation/figures/t0_mode_gallery_{A,B}.png` — 6-panel mode heatmap
+- `cslc_mujoco/validation/figures/t0_impulse_response_{A,B}.png` — radial decay + fit
+- `cslc_mujoco/validation/figures/t0_modal_energy_{A,B}.png` — |c_k|^2 vs k for all loads
 - stdout: PASS/FAIL with all numerical evidence
 
 ## Next: Tier 1 — kernel sanity vs numpy reference

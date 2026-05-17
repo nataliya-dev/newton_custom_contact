@@ -1,21 +1,21 @@
 '''
-uv run cslc_v1/robot_example/robot_lift.py --contact-model cslc
-uv run cslc_v1/robot_example/robot_lift.py --contact-model hydro --start-gripped
-uv run cslc_v1/robot_example/robot_lift.py --headless --contact-models hydro point cslc
+uv run cslc_mujoco/robot_example/robot_lift.py --contact-model cslc
+uv run cslc_mujoco/robot_example/robot_lift.py --contact-model hydro --start-gripped
+uv run cslc_mujoco/robot_example/robot_lift.py --headless --contact-models hydro point cslc
 '''
 
 import time
 import numpy as np
 import warp as wp
 
-from cslc_v1.robot_example.utils import  \
+from cslc_mujoco.robot_example.utils import  \
                     find_body_in_builder, get_sphere_cfg_not_hyrdo, get_cslc_pad_cfg, get_hydro_pad_cfg, \
                     point_pad_cfg, get_sphere_cfg_hydro, make_solver, \
                     SimDiagnostics, count_active_contacts, read_cslc_state, \
                     inspect_model, recalibrate_cslc_kc_per_pad, \
                     _log, _section
 
-from cslc_v1.robot_example.config import SceneParams, TaskType, LiftMetrics
+from cslc_mujoco.robot_example.config import SceneParams, TaskType, LiftMetrics
 
 
 import newton

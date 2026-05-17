@@ -27,9 +27,9 @@ parameter scope.  If it does change, Fix 1.1 (resolution-independent
 kl_physical scaling) is the lasting fix.
 
 Run with:
-    uv run python -m cslc_v1.validation.t2_fine_grid_kl_sweep
+    uv run python -m cslc_mujoco.validation.t2_fine_grid_kl_sweep
 
-Outputs profile figures into ``cslc_v1/validation/figures/`` and prints
+Outputs profile figures into ``cslc_mujoco/validation/figures/`` and prints
 the r10/a_indent metric per regime for the headline comparison.
 """
 
@@ -42,7 +42,7 @@ import numpy as np
 
 # Reuse the existing Tier 2 infrastructure verbatim — different scenes
 # are the only knob we vary.
-from cslc_v1.validation.t2_indenter import (
+from cslc_mujoco.validation.t2_indenter import (
     T2Scene,
     pressure_profile_comparison,
 )

@@ -6,7 +6,7 @@ hydroelastic PFC — in squeeze and lift tasks for the ICRA paper.
 
 
 
-## 1. Squeeze test (`cslc_v1/squeeze_test.py`)
+## 1. Squeeze test (`cslc_mujoco/squeeze_test.py`)
 
 ### Scene
 
@@ -30,9 +30,9 @@ The squeeze test supports two held targets via `--object`:
   `kh = ke/(2hy·2hz) ≈ 1.25e7 Pa`.
 
 ```
-uv run cslc_v1/squeeze_test.py --mode squeeze --solver mujoco \
+uv run cslc_mujoco/squeeze_test.py --mode squeeze --solver mujoco \
     --contact-models point,cslc,hydro            # sphere
-uv run cslc_v1/squeeze_test.py --mode squeeze --object book \
+uv run cslc_mujoco/squeeze_test.py --mode squeeze --object book \
     --contact-models point,cslc,hydro            # book
 ```
 
@@ -134,7 +134,7 @@ per-polygon stiffness was already near the solver floor; the 2× kh
 bump is invisible to the macroscopic creep metric.
 
 ```
-uv run cslc_v1/squeeze_test.py --mode squeeze --object book \
+uv run cslc_mujoco/squeeze_test.py --mode squeeze --object book \
     --contact-models point,cslc,hydro
 ```
 
@@ -142,7 +142,7 @@ uv run cslc_v1/squeeze_test.py --mode squeeze --object book \
 
 The squeeze test supports `--external-force fx,fy,fz` and
 `--external-torque tx,ty,tz` (world frame, applied to the held body
-during HOLD only via `cslc_v1/common.py:apply_external_wrench`).
+during HOLD only via `cslc_mujoco/common.py:apply_external_wrench`).
 
 > **2026-05-03 — `apply_external_wrench` layout bug fixed.** The function
 > previously had force/torque slots swapped (`body_f[0:3] = torque,
@@ -255,7 +255,7 @@ distinct cliffs** in the BOX-on-BOX scene and confirming that **CSLC
 is the only model with zero ejections across all 63 magnitudes
 tested**.
 
-Reproduce: `cslc_v1/_validation_logs/sweep_book_disturbance_curves.py`
+Reproduce: `cslc_mujoco/_validation_logs/sweep_book_disturbance_curves.py`
 (~5 min on RTX 3070).  CSV → `sweep_book_disturbance_curves.csv` (190
 rows).  Trade-paperback book, μ=0.5, weight 4.42 N, kinematic BOX
 pads, 1 s HOLD.
@@ -373,14 +373,14 @@ tilt-vs-magnitude curve stays sub-linear** through this regime.
    contact) on 1 axis.
 
 ```
-uv run --extra dev python cslc_v1/_validation_logs/sweep_book_disturbance_curves.py
+uv run --extra dev python cslc_mujoco/_validation_logs/sweep_book_disturbance_curves.py
 ```
 
 ---
 
 ### Disturbance sweep — three baselines side by side (2026-05-03, post-fix)
 
-Reproduce via `cslc_v1/_validation_logs/sweep_book_disturbances.py`.
+Reproduce via `cslc_mujoco/_validation_logs/sweep_book_disturbances.py`.
 Trade-paperback book (152×229×25 mm, 0.45 kg, μ=0.5, weight 4.42 N),
 disturbance applied to the held body during HOLD only.
 
@@ -520,9 +520,9 @@ recovers the paper's "fragile point-contact grasp" intuition without
 relying on MuJoCo's box-vs-box specialisation.
 
 ```
-uv run --extra dev cslc_v1/squeeze_test.py --mode squeeze --object book
-uv run --extra dev cslc_v1/squeeze_test.py --mode squeeze --object book --book-as-mesh
-uv run --extra dev python cslc_v1/_validation_logs/sweep_book_disturbances.py
+uv run --extra dev cslc_mujoco/squeeze_test.py --mode squeeze --object book
+uv run --extra dev cslc_mujoco/squeeze_test.py --mode squeeze --object book --book-as-mesh
+uv run --extra dev python cslc_mujoco/_validation_logs/sweep_book_disturbances.py
 ```
 
 ### Active contacts — what the column actually means
@@ -540,7 +540,7 @@ apples-to-oranges.
 `calibrate_kc` defaults to `per_pad=True`: each pad's aggregate stiffness
 at uniform contact equals `ke_bulk`, regardless of pad count.
 `recalibrate_cslc_kc_per_pad(model, contact_fraction)` (now in
-`cslc_v1/common.py`) overrides `kc` so the active-contact count
+`cslc_mujoco/common.py`) overrides `kc` so the active-contact count
 matches the calibration prior.  Without this override, the handler
 default `cf=0.3` under-estimates the active count for sphere targets
 (only ~5/189 spheres active at 1 mm Hertzian pen) and each pad
@@ -594,7 +594,7 @@ lift.
 
 ---
 
-## 2. Lift test (`cslc_v1/lift_test.py`)
+## 2. Lift test (`cslc_mujoco/lift_test.py`)
 
 ### Scene
 
@@ -606,11 +606,11 @@ LIFT 1.5 s, HOLD 1.0 s. Total 2250 steps @ 2 ms.
 
 ```
 # Headless comparison (all three models):
-uv run cslc_v1/lift_test.py --mode headless --contact-models point,cslc,hydro
+uv run cslc_mujoco/lift_test.py --mode headless --contact-models point,cslc,hydro
 
 # Viewer:
-uv run cslc_v1/lift_test.py --viewer gl --contact-model cslc
-uv run cslc_v1/lift_test.py --viewer gl --contact-model cslc --start-gripped
+uv run cslc_mujoco/lift_test.py --viewer gl --contact-model cslc
+uv run cslc_mujoco/lift_test.py --viewer gl --contact-model cslc --start-gripped
 ```
 
 ### Tuning parameters (shared and per-model)
@@ -676,7 +676,7 @@ was 2× too soft (`kh_eff = kh/2` after the
 Reproduce (fair-calibration values are now the defaults, so no
 overrides needed):
 ```
-uv run cslc_v1/lift_test.py --mode headless \
+uv run cslc_mujoco/lift_test.py --mode headless \
     --contact-models point,cslc,hydro
 ```
 
@@ -907,7 +907,7 @@ irreducible per-step constraint compliance for this pad geometry.
 Re-measured 2026-04-20 on the current squeeze scene (default params,
 hydro_mujoco). `Squeeze z-drop` is the legacy `FullDrop = z[0] - min(z)`.
 `HoldCreep` is the second-half-of-HOLD mean velocity (positive = falling).
-All five runs reproduced via `cslc_v1/_validation_logs/sweep_kh_stability.py`.
+All five runs reproduced via `cslc_mujoco/_validation_logs/sweep_kh_stability.py`.
 
 | kh [Pa] | FullDrop | HoldDrop | HoldCreep | Peak contacts | Notes |
 |---|---|---|---|---|---|
@@ -1166,7 +1166,7 @@ Two paired changes to `cslc_kernels.py` / `cslc_handler.py`:
 
 ### 4.4c `apply_external_wrench` layout bug (FIXED 2026-05-03)
 
-`cslc_v1/common.py:apply_external_wrench` was writing the wrench in
+`cslc_mujoco/common.py:apply_external_wrench` was writing the wrench in
 `[torque, force]` order — opposite to Newton's actual
 `wp.spatial_vector(force, torque)` convention used by both
 `semi_implicit/kernels_contact.py:261` (`wp.spatial_vector(f_total,
@@ -1200,7 +1200,7 @@ the metric values without cross-checking against the disturbance
 label.  Going forward, any new disturbance entries should include a
 predicted-vs-observed sanity check.
 
-### 4.5 Smoothness / differentiability coverage (verified by `cslc_v1/smooth_basic_test.py`, 33 tests)
+### 4.5 Smoothness / differentiability coverage (verified by `cslc_mujoco/smooth_basic_test.py`, 33 tests)
 
 The paper's "differentiable everywhere" claim is supported by replacing
 every hard `[·]_+` / `H(·)` in the CSLC math with C^∞ surrogates
@@ -1252,7 +1252,7 @@ jumps in the active transition band.
 
 Run with:
 ```
-uv run --extra dev python -m unittest cslc_v1.smooth_basic_test -v
+uv run --extra dev python -m unittest cslc_mujoco.smooth_basic_test -v
 ```
 
 ---
@@ -1425,7 +1425,7 @@ Remaining follow-ups:
     joint target_kd (addresses #1 only).
   - `semi_implicit/solver_semi_implicit.py`: thread `dt` into
     `eval_body_joint_forces`.
-  - `cslc_v1/lift_test.py`: `kinematic_pads=True` path — pads become
+  - `cslc_mujoco/lift_test.py`: `kinematic_pads=True` path — pads become
     `is_kinematic=True` free-joint root bodies, pose/velocity written
     directly each step via a new `set_pad_kinematic_state` helper. Auto-
     enabled when `--solver semi`. This sidesteps #1 and #2 entirely by
@@ -1604,7 +1604,7 @@ without re-tuning per scene).
     `_launch_vs_sphere` for box targets; `CSLCShapePair` cached fields
     `other_local_xform` (full transform) + `other_half_extents`;
     `supported_pairs` filter now includes `_GEOTYPE_BOX`.
-- `cslc_v1/common.py` (new in 2026-04-26 refactor) — shared helpers
+- `cslc_mujoco/common.py` (new in 2026-04-26 refactor) — shared helpers
   for squeeze/lift/robot tests: `make_solver`, `count_active_contacts`,
   `read_cslc_state`, `recalibrate_cslc_kc_per_pad`,
   `apply_external_wrench`, `inspect_model`, `get_cslc_lattice_viz_data`.
@@ -1612,7 +1612,7 @@ without re-tuning per scene).
   `body_f[0:3] = force, body_f[3:6] = torque` (matches Newton's
   `wp.spatial_vector(force, torque)` convention).  Was previously
   swapped — see §4.4c.
-- `cslc_v1/squeeze_test.py` — 3-way comparison wired via
+- `cslc_mujoco/squeeze_test.py` — 3-way comparison wired via
   `--contact-models`; HOLD-phase metrics (`hold_drop_mm`,
   `hold_creep_rate_mm_per_s`).  Held target selectable via
   **`--object {sphere,book}`** — book mode exercises the box kernels
@@ -1633,19 +1633,19 @@ without re-tuning per scene).
   Helper `_make_box_mesh(hx, hy, hz)` builds a CCW-from-outside
   12-triangle box `newton.Mesh` (verified by `_validation_logs/
   sweep_book_disturbances.py`).
-- `cslc_v1/lift_test.py` — 3-way comparison; per-pad kc recalibration with
+- `cslc_mujoco/lift_test.py` — 3-way comparison; per-pad kc recalibration with
   cf=0.025 via `recalibrate_cslc_kc_per_pad`; `--cslc-ka` / `--cslc-contact-fraction` / `--kh` CLI overrides; per-step timing diagnostic.
-- `cslc_v1/cslc_box_test.py` (new 2026-04-26) — 12 tests for the box
+- `cslc_mujoco/cslc_box_test.py` (new 2026-04-26) — 12 tests for the box
   kernels: SDF analytical (7), K1 contact-active gate (4) regressing
   the d_proj sign-flip bug, and one full-pipeline aggregate-force test
   on the book scene.  Run via
-  `uv run --extra dev -m unittest cslc_v1.cslc_box_test -v`.
-- `cslc_v1/_validation_logs/sweep_book_disturbances.py` (new 2026-05-03)
+  `uv run --extra dev -m unittest cslc_mujoco.cslc_box_test -v`.
+- `cslc_mujoco/_validation_logs/sweep_book_disturbances.py` (new 2026-05-03)
    — disturbance sweep across (BOX book, MESH book, SPHERE-pad book) ×
    (point, cslc, hydro) × {none, τ_y=1, τ_y=5, τ_x=5, τ_z=5, F_z=−2}.
    Source of the §1 "Disturbance sweep — three baselines" tables.
    Expected runtime ~3 min on RTX 3070.
-- `cslc_v1/_validation_logs/sweep_book_disturbance_curves.py` (new 2026-05-03)
+- `cslc_mujoco/_validation_logs/sweep_book_disturbance_curves.py` (new 2026-05-03)
    — magnitude sweep across all 6 disturbance axes × 3 contact models
    on the BOX-on-BOX book scene, exposing the failure curves
    (continuous tilt-vs-magnitude, ejection thresholds).  189-row CSV

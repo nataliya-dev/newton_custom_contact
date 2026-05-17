@@ -39,16 +39,16 @@ Flags
 Usage
 ─────
   # Live viewer — full cycle (approach → squeeze → lift → hold):
-  uv run cslc_v1/lift_test.py --viewer gl --contact-model cslc
-  uv run cslc_v1/lift_test.py --viewer gl --contact-model point
+  uv run cslc_mujoco/lift_test.py --viewer gl --contact-model cslc
+  uv run cslc_mujoco/lift_test.py --viewer gl --contact-model point
 
   # Skip to lift phase immediately (no approach/squeeze transient):
-  uv run cslc_v1/lift_test.py --viewer gl --contact-model cslc --start-gripped
-  uv run cslc_v1/lift_test.py --viewer gl --contact-model cslc --start-gripped --no-ground
+  uv run cslc_mujoco/lift_test.py --viewer gl --contact-model cslc --start-gripped
+  uv run cslc_mujoco/lift_test.py --viewer gl --contact-model cslc --start-gripped --no-ground
 
   # Headless batch comparison (both models, prints summary):
-  uv run cslc_v1/lift_test.py --mode headless
-  uv run cslc_v1/lift_test.py --mode headless --solver semi
+  uv run cslc_mujoco/lift_test.py --mode headless
+  uv run cslc_mujoco/lift_test.py --mode headless --solver semi
 """
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ import newton
 import newton.examples
 from newton import JointTargetMode
 
-from cslc_v1.common import (
+from cslc_mujoco.common import (
     CSLC_FLAG,
     HAS_MUJOCO,
     _SEP,
@@ -154,7 +154,7 @@ class SceneParams:
     drive_kd: float = 1.0e3
 
     # CSLC tuning — matched to squeeze_test.py and the fair-calibration
-    # derivation in §2 of cslc_v1/summary.md.  Under the H1 three-spring
+    # derivation in §2 of cslc_mujoco/summary.md.  Under the H1 three-spring
     # series (anchor, contact, target), the recalibration formula
     # `1/kc = N/ke_bulk − 1/ka − 1/ke_target` requires ka above the
     # threshold ke_bulk/(N − ke_bulk/ke_target) ≈ 16667 to admit a
@@ -183,7 +183,7 @@ class SceneParams:
     # get_effective_stiffness in sdf_hydroelastic.py).  With both bodies
     # at the same kh, kh_eff = kh/2, so kh = 2·ke_bulk/A_patch.
     # At r=30 mm sphere on flat pad, A_patch ≈ π·(2·r·pen) = 188 mm²,
-    # so kh = 2·5e4 / 1.88e-4 = 5.3e8 Pa.  See §2 in cslc_v1/summary.md.
+    # so kh = 2·5e4 / 1.88e-4 = 5.3e8 Pa.  See §2 in cslc_mujoco/summary.md.
     kh: float = 5.3e8
     sdf_resolution: int = 64
 
@@ -636,7 +636,7 @@ def set_pad_targets(control, step, p: SceneParams, dof_map, debug=False):
 
 # `count_active_contacts`, `recalibrate_cslc_kc_per_pad`,
 # `read_cslc_state`, `_quat_rotate`, `get_cslc_lattice_viz_data`,
-# `inspect_model`, and `make_solver` all live in cslc_v1.common.
+# `inspect_model`, and `make_solver` all live in cslc_mujoco.common.
 
 
 # ── Headless runner ───────────────────────────────────────────────────────

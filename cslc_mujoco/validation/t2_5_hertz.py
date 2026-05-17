@@ -61,7 +61,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import warp as wp
 
-from cslc_v1.validation.t2_indenter import (
+from cslc_mujoco.validation.t2_indenter import (
     T2Scene,
     build_t2_model_cslc,
     measure_one,
@@ -178,7 +178,7 @@ def run_cslc_at_target(target: TargetMaterial, scene: T2Scene,
 def t2_5_main() -> None:
     wp.init()
     np.set_printoptions(precision=6, suppress=True)
-    out_dir = "cslc_v1/validation/figures"
+    out_dir = "cslc_mujoco/validation/figures"
 
     deltas_mm = np.array([0.1, 0.25, 0.5, 1.0, 2.0, 4.0])
     deltas = deltas_mm * 1e-3

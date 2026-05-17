@@ -41,7 +41,7 @@ Layout
 
 Run
 ---
-    uv run --extra dev -m unittest cslc_v1.smooth_basic_test -v
+    uv run --extra dev -m unittest cslc_mujoco.smooth_basic_test -v
 """
 
 from __future__ import annotations

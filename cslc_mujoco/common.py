@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared helpers for cslc_v1's squeeze, lift, and robot examples.
+"""Shared helpers for cslc_mujoco's squeeze, lift, and robot examples.
 
 Everything here is CSLC-specific scaffolding that was being duplicated
 across `squeeze_test.py`, `lift_test.py`, and `robot_example/utils.py`

@@ -138,10 +138,10 @@ profile p(r), which is the focus of stage 3.
 ## Reproducibility
 
 ```
-uv run --extra dev python cslc_v1/validation/t2_indenter.py
+uv run --extra dev python cslc_mujoco/validation/t2_indenter.py
 ```
 
-Outputs (in cslc_v1/validation/figures/):
+Outputs (in cslc_mujoco/validation/figures/):
 - t2_stage1_heatmap.png             -- per-sphere force at the demo point
 - t2_stage1_F_vs_delta.png          -- single-regime sweep
 - t2_stage1_F_vs_delta_both.png     -- both regimes overlaid
