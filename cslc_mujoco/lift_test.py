@@ -505,7 +505,7 @@ def build_hydro_scene(p: SceneParams):
 
     Both pads AND the sphere need is_hydroelastic=True (PFC requires both
     bodies to carry pressure fields).  kh is the hydroelastic modulus [Pa];
-    see SceneParams.kh docstring and section 9 of convo_april_19.md.
+    see SceneParams.kh
     """
     pad_cfg = newton.ModelBuilder.ShapeConfig(
         ke=p.ke, kd=p.kd, kf=p.kf, mu=p.mu, gap=0.002, density=p.pad_density,
@@ -731,8 +731,9 @@ def test_headless(p, solver_name, contact_models=None):
     print(f"  {_SEP}")
     for m in results:
         lifted_s = 'YES' if m.lifted else 'NO'
-        held_s   = 'YES' if m.held   else 'NO'
-        print(f"  {m.name:<24} {m.max_z:8.4f} {m.final_z:8.4f} {lifted_s:>8} {held_s:>8}")
+        held_s = 'YES' if m.held else 'NO'
+        print(
+            f"  {m.name:<24} {m.max_z:8.4f} {m.final_z:8.4f} {lifted_s:>8} {held_s:>8}")
 
 
 # ── Viewer mode ───────────────────────────────────────────────────────────
@@ -985,7 +986,8 @@ def main():
         args = parser.parse_args()
         sn = args.solver if HAS_MUJOCO or args.solver != "mujoco" else "semi"
         cm_arg = getattr(args, "contact_models", None)
-        cm_list = [c.strip() for c in cm_arg.split(",") if c.strip()] if cm_arg else None
+        cm_list = [c.strip() for c in cm_arg.split(
+            ",") if c.strip()] if cm_arg else None
         scene_kwargs = dict(
             no_ground=getattr(args, "no_ground", False),
             start_gripped=getattr(args, "start_gripped", False),
@@ -994,7 +996,8 @@ def main():
         if getattr(args, "cslc_ka", None) is not None:
             scene_kwargs["cslc_ka"] = float(args.cslc_ka)
         if getattr(args, "cslc_contact_fraction", None) is not None:
-            scene_kwargs["cslc_contact_fraction"] = float(args.cslc_contact_fraction)
+            scene_kwargs["cslc_contact_fraction"] = float(
+                args.cslc_contact_fraction)
         if getattr(args, "kh", None) is not None:
             scene_kwargs["kh"] = float(args.kh)
         test_headless(SceneParams(**scene_kwargs), sn, contact_models=cm_list)

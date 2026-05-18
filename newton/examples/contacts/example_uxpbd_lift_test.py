@@ -41,61 +41,95 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
+import trimesh
 import warp as wp
 
 import newton
 import newton.examples
 from newton import JointTargetMode
 
+# Curved-pad asset bundle (a convex "scoop" mesh + a MorphIt sphere packing
+# baked from that mesh) and a unit-sphere asset (mesh + MorphIt packing) for
+# the grasped object. Both live at the repo root, not in
+# newton/examples/assets, because they're specific to this contact study.
+# pad_5x.obj + pad.json are at native 5x scale (~10 cm wide, 5 cm curve
+# depth). sphere.json packs a unit sphere; we rescale at load time to
+# match SceneParams.obj_radius.
+_ASSETS_DIR = Path(__file__).resolve().parents[3] / "assets"
+_PAD_ASSET_DIR = _ASSETS_DIR / "pad"
+_SPHERE_ASSET_DIR = _ASSETS_DIR / "sphere"
+
 
 @dataclass
 class SceneParams:
     """All knobs for the gripper lift scene."""
 
-    # --- Object (SM-rigid sphere-packed cube grasped by the pads) ---
-    # Identical to the cube in example_uxpbd_lattice_stack: 4x4x4 sphere
-    # packing inscribed in a CUBE_HALF_EXTENT cube, mass from default
-    # density (1000 kg/m^3 * (2*0.04)^3 = 0.512 kg).
-    obj_half_extent: float = 0.04
-    obj_sphere_r: float = 0.012
-    obj_n: int = 4
-    obj_mass: float = 0.512
+    # --- Object (SM-rigid ball: MorphIt sphere packing from sphere.json) ---
+    # A spherical sphere-packed SM-rigid body. Loads the 125-sphere
+    # MorphIt packing of a unit sphere from assets/sphere/sphere.json and
+    # rescales centers + radii at load time so the outer envelope has
+    # radius `obj_radius`.
+    #
+    # Size is set to 4 cm radius (8 cm diameter) -- the same scale as
+    # example_uxpbd_particle_drop, which is the proven-stable regime for
+    # SM-rigid + ground contact. A smaller ball (1.2 cm) was tried
+    # first to fit a tighter pad gap, but SVD-based rotation extraction
+    # in the shape-matching kernel is numerically unstable at cm-scale:
+    # covariance entries scale as r^2 while SVD noise is roughly
+    # absolute, so a symmetric rest pose produces a spurious R != I that
+    # drives m/s-scale internal velocity dispersion during pure free-
+    # fall. At r=4 cm the SM signal dominates the noise and free-fall
+    # stays perfectly rigid.
+    obj_radius: float = 0.04       # outer envelope radius [m]
+    # total mass distributed over 125 spheres [kg]
+    obj_mass: float = 1.0
 
-    # --- Pads (thin boxes; lattice baked into the volume) ---
-    # Pad face (Y, Z extents) matches the object's half-extent so the
-    # lattice covers the full face. The pad is intentionally thin along
-    # the approach axis: pad_lattice_sphere_r > pad_hx so the lattice
-    # spheres protrude past the pad's inner X face. This is required
-    # functionally (SolverUXPBD has no shape-vs-shape contact path; the
-    # collision box is purely for inertia) and visually (the spheres
-    # poke through the rendered box surface, so they're easy to see).
-    pad_hx: float = 0.01
-    pad_hy: float = 0.04
-    pad_hz: float = 0.04
-    # Slightly bigger than obj_sphere_r so the lattice protrudes past
-    # the pad mesh and engages object particles even under tiny squeeze
-    # depths.
-    pad_lattice_sphere_r: float = 0.014
-    # nx=1 puts a single sphere layer at the pad's X center plane; with
-    # pad_lattice_sphere_r > pad_hx the sphere extends past both X faces.
-    pad_lattice_nx: int = 1
-    pad_lattice_ny: int = 4
-    pad_lattice_nz: int = 4
-    # Pad body spawn height. Picked so the lattice bottom sits ~2 cm
-    # above ground (no dragging). With pad_hz = 0.04 and
-    # pad_lattice_sphere_r = 0.014:
-    #   lattice bottom_z = pad_z0 - (pad_hz - r) - r = pad_z0 - pad_hz.
-    pad_z0: float = 0.06
+    # --- Pads (curved scoop mesh + baked sphere packing) ---
+    # Geometry comes from assets/pad/pad_5x.obj and assets/pad/pad.json.
+    # In the pad's body frame the mesh is a half-disk: flat back at
+    # z = 0, convex peak at z = +pad_curve_depth, extending +/- 5 cm
+    # in the orthogonal X and Y axes. The MorphIt sphere centers in
+    # pad.json live in the same body frame.
+    #
+    # Each pad is pre-rotated (mesh vertices and lattice centers, in
+    # NumPy at build time) so its convex face points toward the grasped
+    # object: body +Z -> world +X for the left pad, body +Z -> world -X
+    # for the right pad. The articulated body itself stays at identity
+    # orientation through the prismatic joint chain, which keeps the
+    # joint axes (world X for approach, world Z for lift) aligned with
+    # the world axes.
+    pad_curve_depth: float = 0.05      # max body-z of pad_5x.obj == distance
+    # from body origin to the curved peak
+    # Pad body spawn height. Centered on the object's equator after
+    # settle (ball center z = obj_radius = 0.04). The pad mesh and
+    # lattice span roughly +/- 5 cm vertically after pre-rotation, so
+    # placing them at the ball center brackets the equator where the
+    # grip has the strongest moment arm.
+    pad_z0: float = 0.04
 
     # --- Phase timing ---
+    # SETTLE:   pads stationary, ball free-falls and settles on the ground.
     # APPROACH: pads move inward from `approach_gap` to the object surface.
     # SQUEEZE:  pads press an additional `squeeze_depth` past the surface.
     # LIFT:     pads rise together with a smooth velocity ramp.
     # HOLD:     pads stationary at the lifted height.
-    approach_gap: float = 0.14
+    # The SETTLE phase exists because a direct spawn-tangent-to-ground
+    # SM-rigid initialisation is unstable: with ~3 g per particle, even
+    # a sub-mm shape-matching correction maps to ~1 m/s velocity, and
+    # only 4 particles in the sphere-masked bottom layer means contact
+    # bias gets amplified into lateral runaway. Free-falling from a few
+    # cm lets the SM-rigid cluster settle into ground contact with the
+    # solver iterating over the impact instead of starting fused.
+    settle_duration: float = 0.5
+    # Gap between the two pads' inner faces at t=0. Needs to clear the
+    # ball diameter (2 * obj_radius = 8 cm) with margin so the curved
+    # pad faces start well clear of the ball.
+    approach_gap: float = 0.20
     approach_duration: float = 1.0
     squeeze_depth: float = 0.002
     squeeze_duration: float = 0.5
@@ -112,16 +146,25 @@ class SceneParams:
     # --- Friction ---
     # mu_eff in the kernels = 0.5 * (particle_mu + shape_material_mu).
     # Setting both ends to the same value yields exactly this mu_eff.
-    mu: float = 0.5
+    # The curved pad presents only a thin band of lattice spheres to
+    # the small ball -- few contact pairs, so each needs a high friction
+    # coefficient to carry its share of the load.
+    mu: float = 1.0
 
     # --- Joint drive ---
     drive_ke: float = 5.0e4   # position stiffness
     drive_kd: float = 1.0e3   # velocity damping
 
     # --- Integration ---
+    # Matches example_uxpbd_particle_drop's working SM-rigid + ground
+    # configuration (8 iterations, shock_propagation_k=1.0). Fewer
+    # iterations leak SM corrections into velocity faster than friction
+    # can clamp them; lower shock propagation means contact impulses
+    # don't propagate to the rest of the cluster in one substep.
     fps: int = 100
     sim_substeps: int = 16
-    solver_iterations: int = 4
+    solver_iterations: int = 8
+    shock_propagation_k: float = 1.0
 
     @property
     def frame_dt(self) -> float:
@@ -133,8 +176,8 @@ class SceneParams:
 
     @property
     def approach_speed(self) -> float:
-        # Travel = (approach_gap/2) - obj_half_extent in `approach_duration`.
-        travel = (self.approach_gap / 2.0) - self.obj_half_extent
+        # Travel = (approach_gap/2) - obj_radius in `approach_duration`.
+        travel = (self.approach_gap / 2.0) - self.obj_radius
         return travel / self.approach_duration
 
     @property
@@ -143,8 +186,9 @@ class SceneParams:
 
     @property
     def total_frames(self) -> int:
-        return int((self.approach_duration + self.squeeze_duration
-                    + self.lift_duration + self.hold_duration) * self.fps)
+        return int((self.settle_duration + self.approach_duration
+                    + self.squeeze_duration + self.lift_duration
+                    + self.hold_duration) * self.fps)
 
 
 def _pad_target_xz(step: int, p: SceneParams) -> tuple[float, float]:
@@ -154,6 +198,12 @@ def _pad_target_xz(step: int, p: SceneParams) -> tuple[float, float]:
     pad (left pad uses +dx, right pad uses -dx; both use +dz).
     """
     t = step * p.sim_dt
+
+    # SETTLE: pads frozen at spawn while the ball free-falls onto the
+    # ground. Shifts every later phase by `settle_duration`.
+    if t < p.settle_duration:
+        return 0.0, 0.0
+    t -= p.settle_duration
 
     if t < p.approach_duration:
         return p.approach_speed * t, 0.0
@@ -195,70 +245,94 @@ class Example:
         builder = newton.ModelBuilder(up_axis="Z")
         builder.add_ground_plane()
 
-        # ----- Object: SM-rigid sphere-packed cube, free-floating ------
-        # Spawn at the object's rest height (bottom particle bottom_z = 0
-        # touches ground). This avoids a long free fall before the pads
-        # close on the object.
-        #   bottom particle center_z (body frame) = -(h - r) = -0.028
-        #   ground contact at obj_z - 0.028 - r = 0  =>  obj_z = h = 0.04.
-        obj_z = self.p.obj_half_extent
-        obj_coords = np.linspace(
-            -self.p.obj_half_extent + self.p.obj_sphere_r,
-            self.p.obj_half_extent - self.p.obj_sphere_r,
-            self.p.obj_n,
-        )
-        oxs, oys, ozs = np.meshgrid(
-            obj_coords, obj_coords, obj_coords, indexing="ij")
-        obj_centers = np.stack(
-            [oxs.flatten(), oys.flatten(), ozs.flatten()], axis=1).astype(np.float32)
-        obj_radii = np.full(
-            obj_centers.shape[0], self.p.obj_sphere_r, dtype=np.float32)
+        # ----- Object: SM-rigid sphere-packed ball, free-falling -------
+        # Load the MorphIt packing of a unit sphere and rescale so the
+        # outer envelope has radius `obj_radius`. native_envelope is the
+        # furthest reach of any sub-sphere surface from the body origin
+        # (max_i(|c_i| + r_i)); dividing into obj_radius gives the
+        # uniform scale that turns the unit packing into a ball of the
+        # requested radius. This replaces the hand-built n^3 grid +
+        # sphere mask used previously, which produced an asymmetric
+        # bottom layer (4 particles) and exposed a small-scale SM-rigid
+        # instability.
+        #
+        # The ball is spawned ~4 cm above the ground so it free-falls
+        # into contact during the SETTLE phase. A spawn near the ground
+        # is unstable: SM-rigid shape matching fights the ground
+        # constraint at t=0 and the cluster develops m/s-scale internal
+        # velocity dispersion. Working reference: example_uxpbd_particle_drop.
+        with open(_SPHERE_ASSET_DIR / "sphere.json") as f:
+            sphere_data = json.load(f)
+        native_centers = np.asarray(sphere_data["centers"], dtype=np.float32)
+        native_radii = np.asarray(sphere_data["radii"], dtype=np.float32)
+        native_masses = np.asarray(sphere_data["masses"], dtype=np.float32)
+        native_envelope = float(
+            (np.linalg.norm(native_centers, axis=1) + native_radii).max())
+        obj_scale = self.p.obj_radius / native_envelope
+        obj_centers = (native_centers * obj_scale).astype(np.float32)
+        obj_radii = (native_radii * obj_scale).astype(np.float32)
+        obj_z = self.p.obj_radius + 0.04
         self.obj_group = builder.add_particle_volume(
             volume_data={"centers": obj_centers.tolist(),
                          "radii": obj_radii.tolist()},
             total_mass=self.p.obj_mass,
             pos=wp.vec3(0.0, 0.0, obj_z),
         )
+        # Override add_particle_volume's volume-weighted mass distribution
+        # with MorphIt's physics-optimised per-particle masses from
+        # sphere.json. MorphIt jointly tunes per-sphere mass + position to
+        # minimise the discrepancy between the packing and the true
+        # sphere's mass / COM / inertia; the JSON's masses array carries
+        # that optimisation. Volume weighting (m_i ~ r_i^3) discards it.
+        # We rescale so the total still equals obj_mass.
+        mass_scale = self.p.obj_mass / float(native_masses.sum())
+        obj_masses = (native_masses * mass_scale).astype(np.float32)
+        for idx, m in zip(builder.particle_groups[self.obj_group], obj_masses):
+            builder.particle_mass[idx] = float(m)
 
         # ----- Two articulated pads -----------------------------------
         # Each pad: world --[prismatic X]--> slider --[prismatic Z]--> pad.
         # Slider is a massless intermediate link (no collision).
-        # The pad body carries the contact box AND the kinematic lattice.
+        # The pad body carries the curved scoop mesh AND the kinematic
+        # lattice; both are pre-rotated so the convex face points inward.
         #
-        # Pads start at x = +/- (approach_gap/2 + pad_hx) so the pad inner
-        # face is at +/- approach_gap/2 at t=0, then prismatic-X moves
-        # them inward by `dx` from _pad_target_xz.
-        lx0 = -(self.p.approach_gap / 2.0 + self.p.pad_hx)
-        rx0 = +(self.p.approach_gap / 2.0 + self.p.pad_hx)
+        # Pads start at x = +/- (approach_gap/2 + pad_curve_depth) so the
+        # peak of the convex face is at +/- approach_gap/2 at t=0, then
+        # prismatic-X moves them inward by `dx` from _pad_target_xz.
+        lx0 = -(self.p.approach_gap / 2.0 + self.p.pad_curve_depth)
+        rx0 = +(self.p.approach_gap / 2.0 + self.p.pad_curve_depth)
         pad_z0 = self.p.pad_z0
 
-        # Lattice particle layout (in pad body frame). nx=1 places a
-        # single sphere layer at the pad's X center (the natural choice
-        # when sphere_r >= pad_hx, which is the case here -- np.linspace
-        # would produce an inverted interval otherwise).
-        if self.p.pad_lattice_nx == 1:
-            lx_c = np.array([0.0], dtype=np.float32)
-        else:
-            lx_c = np.linspace(
-                -self.p.pad_hx + self.p.pad_lattice_sphere_r,
-                self.p.pad_hx - self.p.pad_lattice_sphere_r,
-                self.p.pad_lattice_nx,
-            )
-        ly_c = np.linspace(
-            -self.p.pad_hy + self.p.pad_lattice_sphere_r,
-            self.p.pad_hy - self.p.pad_lattice_sphere_r,
-            self.p.pad_lattice_ny,
-        )
-        lz_c = np.linspace(
-            -self.p.pad_hz + self.p.pad_lattice_sphere_r,
-            self.p.pad_hz - self.p.pad_lattice_sphere_r,
-            self.p.pad_lattice_nz,
-        )
-        lxs, lys, lzs = np.meshgrid(lx_c, ly_c, lz_c, indexing="ij")
-        pad_centers = np.stack(
-            [lxs.flatten(), lys.flatten(), lzs.flatten()], axis=1).astype(np.float32)
-        pad_radii = np.full(
-            pad_centers.shape[0], self.p.pad_lattice_sphere_r, dtype=np.float32)
+        # Load the pad scoop mesh and the MorphIt sphere packing baked
+        # from that same mesh. Both arrays live in the same body frame
+        # at native 5x scale (~10 cm wide, 5 cm curve depth); see
+        # pad.json's metadata ("mesh_path": ".../pad_5x.obj").
+        raw_mesh = trimesh.load(_PAD_ASSET_DIR / "pad_5x.obj", force="mesh")
+        pad_mesh_verts = np.asarray(raw_mesh.vertices, dtype=np.float32)
+        pad_mesh_indices = np.asarray(raw_mesh.faces.flatten(), dtype=np.int32)
+
+        with open(_PAD_ASSET_DIR / "pad.json") as f:
+            pad_lattice_data = json.load(f)
+        pad_lattice_centers = np.asarray(
+            pad_lattice_data["centers"], dtype=np.float32)
+        pad_lattice_radii = np.asarray(
+            pad_lattice_data["radii"], dtype=np.float32)
+
+        # Body-to-world rotations baked into the mesh and lattice. A
+        # rotation of +/- 90 deg about the world Y axis sends the convex-
+        # face normal (body +Z) to world +/- X. Applying the rotation in
+        # NumPy keeps the articulated body itself at identity orientation,
+        # which preserves the prismatic joint axes (world X and Z).
+        #
+        #   R(Y, +90) . (0,0,1) = (+1,0,0)   left pad faces +X (center)
+        #   R(Y, -90) . (0,0,1) = (-1,0,0)   right pad faces -X (center)
+        R_left = np.array(
+            [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]],
+            dtype=np.float32)
+        R_right = np.array(
+            [[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+            dtype=np.float32)
+        pad_rotations = {"left": R_left, "right": R_right}
 
         # Ghost config for the slider's stub geometry (no collision, no mass).
         ghost_cfg = newton.ModelBuilder.ShapeConfig(
@@ -270,7 +344,20 @@ class Example:
         self.dof = {}            # label -> qd index
         self.pad_bodies = []     # [left_pad_body, right_pad_body]
 
-        for label, x0 in [("left", lx0), ("right", rx0)]:
+        # Debug staging: --num-pads lets us isolate the SM-rigid ball,
+        # then a single inward-pressing pad, then the full grasp. Slice
+        # the spec list rather than wrapping the build loop in an if.
+        pad_specs = [("left", lx0), ("right", rx0)][: args.num_pads]
+        for label, x0 in pad_specs:
+            R = pad_rotations[label]
+            # Pre-rotate mesh vertices and lattice centers into the body
+            # frame the pad will actually use at runtime. .copy() is
+            # required by newton.Mesh / add_lattice to get contiguous
+            # float32 buffers from the transposed view.
+            verts_rot = (pad_mesh_verts @ R.T).astype(np.float32, copy=True)
+            centers_rot = (pad_lattice_centers @
+                           R.T).astype(np.float32, copy=True)
+
             slider = builder.add_link(
                 xform=wp.transform((x0, 0.0, pad_z0), wp.quat_identity()),
                 mass=0.01,
@@ -278,21 +365,23 @@ class Example:
             )
             builder.add_shape_sphere(slider, radius=0.001, cfg=ghost_cfg)
 
-            # mass=0.0: the shape box density carries both mass and inertia
-            # consistently (see example_uxpbd_lattice_stack.py NOTE for the
-            # add_body(mass=m) + add_shape_box double-counting gotcha).
+            # mass=0.0: the shape mesh density carries both mass and
+            # inertia consistently (see example_uxpbd_lattice_stack.py
+            # NOTE for the add_body(mass=m) + add_shape_* double-counting
+            # gotcha).
             pad = builder.add_link(
                 xform=wp.transform((x0, 0.0, pad_z0), wp.quat_identity()),
                 mass=0.0,
                 label=f"{label}_pad",
             )
-            builder.add_shape_box(
-                pad,
-                hx=self.p.pad_hx, hy=self.p.pad_hy, hz=self.p.pad_hz,
-            )
+            pad_mesh = newton.Mesh(verts_rot, pad_mesh_indices)
+            builder.add_shape_mesh(pad, mesh=pad_mesh)
             builder.add_lattice(
                 link=pad,
-                morphit_json={"centers": pad_centers, "radii": pad_radii},
+                morphit_json={
+                    "centers": centers_rot,
+                    "radii": pad_lattice_radii,
+                },
                 total_mass=0.0,
                 pos=wp.vec3(x0, 0.0, pad_z0),
             )
@@ -333,13 +422,19 @@ class Example:
             np.full(self.model.shape_count, self.p.mu, dtype=np.float32))
 
         self.solver = newton.solvers.SolverUXPBD(
-            self.model, iterations=self.p.solver_iterations)
+            self.model,
+            iterations=self.p.solver_iterations,
+            stabilization_iterations=2,
+            shock_propagation_k=self.p.shock_propagation_k,
+        )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
         newton.eval_fk(self.model, self.model.joint_q,
                        self.model.joint_qd, self.state_0)
 
+        # Snapshot the SM-rigid ball's particle indices so test_final can
+        # average their z position to track the ball's height.
         obj_idx = self.model.particle_groups[self.obj_group]
         if hasattr(obj_idx, "numpy"):
             obj_idx = obj_idx.numpy()
@@ -356,17 +451,23 @@ class Example:
         # Initial state snapshot (used by test_final to measure slip and lift).
         self._obj_z0 = float(self.state_0.particle_q.numpy()[
                              self._obj_idx, 2].mean())
-        self._pad_z0 = float(self.state_0.body_q.numpy()
-                             [self.pad_bodies[0], 2])
+        self._pad_z0 = (
+            float(self.state_0.body_q.numpy()[self.pad_bodies[0], 2])
+            if self.pad_bodies else 0.0
+        )
 
     def _set_pad_targets(self):
-        """Write the prismatic-joint position targets for both pads."""
+        """Write the prismatic-joint position targets for active pads."""
+        if not self.dof:
+            return
         dx, dz = _pad_target_xz(self.sim_step, self.p)
         target = self.control.joint_target_pos.numpy()
-        target[self.dof["left_x"]] = +dx
-        target[self.dof["left_z"]] = +dz
-        target[self.dof["right_x"]] = -dx
-        target[self.dof["right_z"]] = +dz
+        if "left_x" in self.dof:
+            target[self.dof["left_x"]] = +dx
+            target[self.dof["left_z"]] = +dz
+        if "right_x" in self.dof:
+            target[self.dof["right_x"]] = -dx
+            target[self.dof["right_z"]] = +dz
         self.control.joint_target_pos.assign(
             wp.array(target, dtype=wp.float32,
                      device=self.control.joint_target_pos.device))
@@ -385,6 +486,28 @@ class Example:
     def step(self):
         self.simulate()
         self.sim_time += self.frame_dt
+        # DEBUG: object + pad telemetry (ball centroid, averaged over the
+        # SM-rigid sphere packing)
+        frame = int(round(self.sim_time * self.p.fps))
+        # Dense sampling in the first 20 frames catches the t~0 SRXPBD
+        # spike (shape-matching vs ground at the spawn); sparser cadence
+        # afterwards keeps the log readable.
+        if frame < 20 or frame % 25 == 0:
+            q = self.state_0.particle_q.numpy()[self._obj_idx]
+            v = self.state_0.particle_qd.numpy()[self._obj_idx]
+            obj = q.mean(axis=0)
+            objv = v.mean(axis=0)
+            # |v|_max reveals per-particle blow-up even when the mean
+            # cancels out (e.g. symmetric SM correction).
+            v_max = float(np.linalg.norm(v, axis=1).max())
+            msg = (f"[f={frame:03d} t={self.sim_time:.3f}] "
+                   f"obj=({obj[0]:+.4f},{obj[1]:+.4f},{obj[2]:+.4f}) "
+                   f"obj_v=({objv[0]:+.4f},{objv[1]:+.4f},{objv[2]:+.4f}) "
+                   f"|v|_max={v_max:.3f}")
+            if self.pad_bodies:
+                pad = self.state_0.body_q.numpy()[self.pad_bodies[0]]
+                msg += f" left_pad_x={pad[0]:+.4f} left_pad_z={pad[2]:+.4f}"
+            print(msg)
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
@@ -393,41 +516,96 @@ class Example:
         self.viewer.end_frame()
 
     def test_final(self):
-        # After the full APPROACH -> SQUEEZE -> LIFT -> HOLD cycle, the
-        # object should be lifted with the pads. We check:
-        #   1. The object did not fall (its z is well above its spawn).
-        #   2. Slip between object and pads is bounded (the object tracked
-        #      the pad's vertical motion within a tolerance).
-        pad_z = float(self.state_0.body_q.numpy()[self.pad_bodies[0], 2])
-        obj_z = float(self.state_0.particle_q.numpy()[self._obj_idx, 2].mean())
-
-        pad_lift = pad_z - self._pad_z0
+        obj_q = self.state_0.particle_q.numpy()[self._obj_idx]
+        obj_z = float(obj_q[:, 2].mean())
         obj_lift = obj_z - self._obj_z0
+
+        # Numerical sanity applies to every stage: catches SM-rigid
+        # shape-matching blow-ups before we look at the geometry.
+        assert np.isfinite(obj_q).all(), (
+            f"NaN/Inf in object positions (num_pads={self.args.num_pads})"
+        )
+
+        if self.args.num_pads == 0:
+            # Stage A: ball alone, free-falls onto the ground and rests.
+            # After SETTLE, the lowest sphere surface should be tangent
+            # to z=0, putting the cluster centroid at world z ~ obj_radius
+            # (lowest body-frame center = -(obj_radius - obj_sphere_r),
+            # plus obj_sphere_r to put its surface on the ground, gives
+            # cluster center z = obj_radius).
+            expected_rest_z = self.p.obj_radius
+            obj_xy = obj_q[:, :2].mean(axis=0)
+            v_max = float(np.linalg.norm(
+                self.state_0.particle_qd.numpy()[self._obj_idx], axis=1).max())
+
+            assert obj_z > 0.0, f"Ball penetrated ground: obj_z={obj_z:.4f}"
+            assert abs(obj_z - expected_rest_z) < 0.005, (
+                f"Ball did not settle to rest height: obj_z={obj_z:.4f}, "
+                f"expected ~{expected_rest_z:.4f}"
+            )
+            assert np.linalg.norm(obj_xy) < 0.005, (
+                f"Ball drifted in XY: |xy|={np.linalg.norm(obj_xy) * 1e3:.2f} mm"
+            )
+            # Loose velocity bound: per-particle |v|_max stays ~0.3-0.5
+            # m/s in steady-state observed runs (residual SM shake while
+            # the cluster is in contact with the ground). >1 m/s means
+            # the cluster isn't actually at rest.
+            assert v_max < 1.0, (
+                f"Ball still moving after SETTLE: |v|_max={v_max:.3f} m/s"
+            )
+            return
+
+        if self.args.num_pads == 1:
+            # Stage B: a single inward-pressing pad has nothing to
+            # squeeze against, so we expect the ball to be pushed
+            # sideways. Just check we did not blow up or eject.
+            assert np.linalg.norm(obj_q.mean(axis=0)) < 0.5, (
+                "Ball escaped under single-pad push"
+            )
+            return
+
+        # Stage C (default): full two-pad grasp. We check:
+        #   1. The object did not fall (its z is well above its spawn).
+        #   2. The pads did rise (sanity check on the drive).
+        #   3. Slip between object and pads is bounded (the object
+        #      tracked the pad's vertical motion within a tolerance).
+        pad_z = float(self.state_0.body_q.numpy()[self.pad_bodies[0], 2])
+        pad_lift = pad_z - self._pad_z0
         # Slip = pad-frame z drift of the object. Positive means the
         # object lagged behind the pad (slipped down through the grip).
         slip = pad_lift - obj_lift
 
-        # 1. Object did not fall through.
         assert obj_z > self._obj_z0 - 0.005, (
             f"Object dropped: obj_z={obj_z:.4f}, started at {self._obj_z0:.4f}"
         )
-        # 2. The pads did move up (sanity check on the drive).
         assert pad_lift > 0.5 * self.p.lift_speed * self.p.lift_duration, (
             f"Pads did not lift: pad_lift={pad_lift:.4f}, "
             f"expected ~{self.p.lift_speed * self.p.lift_duration:.4f}"
         )
-        # 3. Slip stays under a few mm (loose tolerance: position-based
-        # friction in UXPBD will leak some tangential motion per iteration).
+        # Loose tolerance: position-based friction in UXPBD will leak
+        # some tangential motion per iteration.
         assert abs(slip) < 0.01, (
-            f"Object slipped too much: slip={slip*1e3:.2f} mm "
-            f"(pad_lift={pad_lift*1e3:.2f} mm, obj_lift={obj_lift*1e3:.2f} mm)"
+            f"Object slipped too much: slip={slip * 1e3:.2f} mm "
+            f"(pad_lift={pad_lift * 1e3:.2f} mm, obj_lift={obj_lift * 1e3:.2f} mm)"
         )
 
     @staticmethod
     def create_parser():
-        return newton.examples.create_parser()
+        parser = newton.examples.create_parser()
+        parser.add_argument(
+            "--num-pads",
+            type=int,
+            default=2,
+            choices=[0, 1, 2],
+            help=(
+                "Number of pads to build. Debug helper: 0 = ball only "
+                "(check the SM-rigid object stays put on the ground), "
+                "1 = single inward-pressing pad, 2 = full grasp (default)."
+            ),
+        )
+        return parser
 
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+    viewer, args = newton.examples.init(Example.create_parser())
     newton.examples.run(Example(viewer, args), args)
