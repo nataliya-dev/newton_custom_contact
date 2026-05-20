@@ -1,10 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""CSLC data structures: lattice pad geometry, topology, and GPU upload.
+"""CSLC data structures: lattice geometry, topology, and GPU upload.
 
-CSLCPad: CPU-side geometry and neighbor topology for a single shape.
-CSLCData: merged GPU arrays for all pads in a simulation.
+CSLCLattice: CPU-side geometry and neighbor topology for one rigid body's
+worth of compliant-skin lattice spheres.  Generic in geometry: the caller
+provides positions / normals / edges from whatever sampling pipeline
+they choose (e.g. Poisson-disc Lloyd CVT on a mesh in
+``cslc_main/grasp``); no shape-specific helpers live here.
+
+CSLCData: merged GPU arrays for all lattices in a simulation.
 
 File location: newton/_src/geometry/cslc_data.py
 """
@@ -22,26 +27,36 @@ if TYPE_CHECKING:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  CSLCPad — CPU-side lattice geometry for one shape
+#  CSLCLattice — CPU-side lattice geometry for one rigid body
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 @dataclass
-class CSLCPad:
-    """Lattice pad for one rigid body shape.
+class CSLCLattice:
+    """Compliant-skin lattice for one rigid body shape.
+
+    Generic in geometry: callers construct ``CSLCLattice`` from whatever
+    sampling pipeline they use (e.g. Poisson-disc on a mesh).  This
+    module ships no shape-specific generators -- the box-grid helpers
+    that used to live here were removed in step 7 (see
+    ``cslc_main/theory/notes.md``).
 
     Attributes:
-        positions: (N, 3) float32 — sphere centers in shape-local frame.
-        radii: (N,) float32 — sphere radii.
-        is_surface: (N,) bool — True for spheres that participate in contact.
-        outward_normals: (N, 3) float32 — outward-pointing normal for surface
-            spheres. Interior spheres have (0,0,0). Used as the displacement
-            direction in the Jacobi solve and contact writing.
-        neighbor_indices: list of arrays — CSR neighbor lists.
-        shape_index: int — which shape in the Model this pad belongs to.
-        grid_shape: tuple — (nx, ny, nz) grid dimensions.
-        spacing: float — distance between sphere centers [m].
-        sphere_radius: float — radius of each lattice sphere [m].
+        positions: (N, 3) float32 -- sphere centres in shape-local frame.
+        radii: (N,) float32 -- sphere radii.
+        is_surface: (N,) bool -- True for spheres that participate in contact.
+        outward_normals: (N, 3) float32 -- outward-pointing normal for surface
+            spheres. Interior spheres have (0, 0, 0). Used as the displacement
+            direction in the Jacobi solve and as the local-frame basis for
+            the anisotropic-anchor decomposition in contact writing.
+        neighbor_indices: list of arrays -- per-sphere neighbour index lists
+            (one entry per sphere; each entry is an int32 numpy array of
+            neighbour sphere indices, local to this lattice).
+        shape_index: int -- which shape in the Model this lattice belongs to.
+        spacing: float -- characteristic distance between sphere centres [m].
+            Bookkeeping field used by stiffness calibration; not required by
+            the kernels.
+        sphere_radius: float -- radius of each lattice sphere [m].
     """
 
     positions: np.ndarray
@@ -50,7 +65,6 @@ class CSLCPad:
     outward_normals: np.ndarray
     neighbor_indices: list[np.ndarray]
     shape_index: int
-    grid_shape: tuple[int, int, int]
     spacing: float
     sphere_radius: float
 
@@ -63,208 +77,6 @@ class CSLCPad:
         return int(self.is_surface.sum())
 
 
-def _compute_box_outward_normals(
-    grid_indices: np.ndarray,
-    nx: int, ny: int, nz: int,
-) -> np.ndarray:
-    """Compute outward-pointing normals for surface spheres of a box grid.
-
-    For face spheres: normal points along the face axis.
-    For edge spheres: average of the two adjacent face normals, normalized.
-    For corner spheres: average of the three adjacent face normals, normalized.
-    Interior spheres get (0,0,0).
-
-    Args:
-        grid_indices: (N, 3) int array of (i, j, k) grid indices.
-        nx, ny, nz: grid dimensions.
-
-    Returns:
-        (N, 3) float32 outward normals.
-    """
-    normals = np.zeros((len(grid_indices), 3), dtype=np.float32)
-
-    for idx in range(len(grid_indices)):
-        i, j, k = grid_indices[idx]
-        n = np.zeros(3, dtype=np.float32)
-
-        # X faces
-        if i == 0:
-            n[0] -= 1.0
-        if i == nx - 1:
-            n[0] += 1.0
-
-        # Y faces
-        if j == 0:
-            n[1] -= 1.0
-        if j == ny - 1:
-            n[1] += 1.0
-
-        # Z faces
-        if k == 0:
-            n[2] -= 1.0
-        if k == nz - 1:
-            n[2] += 1.0
-
-        length = np.linalg.norm(n)
-        if length > 1e-8:
-            normals[idx] = n / length
-
-    return normals
-
-
-def create_pad_for_box(
-    hx: float,
-    hy: float,
-    hz: float,
-    *,
-    spacing: float | None = None,
-    grid_shape: tuple[int, int, int] | None = None,
-    shape_index: int = 0,
-) -> CSLCPad:
-    """Create a volumetric lattice pad for a box shape.
-
-    Fills the box interior with a regular 3D grid of spheres.
-    Surface spheres (outer layer) participate in contact. All spheres
-    participate in the Jacobi solve via neighbor coupling.
-
-    Provide either `spacing` or `grid_shape`, not both.
-
-    Args:
-        hx, hy, hz: Box half-extents [m].
-        spacing: Distance between sphere centers [m].
-        grid_shape: (nx, ny, nz) number of spheres per axis.
-        shape_index: Shape index in the Model.
-
-    Returns:
-        CSLCPad with volumetric packing and outward normals.
-    """
-    if spacing is not None and grid_shape is not None:
-        raise ValueError("Provide either spacing or grid_shape, not both.")
-    if spacing is None and grid_shape is None:
-        raise ValueError("Provide either spacing or grid_shape.")
-
-    if grid_shape is not None:
-        nx, ny, nz = grid_shape
-        spacing_val = min(
-            (2.0 * hx) / max(nx - 1, 1) if nx > 1 else 2.0 * hx,
-            (2.0 * hy) / max(ny - 1, 1) if ny > 1 else 2.0 * hy,
-            (2.0 * hz) / max(nz - 1, 1) if nz > 1 else 2.0 * hz,
-        )
-    else:
-        spacing_val = spacing
-        nx = max(int(round(2.0 * hx / spacing_val)) + 1, 2)
-        ny = max(int(round(2.0 * hy / spacing_val)) + 1, 2)
-        nz = max(int(round(2.0 * hz / spacing_val)) + 1, 2)
-
-    sphere_radius = spacing_val * 0.5
-
-    xs = np.linspace(-hx, hx, nx, dtype=np.float32)
-    ys = np.linspace(-hy, hy, ny, dtype=np.float32)
-    zs = np.linspace(-hz, hz, nz, dtype=np.float32)
-    gx, gy, gz = np.meshgrid(xs, ys, zs, indexing="ij")
-    positions = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=-1)
-    n_total = len(positions)
-
-    radii = np.full(n_total, sphere_radius, dtype=np.float32)
-
-    # Grid indices for surface/normal computation
-    grid_indices = np.mgrid[0:nx, 0:ny, 0:nz].reshape(3, -1).T
-
-    is_surface = (
-        (grid_indices[:, 0] == 0)
-        | (grid_indices[:, 0] == nx - 1)
-        | (grid_indices[:, 1] == 0)
-        | (grid_indices[:, 1] == ny - 1)
-        | (grid_indices[:, 2] == 0)
-        | (grid_indices[:, 2] == nz - 1)
-    )
-
-    # Outward normals for surface spheres
-    outward_normals = _compute_box_outward_normals(grid_indices, nx, ny, nz)
-
-    # 6-connected neighbor topology
-    def flat_idx(i: int, j: int, k: int) -> int:
-        return i * (ny * nz) + j * nz + k
-
-    neighbor_indices = []
-    for idx in range(n_total):
-        i = idx // (ny * nz)
-        j = (idx % (ny * nz)) // nz
-        k = idx % nz
-        neighbors = []
-        for di, dj, dk in [(-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)]:
-            ni, nj, nk = i + di, j + dj, k + dk
-            if 0 <= ni < nx and 0 <= nj < ny and 0 <= nk < nz:
-                neighbors.append(flat_idx(ni, nj, nk))
-        neighbor_indices.append(np.array(neighbors, dtype=np.int32))
-
-    return CSLCPad(
-        positions=positions,
-        radii=radii,
-        is_surface=is_surface,
-        outward_normals=outward_normals,
-        neighbor_indices=neighbor_indices,
-        shape_index=shape_index,
-        grid_shape=(nx, ny, nz),
-        spacing=spacing_val,
-        sphere_radius=sphere_radius,
-    )
-
-
-# Backwards compatibility
-def create_pad_for_box_face(
-    hx: float, hy: float, hz: float, *,
-    face_axis: int, face_sign: int, spacing: float, shape_index: int = 0,
-) -> CSLCPad:
-    """Create a 2D lattice pad on one face of a box (legacy API)."""
-    half_extents = [hx, hy, hz]
-    axes = [i for i in range(3) if i != face_axis]
-    a0, a1 = axes
-    h0, h1 = half_extents[a0], half_extents[a1]
-    n0 = max(int(round(2.0 * h0 / spacing)) + 1, 2)
-    n1 = max(int(round(2.0 * h1 / spacing)) + 1, 2)
-    sphere_radius = spacing * 0.5
-    face_coord = face_sign * half_extents[face_axis]
-
-    coords_0 = np.linspace(-h0, h0, n0, dtype=np.float32)
-    coords_1 = np.linspace(-h1, h1, n1, dtype=np.float32)
-    g0, g1 = np.meshgrid(coords_0, coords_1, indexing="ij")
-    g0, g1 = g0.ravel(), g1.ravel()
-    n_total = len(g0)
-
-    positions = np.zeros((n_total, 3), dtype=np.float32)
-    positions[:, face_axis] = face_coord
-    positions[:, a0] = g0
-    positions[:, a1] = g1
-
-    radii = np.full(n_total, sphere_radius, dtype=np.float32)
-    is_surface = np.ones(n_total, dtype=bool)
-
-    # Outward normal: all spheres face the same direction
-    outward_normals = np.zeros((n_total, 3), dtype=np.float32)
-    outward_normals[:, face_axis] = float(face_sign)
-
-    def flat_idx(i: int, j: int) -> int:
-        return i * n1 + j
-
-    neighbor_indices = []
-    for idx in range(n_total):
-        i, j = idx // n1, idx % n1
-        neighbors = []
-        for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            ni, nj = i + di, j + dj
-            if 0 <= ni < n0 and 0 <= nj < n1:
-                neighbors.append(flat_idx(ni, nj))
-        neighbor_indices.append(np.array(neighbors, dtype=np.int32))
-
-    return CSLCPad(
-        positions=positions, radii=radii, is_surface=is_surface,
-        outward_normals=outward_normals, neighbor_indices=neighbor_indices,
-        shape_index=shape_index, grid_shape=(n0, n1, 1),
-        spacing=spacing, sphere_radius=sphere_radius,
-    )
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 #  Stiffness calibration
 # ═══════════════════════════════════════════════════════════════════════════
@@ -272,16 +84,16 @@ def create_pad_for_box_face(
 
 def calibrate_kc(
     ke_bulk: float,
-    pads: list[CSLCPad],
+    lattices: list[CSLCLattice],
     *,
     ka: float,
     contact_fraction: float = 0.3,
-    per_pad: bool = True,
+    per_lattice: bool = True,
     ke_target: float | None = None,
 ) -> float:
     """Derive per-sphere contact stiffness kc from bulk ke.
 
-    The fair invariant is the per-pad aggregate normal stiffness at the
+    The fair invariant is the per-lattice aggregate normal stiffness at the
     operating penetration, composed across all springs in series:
 
     - **Two-spring chain (rigid target, ``ke_target=None``):** anchor
@@ -300,14 +112,30 @@ def calibrate_kc(
       Solving for ``kc`` against the same aggregate identity:
       ``1/kc = N_contact/ke_bulk - 1/ka - 1/ke_target``.
 
+    .. note:: Step 7 calibration alignment
+
+       The series-spring identity above is now an EXACT match for the
+       kernel's contact law (post-D4 deformed-centre emission +
+       smooth_step gradient factor in ``jacobi_step``).  At saturated
+       contact the kernel emits per-contact force
+       ``F = keff * phi_rest = ka*kc/(ka+kc) * phi_rest``, which is what
+       this formula already targets.  No kc migration is needed for the
+       auto-calibrated production path -- the calibration formula was
+       always solving the series-spring system; the pre-D4 kernel was
+       the broken side, applying ``kc * phi_rest`` (constant load) and
+       agreeing numerically only in the ``kc << ka`` regime.  Hand-tuned
+       scenes that set ``kc`` to match a specific force under the old
+       law would need ``kc_new = kc_old * (ka + kc_old) / ka`` to
+       approximately restore that force; this helper is exempt.
+
     Args:
-        ke_bulk: target per-pad aggregate stiffness [N/m].
-        pads: list of CSLCPads (used to count surface spheres).
+        ke_bulk: target per-lattice aggregate stiffness [N/m].
+        lattices: list of CSLCLattices (used to count surface spheres).
         ka: anchor stiffness [N/m].
         contact_fraction: estimated active-contact fraction.
-        per_pad: if True, each pad must independently aggregate to
+        per_lattice: if True, each lattice must independently aggregate to
             ke_bulk; if False, the calibration matches the sum across
-            pads.
+            lattices.
         ke_target: if provided, include the target body's contact
             stiffness in the series chain.  Use ``None`` (default) for
             the legacy rigid-target calibration.
@@ -317,13 +145,13 @@ def calibrate_kc(
         ``ke_bulk / N_contact`` when the analytic formula has no
         positive solution (under-stiff anchor or under-stiff target).
     """
-    if per_pad:
-        # Average n_surface across pads — assumes pads are roughly uniform
-        # in size. For mixed pad sizes, promote to per-shape kc storage
+    if per_lattice:
+        # Average n_surface across lattices — assumes lattices are roughly uniform
+        # in size. For mixed lattice sizes, promote to per-shape kc storage
         # in CSLCData.
-        n_surface = int(np.mean([p.n_surface for p in pads]))
+        n_surface = int(np.mean([p.n_surface for p in lattices]))
     else:
-        n_surface = sum(p.n_surface for p in pads)
+        n_surface = sum(p.n_surface for p in lattices)
     n_contact = max(int(n_surface * contact_fraction), 1)
 
     # Per-sphere effective stiffness target.
@@ -350,7 +178,7 @@ def calibrate_kc(
 
 @dataclass
 class CSLCData:
-    """GPU-resident CSLC lattice data, merged from one or more CSLCPads.
+    """GPU-resident CSLC lattice data, merged from one or more CSLCLattices.
 
     Neighbor lookups use CSR format:
         sphere i's neighbors are
@@ -364,7 +192,14 @@ class CSLCData:
     is_surface: wp.array      # (n_spheres,) int32 — 1 = surface, 0 = interior
     outward_normals: wp.array # (n_spheres,) vec3 — outward normal for surface spheres
     sphere_shape: wp.array    # (n_spheres,) int32 — shape index per sphere
-    sphere_delta: wp.array    # (n_spheres,) float32 — warm-start displacement
+    # (n_spheres,) vec3 — converged displacement of each lattice sphere
+    # from its rest position in world frame.  Deformed sphere centre is
+    # q_i = p_i_world - sphere_delta[i].  Carries the full 3-D
+    # displacement -- no scalar projection / outward-normal shim -- so
+    # tangential components survive across iterations (required for
+    # off-axis contact and stick-slip friction).  Persisted across
+    # steps to warm-start the next collide().
+    sphere_delta: wp.array
     ka: float
     kl: float
     kc: float
@@ -372,44 +207,119 @@ class CSLCData:
     neighbor_start: wp.array  # (n_spheres,) int32 — CSR row pointer
     neighbor_count: wp.array  # (n_spheres,) int32
     neighbor_list: wp.array   # (n_edges,) int32
+    # Precomputed Euclidean rest length L_ij = ‖p_j_local − p_i_local‖
+    # for each directed edge in the CSR neighbor list.  Used by the
+    # distance-preservation lateral spring in `jacobi_step`:
+    #     f_spring(i, j) = k_l · (‖q_j − q_i‖ − L_ij) · unit(q_j − q_i)
+    # where q_i = p_i_world − δ_i is the deformed centre.  Linearises
+    # to the graph-Laplacian as δ → 0 but produces geometric Poisson
+    # bulging at finite δ on curved patches (theory step 5).  Body-local
+    # rest distances are rigid-motion invariant, so they're computed once
+    # at construction.  CSR layout matches `neighbor_list`: entry k is
+    # the rest length of the edge ending at neighbour `neighbor_list[k]`.
+    neighbor_rest_length: wp.array
     # Smoothing width [m] for the differentiable surrogates of `[·]_+` and
     # the contact-active gates in cslc_kernels.py.  eps → 0 recovers the
     # original non-smooth behaviour; default 1e-5 m is essentially binary
     # above 0.1 mm penetration with C^∞ derivatives at the threshold so
     # wp.Tape can backprop through CSLC contact dynamics.
     smoothing_eps: float = 1.0e-5
-    # Dense inverse of A = K + kc·I where K is the CSLC lattice Laplacian
-    # (anchor ka on the diagonal + lateral kl coupling).  Present only when
-    # CSLCData.from_pads(..., build_A_inv=True); used by the tape-compatible
-    # `lattice_solve_equilibrium` kernel as a one-shot drop-in replacement
-    # for the iterative jacobi_step (which can't be backprop'd through
-    # because of src/dst buffer aliasing).  Solves (K + kc·I) δ = kc·φ
-    # in closed form as δ = kc · A_inv · φ — preserves full lattice
-    # physics (ka, kl, kc) in the differentiable path.  O(n_spheres²)
-    # memory; for n > ~1000 a future follow-up should replace this with
-    # a GPU sparse Cholesky factorisation plus two triangular solves.
+    # Anisotropic anchor stiffness (theory step 6).  `ka` is the NORMAL
+    # (out-of-plane) anchor stiffness -- resistance to compression
+    # along the rest outward normal.  `ka_tangent_ratio` scales it for
+    # the two in-plane (tangential) axes: ka_t = ka_tangent_ratio · ka.
+    # The flesh-like default (1/3) follows from a nearly-incompressible
+    # isotropic elastic medium (Poisson ν → 0.5), where shear modulus
+    # G = E / (2(1+ν)) → E/3.  Set to 1.0 for isotropic anchor.  Set
+    # to 0.0 for "frictionless tangent" (lattice spheres free to slide
+    # laterally, restrained only by lateral coupling).  Any positive
+    # value is supported by both the closed-form warm-start
+    # (lattice_solve_equilibrium uses A_inv_t for tangent solves) and
+    # the iterative jacobi_step.
+    ka_tangent_ratio: float = 1.0
+    # Stick-slip friction via tangential δ (theory step 4 + 6).  The
+    # compliant skin develops a tangential displacement
+    # δ_t = δ − dot(δ, n_eff)·n_eff under shear loading; this generates
+    # a friction-like force f_t = -k_stick · δ_t clamped at the
+    # Coulomb cone ‖f_t‖ ≤ μ·f_n.  In stick mode (proposed ≤ cone) the
+    # force pulls the contact patch back toward zero shear; in slip
+    # mode (proposed > cone) the magnitude saturates at the cone
+    # boundary.  Models real flesh: static friction via shear
+    # deformation BEFORE macroscopic slip.
+    #
+    # Default k_stick = ka so the tangent shear-stiffness matches the
+    # anchor's normal stiffness (reasonable starting point for
+    # flesh-like calibration; with ka_tangent_ratio = 1/3 the geometric
+    # tangent anchor is 3× softer than k_stick, so friction dominates
+    # static restraint over anchor in the tangent plane).  Set
+    # k_stick = 0 (or mu_friction = 0) to disable friction entirely.
+    k_stick: float = 25000.0
+    # Coulomb friction coefficient applied to the cone clamp.  Read at
+    # construction from the active CSLC shape's material friction in
+    # `_from_model`; falls back to the dataclass default for tests that
+    # construct CSLCData directly.  This is the friction USED BY THE
+    # LATTICE SOLVER for the stick-slip restraint — it does NOT replace
+    # MuJoCo's rigid-body friction (which still acts at the macroscopic
+    # contact, with the geom-pair μ from `shape_material_mu`).
+    mu_friction: float = 0.3
+    # Dense inverses of the lattice system matrices, applied per-axis in
+    # each sphere's local rest-normal frame.  Built only when
+    # `build_A_inv=True` is passed to `from_lattices`; consumed by
+    # `lattice_solve_equilibrium` as the closed-form linear warm-start
+    # before damped Jacobi refines.
+    #
+    # A_inv_n = (K_n + kc·I)^-1
+    #     where K_n is the SPD lattice Laplacian assembled with the NORMAL
+    #     anchor stiffness on the diagonal: K_n_ii = ka + kl·|N(i)|,
+    #     K_n_ij = -kl if j ∈ N(i).  The +kc·I term captures the contact
+    #     spring in the saturated-active limit (paper eq. 12); inactive
+    #     spheres have phi ≈ 0 so their contribution stays near zero.
+    #     Applied to the scalar normal-axis force field
+    #     f_n_j = phi[j] · dot(n_eff_j, n_outward_j).
+    #
+    # A_inv_t = (K_t)^-1
+    #     where K_t = ka·ratio·I + kl·L (no kc -- the contact spring
+    #     acts along n_eff and is absorbed into the normal axis).
+    #     Applied to the tangent-axis force vec3 field
+    #     f_t_j = phi[j] · (n_eff_j − dot(n_eff_j, n_outward_j)·n_outward_j).
+    #
+    # Both are SPD for ka > 0 and ka·ratio > 0; np.linalg.inv is fine at
+    # the n we use.  For n ≳ 1000 the right follow-up is a sparse
+    # Cholesky factorisation + triangular tri-solve kernels (one per
+    # axis class), which would also bound the memory growth from O(n²)
+    # to O(n·avg_neigh).  ``A_inv`` is the public attribute name for the
+    # normal-axis matrix; ``A_inv_t`` for the tangent.
     A_inv: wp.array | None = None
+    A_inv_t: wp.array | None = None
     device: str | None = None
 
     @classmethod
-    def from_pads(
-        cls, pads: list[CSLCPad], *, ka: float, kl: float, kc: float,
+    def from_lattices(
+        cls, lattices: list[CSLCLattice], *, ka: float, kl: float, kc: float,
         dc: float, smoothing_eps: float = 1.0e-5,
+        ka_tangent_ratio: float = 1.0,
+        k_stick: float | None = None,
+        mu_friction: float | None = None,
         build_A_inv: bool = False,
         kl_physical: float | None = None,
         device: Devicelike | None = None,
     ) -> CSLCData:
-        """Merge CSLCPads into GPU-resident CSLCData with global indexing.
+        """Merge CSLCLattices into GPU-resident CSLCData with global indexing.
 
         Args:
-            pads: one or more CSLCPads to merge (assumed uniform material).
+            lattices: one or more CSLCLattices to merge (assumed uniform material).
             ka, kl, kc, dc: spring constants; see CSLCData docstring.
             smoothing_eps: differentiability width for kernel gates.
             build_A_inv: if True, precompute the dense inverse of the
                 lattice system matrix A = K + kc·I and store in A_inv
-                for use by the tape-compatible
-                `lattice_solve_equilibrium` kernel.  Default False —
-                production tests (squeeze, lift) don't need it.
+                + A_inv_t for use by the tape-compatible
+                ``lattice_solve_equilibrium`` kernel (the linear
+                warm-start that runs before ``jacobi_step`` refines).
+                Default ``False`` keeps the signature lean for unit
+                tests; production callers (``cslc_main/grasp``) pass
+                ``True`` so the closed-form warm-start absorbs most
+                of the per-step displacement and the iterative
+                refinement converges in a handful of iterations.
             kl_physical: optional resolution-independent lateral stiffness
                 in continuous-PDE units [N·m].  When provided, the kernel-
                 level ``kl`` is replaced with ``kl_physical / spacing²``
@@ -418,24 +328,25 @@ class CSLCData:
                 continuous operator ``ka·I − kl_physical·∇²`` consistently
                 across refinement.  The induced lateral correlation length
                 in physical units is ``ℓ_c = √(kl_physical / ka)``,
-                invariant to grid spacing.  When ``None`` (legacy default),
+                invariant to grid spacing.  When ``None`` (default),
                 ``kl`` is used directly and the correlation length in
                 lattice-spacing units is ``√(kl/ka)``, which shrinks under
-                refinement — see Finding A in
-                ``cslc_mujoco/validation/FINDINGS.md``.  Assumes uniform
-                spacing across all pads (uses ``pads[0].spacing``); a
-                future per-pad extension would index by pad.
+                refinement (theory step 2 documents the discrete vs
+                continuum decay-length subtlety; see
+                ``cslc_main/theory/notes.md``).  Assumes uniform spacing
+                across all lattices (uses ``lattices[0].spacing``); a
+                future per-lattice extension would index by lattice.
         """
         # Resolution-independent lateral coupling (Fix 1.1).  When
         # ``kl_physical`` is provided, override the kernel-facing ``kl``
         # so that the same continuous PDE is consistently discretised at
         # any spacing.
         if kl_physical is not None:
-            if not pads:
+            if not lattices:
                 raise ValueError(
-                    "kl_physical requires at least one pad to read spacing from"
+                    "kl_physical requires at least one lattice to read spacing from"
                 )
-            spacing = float(pads[0].spacing)
+            spacing = float(lattices[0].spacing)
             if spacing <= 0.0:
                 raise ValueError(
                     f"kl_physical requires positive spacing; got {spacing}"
@@ -446,9 +357,9 @@ class CSLCData:
 
         offsets = []
         offset = 0
-        for pad in pads:
+        for lattice in lattices:
             offsets.append(offset)
-            offset += pad.n_spheres
+            offset += lattice.n_spheres
         n_total = offset
 
         all_pos = np.zeros((n_total, 3), dtype=np.float32)
@@ -457,54 +368,101 @@ class CSLCData:
         all_normals = np.zeros((n_total, 3), dtype=np.float32)
         all_shape = np.zeros(n_total, dtype=np.int32)
 
-        for pad, off in zip(pads, offsets):
-            sl = slice(off, off + pad.n_spheres)
-            all_pos[sl] = pad.positions
-            all_radii[sl] = pad.radii
-            all_surface[sl] = pad.is_surface.astype(np.int32)
-            all_normals[sl] = pad.outward_normals
-            all_shape[sl] = pad.shape_index
+        for lattice, off in zip(lattices, offsets):
+            sl = slice(off, off + lattice.n_spheres)
+            all_pos[sl] = lattice.positions
+            all_radii[sl] = lattice.radii
+            all_surface[sl] = lattice.is_surface.astype(np.int32)
+            all_normals[sl] = lattice.outward_normals
+            all_shape[sl] = lattice.shape_index
 
-        # CSR neighbor structure
+        # CSR neighbor structure + per-edge rest length L_ij.
         all_start = np.zeros(n_total, dtype=np.int32)
         all_count = np.zeros(n_total, dtype=np.int32)
         neighbor_lists = []
+        rest_length_lists = []
         edge_offset = 0
 
-        for pad, glob_off in zip(pads, offsets):
-            for local_i, neighbors in enumerate(pad.neighbor_indices):
+        for lattice, glob_off in zip(lattices, offsets):
+            lat_pos = lattice.positions
+            for local_i, neighbors in enumerate(lattice.neighbor_indices):
                 global_i = glob_off + local_i
                 all_start[global_i] = edge_offset
                 all_count[global_i] = len(neighbors)
                 neighbor_lists.append(neighbors + glob_off)
+                # Precompute rest distances in body-local frame.  Rest
+                # distances are rigid-body invariant, so we compute them
+                # once here against lattice.positions; the kernel will
+                # later compare against ‖q_j_world − q_i_world‖ which is
+                # equivalent up to the rigid body transform (preserves
+                # distances).  Cross-lattice neighbours would need
+                # world-frame rest distances, but our lattices are
+                # connected only intra-lattice, so body-local is
+                # sufficient.
+                if len(neighbors):
+                    deltas = lat_pos[neighbors] - lat_pos[local_i]
+                    L_ij = np.linalg.norm(deltas, axis=-1).astype(np.float32)
+                else:
+                    L_ij = np.zeros(0, dtype=np.float32)
+                rest_length_lists.append(L_ij)
                 edge_offset += len(neighbors)
 
         all_neighbor_list = (
             np.concatenate(neighbor_lists).astype(np.int32)
             if neighbor_lists else np.zeros(0, dtype=np.int32)
         )
+        all_rest_length = (
+            np.concatenate(rest_length_lists).astype(np.float32)
+            if rest_length_lists else np.zeros(0, dtype=np.float32)
+        )
 
-        # Optionally build the dense inverse A_inv = (K + kc·I)^-1 for the
-        # tape-compatible lattice solve.  K is assembled from the pads'
-        # neighbour topology: K_ii = ka + kl·|N(i)|, K_ij = -kl if j ∈ N(i).
-        # K is SPD (Laplacian + ka·I), so A = K + kc·I is SPD; np.linalg.inv
-        # is fine for the small n we use.  For n ≫ 1000, a sparse Cholesky
-        # factorisation + two triangular tri-solve kernels would be the
-        # right follow-up (stored L is O(n·avg_neighbors) vs the dense
-        # A_inv's O(n²)).
+        # Build TWO dense inverses for the closed-form lattice solve,
+        # one per axis class in the per-sphere local rest-normal frame:
+        #   A_inv_n = (K_n + kc·I)^-1   with K_n_ii = ka + kl·|N(i)|
+        #   A_inv_t = (K_t)^-1          with K_t_ii = ka·ratio + kl·|N(i)|
+        # The off-diagonal Laplacian coupling (-kl on edges) is
+        # identical for both axes -- only the diagonal anchor stiffness
+        # differs.  Splitting into per-axis matrices supports anisotropic
+        # anchors (ka_tangent_ratio ≠ 1) in closed form without falling
+        # back to iterative Jacobi for the warm-start, and keeps the
+        # matvec tape-compatible (the iterative path's src/dst aliasing
+        # breaks wp.Tape backward).
+        #
+        # When ratio == 1.0 (isotropic default) the two matrices differ
+        # only by the +kc·I term: A_inv_n absorbs the contact spring;
+        # A_inv_t does not (the contact force is along n_eff, projected
+        # entirely onto the normal axis in the decomposition kernel --
+        # see `lattice_solve_equilibrium`).
         A_inv_wp = None
+        A_inv_t_wp = None
         if build_A_inv:
-            K = np.zeros((n_total, n_total), dtype=np.float64)
-            for pad, glob_off in zip(pads, offsets):
-                for local_i, neighbors in enumerate(pad.neighbor_indices):
+            if ka_tangent_ratio <= 0.0:
+                raise ValueError(
+                    "ka_tangent_ratio must be > 0 for the closed-form solve "
+                    "(K_t = ka·ratio·I + kl·L would be singular when "
+                    "ratio = 0 because kl·L has a constant nullspace). "
+                    f"Got ka_tangent_ratio={ka_tangent_ratio}."
+                )
+            # Assemble the graph Laplacian L once; both K_n and K_t share
+            # the same off-diagonal structure with diagonals = |N(i)|.
+            L = np.zeros((n_total, n_total), dtype=np.float64)
+            for lattice, glob_off in zip(lattices, offsets):
+                for local_i, neighbors in enumerate(lattice.neighbor_indices):
                     gi = int(glob_off + local_i)
-                    K[gi, gi] = ka + kl * len(neighbors)
+                    L[gi, gi] = float(len(neighbors))
                     for nb in neighbors:
                         gj = int(glob_off + int(nb))
-                        K[gi, gj] = -kl
-            A = K + kc * np.eye(n_total)
-            A_inv_np = np.linalg.inv(A).astype(np.float32)
+                        L[gi, gj] = -1.0
+
+            I_n = np.eye(n_total, dtype=np.float64)
+            # Normal axis: ka·I + kl·L + kc·I.
+            A_n = ka * I_n + kl * L + kc * I_n
+            A_inv_np = np.linalg.inv(A_n).astype(np.float32)
             A_inv_wp = wp.array(A_inv_np, dtype=wp.float32, device=device)
+            # Tangent axes: ka·ratio·I + kl·L (no contact spring).
+            A_t = (ka * ka_tangent_ratio) * I_n + kl * L
+            A_inv_t_np = np.linalg.inv(A_t).astype(np.float32)
+            A_inv_t_wp = wp.array(A_inv_t_np, dtype=wp.float32, device=device)
 
         return cls(
             n_spheres=n_total,
@@ -514,12 +472,18 @@ class CSLCData:
             is_surface=wp.array(all_surface, dtype=wp.int32, device=device),
             outward_normals=wp.array(all_normals, dtype=wp.vec3, device=device),
             sphere_shape=wp.array(all_shape, dtype=wp.int32, device=device),
-            sphere_delta=wp.zeros(n_total, dtype=wp.float32, device=device),
+            sphere_delta=wp.zeros(n_total, dtype=wp.vec3, device=device),
             ka=ka, kl=kl, kc=kc, dc=dc,
             neighbor_start=wp.array(all_start, dtype=wp.int32, device=device),
             neighbor_count=wp.array(all_count, dtype=wp.int32, device=device),
             neighbor_list=wp.array(all_neighbor_list, dtype=wp.int32, device=device),
+            neighbor_rest_length=wp.array(
+                all_rest_length, dtype=wp.float32, device=device),
             smoothing_eps=smoothing_eps,
+            ka_tangent_ratio=ka_tangent_ratio,
+            k_stick=k_stick if k_stick is not None else ka,
+            mu_friction=mu_friction if mu_friction is not None else 0.3,
             A_inv=A_inv_wp,
+            A_inv_t=A_inv_t_wp,
             device=device,
         )

@@ -204,7 +204,26 @@ class SceneParams:
     # parameter, since spacing is determined by N_samples on the curved
     # face).
     cslc_ka: float = 25_000.0
-    cslc_kl: float = 500.0
+    # Micro-step 3 production default.  Distance-preservation lateral
+    # is directionally softer than the legacy graph-Laplacian (only
+    # resists distance changes along edges), so the previous 500 N/m
+    # tuned for the graph-Laplacian operator produces ~3× too little
+    # shear stiffness on the dome.  Empirically calibrated by an N=5
+    # pad_lift sweep with stick-slip enabled:
+    #
+    #   kl    | slip mean ± std         | bulging      | notes
+    #   500   | 33 mm (bimodal)         | 0/300       | original Phase 1g number
+    #   5000  | 4.9 ± 0.6 mm (stable)   | 0/300       | matches Phase 1g grip ← default
+    #   25000 | 75 mm (cascade)         | 8/300       | bulging visible but grip lost
+    #
+    # 5000 N/m sits in the sweet spot: lateral provides enough shear
+    # stiffness for the dome scene to hold the gripped sphere stably,
+    # while staying soft enough that the lattice doesn't over-constrain
+    # the contact patch.  The 25000 calibration is reserved as a CLI
+    # opt-in (--cslc-kl 25000) for the "physics demonstration" mode
+    # where the geometric Poisson coupling (paper §III-F gap closure)
+    # is the experimental object of study.
+    cslc_kl: float = 5_000.0
     cslc_dc: float = 2.0
     cslc_n_iter: int = 20
     cslc_alpha: float = 0.6
@@ -215,6 +234,28 @@ class SceneParams:
     # k=6 is the natural choice for a 2-D Poisson-disc scatter (a typical
     # blue-noise neighbour has ~6 neighbours within its Delaunay cell).
     cslc_k_neighbors: int = 6
+    # Smoothing width [m] for the CSLC contact-active gate.  Wider than the
+    # CSLCData default (1e-5) because the curved OBJ pad engages only ~28
+    # surface spheres at face_pen = 2 mm — too thin a band to maintain a
+    # stable patch on the dome geometry.
+    #
+    # Calibrated empirically with N=5 runs per eps (the MuJoCo GPU solver
+    # has run-to-run variance from atomics, so N=1 measurements are
+    # unreliable here):
+    #
+    #   eps   |  mean XY slip ± std  | grip behaviour
+    #   1e-5  |  325 ± 25 mm         | always cascades (baseline)
+    #   1e-4  |  ~230 ± 180 mm       | BIMODAL — sometimes 7 mm, sometimes 360 mm
+    #   5e-4  |  9.6 ± 5 mm          | reliable grip (chosen default)
+    #   1e-3  |  15.7 ± 2 mm         | tighter but slightly worse mean
+    #
+    # 5e-4 wins on mean slip with acceptable variance.  Cost: the gate's
+    # tail spans roughly 1 mm so ~337 contact polys are emitted vs only
+    # ~28 truly engaged spheres — these tail contacts carry tiny forces
+    # but distort the strict "Nc · keff = ke_bulk" calibration invariant.
+    # That's a known trade-off; the alternative (1e-4) was unreliable.
+    # CLI flag --smoothing-eps overrides this.
+    cslc_smoothing_eps: float = 5.0e-4
 
     # Hydroelastic contact (used when contact_model == "hydro").
     #
@@ -401,7 +442,9 @@ def _make_mesh_cslc_pad(
     )
 
 
-def _build_cslc_handler_with_mesh_pads(model, mesh_pads_by_shape):
+def _build_cslc_handler_with_mesh_pads(model, mesh_pads_by_shape,
+                                       smoothing_eps: float | None = None,
+                                       ka_tangent_ratio: float | None = None):
     """Build a CSLCHandler whose lattice pads come from `mesh_pads_by_shape`.
 
     Mirrors `CSLCHandler._from_model` (the parts that aren't shape-type-
@@ -493,9 +536,13 @@ def _build_cslc_handler_with_mesh_pads(model, mesh_pads_by_shape):
     ke_bulk = float(shape_ke[first_cslc])
     kc = calibrate_kc(ke_bulk, pads, ka=ka, contact_fraction=0.3, per_pad=True)
 
-    cslc_data = CSLCData.from_pads(
-        pads, ka=ka, kl=kl, kc=kc, dc=dc,
-        build_A_inv=True, device=model.device)
+    from_pads_kwargs = dict(ka=ka, kl=kl, kc=kc, dc=dc,
+                            build_A_inv=True, device=model.device)
+    if smoothing_eps is not None:
+        from_pads_kwargs["smoothing_eps"] = float(smoothing_eps)
+    if ka_tangent_ratio is not None:
+        from_pads_kwargs["ka_tangent_ratio"] = float(ka_tangent_ratio)
+    cslc_data = CSLCData.from_pads(pads, **from_pads_kwargs)
 
     # Filter CSLC pairs from the narrow phase (otherwise contacts double).
     if not hasattr(model, "shape_collision_filter_pairs"):
@@ -1031,15 +1078,31 @@ class Example:
         self.solver_name = getattr(args, "solver", "mujoco")
         self.contact_model = getattr(args, "contact_model", "point")
 
-        self.p = SceneParams(
+        scene_kwargs = dict(
             dt=self.sim_dt,
             n_samples_per_pad=getattr(args, "n_samples", 150),
             nz_threshold=getattr(args, "nz_threshold", 0.3),
             arrow_length=getattr(args, "arrow_length", 0.005),
             add_ground=not getattr(args, "no_ground", False),
         )
+        if getattr(args, "lift_ramp_duration", None) is not None:
+            scene_kwargs["lift_ramp_duration"] = float(args.lift_ramp_duration)
+        self.p = SceneParams(**scene_kwargs)
         if getattr(args, "kh", None) is not None:
             self.p.kh = float(args.kh)
+        if getattr(args, "cslc_kl", None) is not None:
+            self.p.cslc_kl = float(args.cslc_kl)
+        # CLI flag overrides the SceneParams default; otherwise use the
+        # scene's calibrated value (see SceneParams.cslc_smoothing_eps).
+        cli_eps = getattr(args, "smoothing_eps", None)
+        self._smoothing_eps = (
+            float(cli_eps) if cli_eps is not None
+            else self.p.cslc_smoothing_eps
+        )
+        cli_ratio = getattr(args, "ka_tangent_ratio", None)
+        self._ka_tangent_ratio = (
+            float(cli_ratio) if cli_ratio is not None else None
+        )
         self.p.dump()
         _log(f"contact_model = {self.contact_model}"
              + (f"  kh = {self.p.kh:.2e} Pa" if self.contact_model == "hydro" else ""))
@@ -1103,7 +1166,10 @@ class Example:
                     self.pad_shape_indices["right"],
                     k_neighbors=self.p.cslc_k_neighbors),
             }
-            handler = _build_cslc_handler_with_mesh_pads(self.model, mesh_pads)
+            handler = _build_cslc_handler_with_mesh_pads(
+                self.model, mesh_pads,
+                smoothing_eps=self._smoothing_eps,
+                ka_tangent_ratio=self._ka_tangent_ratio)
             _log(f"CSLC: built handler with {handler.cslc_data.n_spheres} "
                  f"total spheres across {len(mesh_pads)} pad(s); "
                  f"spacing ≈ {1e3*np.mean([p.spacing for p in mesh_pads.values()]):.2f} mm")
@@ -1288,6 +1354,84 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
             self.sim_step += 1
 
+    def _print_bulging_diagnostic(self, tag: str = ""):
+        """One-shot dump of the per-sphere normal-axis δ distribution.
+
+        Reads ``cslc_data.sphere_delta`` (world-frame vec3) and the
+        rest outward normal (body-local), rotates the normal into world
+        frame using the current pad body transforms, and projects δ
+        onto it.  Reports the count of:
+
+          * COMPRESSED  (δ_n > 0)  — sphere pushed INTO the pad
+          * NEUTRAL     (|δ_n| ≤ 10 µm)
+          * BULGING     (δ_n < 0) — sphere pushed OUTWARD from the pad
+                                     toward the target
+
+        Bulging is the smoking gun for the geometric Poisson effect
+        produced by the distance-preservation lateral spring (Micro-
+        step 3): when an apex sphere compresses, the lateral springs
+        stretch and pull side-of-dome neighbours OUTWARD along their
+        own outward normals.  A non-zero BULGING count during HOLD
+        means the §III-F dome-flattening physics is engaging on this
+        scene.
+
+        Purely diagnostic; never modifies state.
+        """
+        if self.contact_model != "cslc":
+            return
+        h = self.collision_pipeline.cslc_handler
+        if h is None:
+            return
+
+        import numpy as _np
+        d = h.cslc_data
+        delta_np      = d.sphere_delta.numpy()       # (N, 3) world frame
+        n_local_np    = d.outward_normals.numpy()    # (N, 3) shape-local
+        is_surf_np    = d.is_surface.numpy() == 1
+        sphere_shape  = d.sphere_shape.numpy()
+        body_q_np     = self.state_0.body_q.numpy()  # (n_body, 7) pos+quat
+        shape_body    = self.model.shape_body.numpy()
+        shape_xform   = self.model.shape_transform.numpy()  # (n_shape, 7)
+
+        # Local quat-rotate (avoids touching common.py imports).
+        def _qrot(q, v):
+            xyz = _np.array([q[0], q[1], q[2]])
+            t = 2.0 * _np.cross(xyz, v)
+            return v + q[3] * t + _np.cross(xyz, t)
+
+        # Rotate body-local outward normal → world frame for each sphere.
+        n_world = _np.zeros_like(n_local_np)
+        for i in range(len(delta_np)):
+            if not is_surf_np[i]:
+                continue
+            s = int(sphere_shape[i])
+            b = int(shape_body[s])
+            n_body = _qrot(shape_xform[s, 3:], n_local_np[i])
+            n_world[i] = _qrot(body_q_np[b, 3:], n_body)
+
+        delta_n = _np.sum(delta_np * n_world, axis=-1)  # signed compression
+        surf_dn = delta_n[is_surf_np]
+        if surf_dn.size == 0:
+            return
+
+        neutral_tol = 1e-5  # 10 µm: matches CSLC smoothing eps default
+        n_total = int(surf_dn.size)
+        n_comp  = int((surf_dn >  neutral_tol).sum())
+        n_neu   = int(((surf_dn >= -neutral_tol) & (surf_dn <= neutral_tol)).sum())
+        n_bul   = int((surf_dn < -neutral_tol).sum())
+        max_comp = float(surf_dn.max())   # most positive = deepest compression
+        max_bul  = float(surf_dn.min())   # most negative = strongest bulge
+        mean_bul_mag = float(-surf_dn[surf_dn < -neutral_tol].mean()) \
+            if n_bul > 0 else 0.0
+
+        prefix = f"BULGING{(' ' + tag) if tag else ''}:"
+        _log(
+            f"{prefix} compressed={n_comp}/{n_total} (max +{max_comp*1e3:.3f}mm)  "
+            f"neutral={n_neu}/{n_total}  "
+            f"bulging={n_bul}/{n_total} (max {max_bul*1e3:.3f}mm, "
+            f"mean {mean_bul_mag*1e3:.3f}mm)"
+        )
+
     def step(self):
         self.simulate()
         self.sim_time += self.frame_dt
@@ -1335,6 +1479,18 @@ class Example:
             _log(f"[{phase:8s}] step={self.sim_step:5d}  "
                  f"sphere_z={sphere_z:+.4f}  pad_z={pad_z:+.4f}  "
                  f"contacts={nc}{extra}")
+
+            # Phase transition probe for the Micro-step 3 distance-
+            # preservation lateral.  Print a one-shot bulging diagnostic
+            # at the first telemetry tick of each phase so we can see
+            # how δ distributes across the lattice as the scene
+            # progresses.  Uses a phase-edge guard so we only fire once
+            # per phase even though this branch runs every ~100 ms.
+            if not hasattr(self, "_bulging_phases_seen"):
+                self._bulging_phases_seen = set()
+            if phase not in self._bulging_phases_seen:
+                self._bulging_phases_seen.add(phase)
+                self._print_bulging_diagnostic(tag=f"[{phase} entry]")
 
     # ── Per-frame viz update ────────────────────────────────────────────
 
@@ -1592,6 +1748,29 @@ class Example:
                             help="Measure A_patch at 1 mm face_pen, print the "
                                  "fair kh that matches per-pad aggregate "
                                  "stiffness to ke_bulk = 5e4 N/m, then exit.")
+        parser.add_argument("--lift-ramp-duration", type=float, default=None,
+                            help="Override SceneParams.lift_ramp_duration [s] "
+                                 "(C1 ramp at both LIFT endpoints).  Longer "
+                                 "values reduce friction-impulse launch.")
+        parser.add_argument("--smoothing-eps", type=float, default=None,
+                            help="Override CSLCData.smoothing_eps [m] for the "
+                                 "differentiable contact-active gate.  Wider "
+                                 "values keep marginally-engaged spheres "
+                                 "active during transients.")
+        parser.add_argument("--ka-tangent-ratio", type=float, default=None,
+                            help="Override CSLCData.ka_tangent_ratio "
+                                 "(anisotropic anchor stiffness).  1.0 = "
+                                 "isotropic; 1/3 ≈ 0.333 = nearly-"
+                                 "incompressible flesh-like (Poisson 0.5 → "
+                                 "shear modulus G = E/3).  Phase 1g unlocks "
+                                 "the closed-form path for ratio != 1.0.")
+        parser.add_argument("--cslc-kl", type=float, default=None,
+                            help="Override SceneParams.cslc_kl (lateral "
+                                 "spring stiffness, N/m).  Used to probe "
+                                 "the distance-preservation lateral's "
+                                 "geometric Poisson coupling: higher kl "
+                                 "produces stronger side-sphere bulging "
+                                 "for a given apex compression.")
         return parser
 
 

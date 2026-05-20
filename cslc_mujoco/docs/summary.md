@@ -71,7 +71,7 @@ Three complementary HOLD-phase numbers are reported per model:
 For the paper, `HoldCreep` is the primary number — solver-compliance-
 dominated and directly comparable across models.
 
-### Results — `--object sphere` (default, post-H1 + fair-hydro + ka=25000 exact branch, 2026-05-11)
+### Results — `--object sphere`
 
 | Model | FullDrop | HoldDrop | **HoldCreep** | Active contacts |
 |---|---|---|---|---|

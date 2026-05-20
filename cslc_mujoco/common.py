@@ -90,14 +90,22 @@ def read_cslc_state(model) -> dict | None:
         return None
     d = handler.cslc_data
     is_surf = d.is_surface.numpy() == 1
-    deltas = d.sphere_delta.numpy()[is_surf]
+    deltas_vec = d.sphere_delta.numpy()[is_surf]  # vec3 since Phase 1b
+    # Reduce to per-sphere magnitudes so the existing scalar-shaped
+    # telemetry consumers (lift/squeeze formatters) keep working.  Using
+    # the Euclidean norm rather than `.max()`/`.mean()` on the raw vec3
+    # array, which would otherwise pick out the largest single
+    # Cartesian COMPONENT instead of the largest physical displacement
+    # magnitude.
+    delta_mags = (np.linalg.norm(deltas_vec, axis=-1)
+                  if deltas_vec.ndim == 2 else deltas_vec)
     pen = handler.raw_penetration.numpy()[is_surf]
     active = pen > 0
     n_active = int(active.sum())
     n_surface = int(is_surf.sum())
-    max_delta = float(deltas.max()) if len(deltas) else 0.0
+    max_delta = float(delta_mags.max()) if len(delta_mags) else 0.0
     max_pen = float(pen.max()) if len(pen) else 0.0
-    mean_delta = float(deltas.mean()) if len(deltas) else 0.0
+    mean_delta = float(delta_mags.mean()) if len(delta_mags) else 0.0
     mean_pen_active = float(pen[active].mean()) if n_active else 0.0
     return {
         # Short form (lift/robot convention).
@@ -222,10 +230,29 @@ def _quat_rotate(q, v):
 def get_cslc_lattice_viz_data(model, state):
     """Compute world-space positions of every surface lattice sphere.
 
-    Returns (pw, dl, rd, sf) where pw is (n_spheres, 3) world positions
-    after applying per-sphere compression along outward normal, dl is
-    the raw delta array, rd the radii, sf the surface flag.  Returns
-    None if no CSLC handler is attached.
+    Returns ``(pw, dl_scalar, rd, sf)`` where:
+
+      * ``pw`` is (n_spheres, 3) — the DEFORMED world position of each
+        lattice sphere centre, i.e. ``q_rest_world − δ_world`` with the
+        Phase 1b/1e vec3 δ convention (compression along the rest
+        outward normal moves the sphere INTO the pad body).
+      * ``dl_scalar`` is (n_spheres,) float32 — the SIGNED scalar
+        compression of each sphere along its rest outward normal in
+        WORLD frame, computed as ``dot(δ_world, n_outward_world)``.
+        Positive = compressed (skin pushed into the body); negative =
+        BULGING (skin pushed outward toward the target — geometric
+        Poisson signature of the §III-F gap closure).  Used by the
+        viewer-side lattice colouring to render compression as a heat
+        map.
+      * ``rd``, ``sf`` are radii and surface flag arrays (unchanged).
+
+    Returns None if no CSLC handler is attached.
+
+    Phase 2 note: the previous ``pl[i] + dl[i]*nm[i]`` formula computed
+    a body-local element-wise product of two vec3 arrays — meaningless
+    after Phase 1b made ``sphere_delta`` a vec3 stored in world frame.
+    The correct deformation is in world frame:
+    transform rest position to world, then subtract the world δ.
     """
     pipeline = getattr(model, "_collision_pipeline", None)
     handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
@@ -233,9 +260,9 @@ def get_cslc_lattice_viz_data(model, state):
         return None
     d = handler.cslc_data
     n = d.n_spheres
-    pl = d.positions.numpy()
-    nm = d.outward_normals.numpy()
-    dl = d.sphere_delta.numpy()
+    pl = d.positions.numpy()        # (n, 3) shape-local rest
+    nm = d.outward_normals.numpy()  # (n, 3) shape-local outward normal
+    dl_vec = d.sphere_delta.numpy() # (n, 3) WORLD-frame δ (vec3)
     rd = d.radii.numpy()
     sf = d.is_surface.numpy()
     si = d.sphere_shape.numpy()
@@ -244,15 +271,25 @@ def get_cslc_lattice_viz_data(model, state):
     sx = model.shape_transform.numpy()
 
     pw = np.zeros((n, 3), np.float32)
+    dl_scalar = np.zeros(n, np.float32)
     for i in range(n):
         if sf[i] == 0:
             continue
         s = si[i]
         b = sb[s]
-        ql = pl[i] + dl[i] * nm[i]
-        qb = _quat_rotate(sx[s, 3:7], ql) + sx[s, :3]
-        pw[i] = _quat_rotate(bq[b, 3:7], qb) + bq[b, :3]
-    return pw, dl, rd, sf
+        # World-frame rest position via the standard transform chain
+        # (shape-local → body-local → world).
+        qb = _quat_rotate(sx[s, 3:7], pl[i]) + sx[s, :3]
+        p_rest_world = _quat_rotate(bq[b, 3:7], qb) + bq[b, :3]
+        # World-frame deformed position: subtract world δ.
+        pw[i] = p_rest_world - dl_vec[i]
+        # Signed scalar compression in world frame.  Rotate the
+        # shape-local outward normal into world via the same transform
+        # chain (vectors don't translate).
+        n_body = _quat_rotate(sx[s, 3:7], nm[i])
+        n_world = _quat_rotate(bq[b, 3:7], n_body)
+        dl_scalar[i] = float(np.dot(dl_vec[i], n_world))
+    return pw, dl_scalar, rd, sf
 
 
 # ── Shape config factories ───────────────────────────────────────────────
