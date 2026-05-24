@@ -45,13 +45,31 @@ class ObjectParams:
         m = (4/3) · π · r³ · ρ  →  ρ = m / V ≈ 368 kg/m³.
     """
 
-    # "sphere" is the only kind implemented for this PR; the field is
-    # exposed so future extensions (cube, cylinder) drop in without
-    # changing the surrounding code.
+    # "sphere" (default, tennis ball) or "box" (C2e: dome-vs-flat-face
+    # falsification).  The box's surface is uniformly point-set sampled
+    # at construction; the CSLC handler dispatches to the point-set
+    # contact path (``_launch_vs_point_set``) automatically.
     kind: str = "sphere"
 
-    # Sphere radius [m].  Tennis ball: 0.0335.
+    # Sphere radius [m].  Tennis ball: 0.0335.  Only used when
+    # ``kind == "sphere"``.
     radius: float = 0.0335
+
+    # Box half-extents [m] in body-local frame (C2e).  Default 12.5 mm
+    # half-side = 25 mm full side, chosen to satisfy the dome-vs-box
+    # geometric constraint at the default dome geometry
+    # (R_pad = 20 mm, half-angle = 72 deg, patch_radius ~= 19 mm).
+    # Below 25 mm the contact patch overflows the box edges and mixes
+    # normals, creating a local wedge that confounds the falsification;
+    # the scene builder warns when ``2*hx < 2*patch_radius + 6mm``.
+    box_half_extents: tuple[float, float, float] = (0.0125, 0.0125, 0.0125)
+
+    # Target-point pitch [m] on each box face (C2e).  Default 1 mm gives
+    # 625 samples per 25 mm face, 3750 total across 6 faces.  Pitch sets
+    # both the per-target radius (``pitch / 2``) and the lattice
+    # density that feeds into ``compute_k_max``.  Smaller pitch ->
+    # denser target -> larger K_max budget.
+    box_face_pitch: float = 0.001
 
     # Material density [kg/m³].  368 → tennis-ball mass at r=33.5 mm.
     density: float = 368.0
@@ -61,11 +79,53 @@ class ObjectParams:
     # pads make contact.
     start_z: float = 0.10
 
+    # Lateral spawn jitter [m] along Y, used to drive multi-seed
+    # statistics for the C2 ke-sweep falsification (3 seeds at
+    # {-1mm, 0, +1mm}).  Small enough to keep the grasp geometry
+    # valid; large enough to break the perfect symmetry of the
+    # default centred spawn and exercise asymmetric pad-vs-object
+    # contact patches.  Default 0.0 preserves the legacy
+    # centre-of-pad spawn.
+    spawn_y_offset: float = 0.0
+
     @property
     def mass(self) -> float:
-        """Mass [kg], derived from density × volume for the sphere kind."""
+        """Mass [kg], derived from density × volume for the active kind."""
         if self.kind == "sphere":
             return self.density * (4.0 / 3.0) * math.pi * self.radius**3
+        if self.kind == "box":
+            hx, hy, hz = self.box_half_extents
+            return self.density * (2.0 * hx) * (2.0 * hy) * (2.0 * hz)
+        raise ValueError(f"Unknown object kind: {self.kind!r}")
+
+    @property
+    def grasp_axis_half(self) -> float:
+        """Half-extent along the X (grasp) axis [m].
+
+        Used by the scene builder to position pads laterally.  Pads
+        spawn at ``x = +/-(grasp_axis_half + pad_thickness + approach_gap)``
+        so the pad's inner face starts ``approach_gap`` clear of the
+        object's side surface.
+        """
+        if self.kind == "sphere":
+            return self.radius
+        if self.kind == "box":
+            return self.box_half_extents[0]
+        raise ValueError(f"Unknown object kind: {self.kind!r}")
+
+    @property
+    def settled_z_center(self) -> float:
+        """Z position of the object's centre once it settles on the ground [m].
+
+        Pads use this to position their vertical centre on the
+        object's equator.  Sphere: ``radius`` (ball rolls to rest with
+        centre at +radius).  Box: ``box_half_extents[2]`` (axis-aligned
+        cube rests with bottom face on z=0).
+        """
+        if self.kind == "sphere":
+            return self.radius
+        if self.kind == "box":
+            return self.box_half_extents[2]
         raise ValueError(f"Unknown object kind: {self.kind!r}")
 
     @property
@@ -91,7 +151,11 @@ class PadParams:
     radius (``spacing / 2``, matching Newton's box convention).
     """
 
-    # "box" (default, simple flat pads) or "dome" (curved pad from OBJ).
+    # "box" (default, flat pads), "dome" (curved pad from a pre-baked
+    # OBJ asset), or "dome_param" (curved pad generated in-code from
+    # ``dome_param_R_pad`` and ``dome_param_half_angle`` -- mirrors the
+    # ``make_dome`` math in ``cslc_main.theory.cslc_lattice`` so the
+    # grasp pad shape and the theory dome lattice share their geometry).
     kind: str = "box"
 
     # Box pad half-extents [m] (only used when kind="box").  Defaults:
@@ -112,6 +176,21 @@ class PadParams:
     # normal has z-component above this threshold are sampled (i.e. the
     # outward-curving cap, not the back face).
     dome_nz_threshold: float = 0.3
+
+    # Parametric-dome geometry (only used when kind="dome_param").
+    # Defaults reproduce the shipped ``assets/pad/pad.obj`` to within
+    # mesh resolution: R_pad = 10 mm, half_angle = 72 deg, 3 mm back.
+    # Sweep these for the Step-11 dome-geometry experiment in
+    # ``cslc_main/theory/notes.md``.  The math matches
+    # ``cslc_main.theory.cslc_lattice.make_dome`` so the grasp pad and
+    # the theory lattice share their cap.
+    dome_param_R_pad: float = 0.010
+    dome_param_half_angle: float = 72.0 * math.pi / 180.0
+    dome_param_back_height: float = 0.003
+    # Tessellation -- enough to make the cap visually smooth and the
+    # outward-normal direction estimate stable for CSLC sampling.
+    dome_param_n_theta: int = 24
+    dome_param_n_phi: int = 48
 
     # Z-coordinate [m] at which each pad BODY's centre sits at t=0.
     # ``None`` (default) → auto-derived in the scene builder:
@@ -159,13 +238,65 @@ class MaterialParams:
 
     These set the elastic response (``ke``), dissipative response
     (``kd``), tangential stiffness (``kf``), and Coulomb friction
-    coefficient (``mu``) at the SHAPE level.  CSLC layers its own
-    spring network on top via :class:`CSLCParams`; ``ke`` here doubles
-    as the "bulk" target stiffness for CSLC's kc calibration.
+    coefficient (``mu``) at the SHAPE level.
+
+    ke is split by role under CSLC (see C2 closure in
+    ``cslc_main/theory/notes.md``):
+
+    * ``ke_pad_physical`` is the CSLC pad's bulk Young's-modulus-equivalent.
+      It feeds ``calibrate_kc(ke_bulk=...)`` and so sets the pad's
+      per-sphere contact stiffness ``kc``.  Physical knob.
+    * ``ke_target_constraint`` is the OBJECT's effective contact stiffness.
+      It enters the harmonic-mean series-spring composition
+      ``kc_series = kc * target_ke / (kc + target_ke + eps^2)`` in the
+      emission kernel and so sets the MuJoCo rigid-contact stiffness
+      (which drives both force-per-penetration AND regularisation
+      timeconst -- MuJoCo's contact API takes one stiffness slot per
+      contact).  Numerical / regularisation knob.
+    * ``kh`` is the hydroelastic physical-compliance modulus [Pa/m].
+      Used only when ``contact_model="hydro"``; ignored under CSLC.
+
+    The split decouples per-role knobs at the configuration layer but
+    DOES NOT make them physically independent: kc and target_ke
+    co-determine kc_series via the harmonic-mean composition.  The
+    cleanest apples-to-apples comparison with hydroelastic uses
+    ``ke_target_constraint`` held fixed and ``ke_pad_physical`` /
+    ``kh`` swept as the "physical material" axis.
+
+    The legacy ``MaterialParams.ke`` is preserved as a property
+    alias for ``ke_pad_physical`` (silent; no DeprecationWarning).
+    CLI ``--material-ke`` sets BOTH ke fields to the same value so
+    pre-split recipes (dome_curved_flat, C2 day-1 sweep) reproduce
+    bit-identically.
     """
 
-    # Hunt-Crossley elastic stiffness [N/m] of the pad-vs-object contact.
-    ke: float = 5.0e4
+    # ── Fields ──
+
+    # CSLC pad physical bulk-modulus equivalent [N/m].  Drives
+    # ``calibrate_kc(ke_bulk=...)`` on the pad lattice.  Under
+    # ``contact_model="hydro"`` this field is unused (hydro reads
+    # ``kh`` for physical compliance instead).  Default 5e4
+    # preserves the pre-split single-ke default.
+    ke_pad_physical: float = 5.0e4
+
+    # Object's harmonic-mean composition partner [N/m].  Drives
+    # kc_series target_ke in the CSLC emission kernel; flows to
+    # MuJoCo as the rigid-contact stiffness for the regularisation
+    # timeconst.  Default 5e4 preserves the pre-split single-ke
+    # default; bump to 5e5 (the C2 day-1 / Bug B operating point)
+    # for the wedge-suppressing regime.
+    ke_target_constraint: float = 5.0e4
+
+    # Hydroelastic physical-compliance modulus [Pa/m].  Used only
+    # when ``contact_model="hydro"``; ignored under CSLC / point.
+    # Default 5.3e8 matches the pre-split ``HydroParams.kh`` default
+    # (fair-calibrated against MaterialParams.ke at the expected
+    # contact patch area; see cslc_mujoco/summary.md §2).
+    # Centralising on MaterialParams lets the squeeze-sweep treat
+    # CSLC ``ke_pad_physical`` and hydro ``kh`` as the parallel
+    # "physical material" axis.  ``HydroParams.kh`` removed as part
+    # of the same split.
+    kh: float = 5.3e8
 
     # Hunt-Crossley damping coefficient [N·s/m].
     kd: float = 5.0e2
@@ -181,6 +312,33 @@ class MaterialParams:
     # Proximity gap [m] for narrow-phase early-out.  Should comfortably
     # exceed the maximum penetration expected during SQUEEZE.
     gap: float = 0.002
+
+    # ── Legacy property (pre-split back-compat) ──
+
+    @property
+    def ke(self) -> float:
+        """Legacy alias for ``ke_pad_physical`` (read-only getter).
+
+        Pre-split code reads ``material.ke``; the split keeps this
+        as a property returning the physical knob so no external
+        consumer breaks.  New code should use ``ke_pad_physical``
+        and ``ke_target_constraint`` explicitly.
+        """
+        return self.ke_pad_physical
+
+    @ke.setter
+    def ke(self, value: float) -> None:
+        """Legacy setter -- sets BOTH ke fields to ``value``.
+
+        Pre-split semantics: ``material.ke = X`` set both the
+        physical and constraint roles to the same number.
+        Preserved here so existing scripts and the
+        ``--material-ke`` CLI alias keep working bit-identically.
+        Explicit per-role assignment should set ``ke_pad_physical``
+        and ``ke_target_constraint`` directly.
+        """
+        self.ke_pad_physical = value
+        self.ke_target_constraint = value
 
 
 # ── CSLC compliant-skin tuning ───────────────────────────────────────────
@@ -262,16 +420,16 @@ class CSLCParams:
 
 @dataclass
 class HydroParams:
-    """Hydroelastic contact-model parameters.
+    """Hydroelastic contact-model SDF parameters.
 
-    Only used when ``GraspConfig.contact_model == "hydro"``.  The default
-    ``kh`` is fair-calibrated against ``MaterialParams.ke`` at the
-    expected contact patch area (see ``cslc_mujoco/summary.md`` §2):
-        kh_eff · A_patch(1 mm pen) = ke
+    Only used when ``GraspConfig.contact_model == "hydro"``.
+
+    ``kh`` (the hydroelastic physical-compliance modulus) moved to
+    :class:`MaterialParams.kh` as part of the C2 split so that
+    CSLC ``ke_pad_physical`` and hydro ``kh`` live on the same
+    config object as the symmetric "physical material" axis.  This
+    class now holds only the SDF resolution.
     """
-
-    # Hydroelastic modulus [Pa].
-    kh: float = 5.3e8
 
     # Voxel grid resolution for the analytic SDF generated by Newton.
     sdf_resolution: int = 64
@@ -477,11 +635,18 @@ class GraspConfig:
         return last_name, 0
 
     def run_dir_name(self) -> str:
-        """Compute the run directory name from the logging config."""
+        """Compute the run directory name from the logging config.
+
+        The contact model is *always* appended to the final directory
+        name so two runs that differ only in ``--contact-model`` end up
+        in distinct directories under ``--no-timestamp``.  Users can
+        keep their scene label clean (``--run-label dome_curved_flat``)
+        and not worry about manually disambiguating CSLC vs hydro vs
+        point runs.
+        """
         lp = self.logging
-        label = lp.run_label or (
-            f"{self.pad.kind}_{self.object.kind}_{self.contact_model}"
-        )
+        scene_label = lp.run_label or f"{self.pad.kind}_{self.object.kind}"
+        label = f"{scene_label}_{self.contact_model}"
         if lp.use_timestamp:
             ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             return f"{ts}_{label}"

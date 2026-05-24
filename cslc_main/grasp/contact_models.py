@@ -55,7 +55,26 @@ from newton._src.geometry.cslc_handler import (
     CSLCShapePair,
 )
 
-from .params import CSLCParams, GraspConfig, HydroParams, MaterialParams, PadParams
+from .objects import box_face_area, box_surface_area, compute_k_max, make_box_target
+
+# C2e: box-grasp approach faces.  The grasp pipeline puts pads at +/- x;
+# the +y/-y and +z/-z faces of the held box are physically unreachable
+# to those pads.  Sampling them adds Jacobi inner-loop cost and pads
+# the K_max budget with adjacent-face wraparound (every point on
+# +/-y/z faces within ~27mm of an engaged pad sphere still passes the
+# active-set inclusion threshold even though it can't contribute real
+# wrench).  We sample only the approach faces to bound the per-step
+# kernel work.  If a future pipeline grips along a different axis,
+# extend this with an axis-aware selection.
+_BOX_APPROACH_FACES = ("+x", "-x")
+from .params import (
+    CSLCParams,
+    GraspConfig,
+    HydroParams,
+    MaterialParams,
+    ObjectParams,
+    PadParams,
+)
 
 # Newton geometry-type integers we need locally.  Newton doesn't export
 # MESH / CONVEX_MESH separately from the cslc handler module, so we
@@ -63,6 +82,10 @@ from .params import CSLCParams, GraspConfig, HydroParams, MaterialParams, PadPar
 _GEOTYPE_MESH = 1
 _GEOTYPE_CONVEX_MESH = 8
 _MESH_LIKE_TYPES = (_GEOTYPE_MESH, _GEOTYPE_CONVEX_MESH)
+# C2e: box-target dispatch via the point-set path.  Matches
+# newton._src.geometry.types.GeoType.BOX = 7.
+_GEOTYPE_BOX = 7
+_POINT_SET_TARGET_TYPES = (_GEOTYPE_BOX,)
 
 
 # ── Shape configs ────────────────────────────────────────────────────────
@@ -85,8 +108,12 @@ def make_pad_shape_cfg(
     ``shape_cslc_spacing[i]`` only for its calibration heuristic, so a
     nominal value is sufficient.
     """
+    # C2 ke-split: the pad's physical bulk modulus drives ``calibrate_kc``
+    # via ``model.shape_material_ke[pad_idx]``.  Object's ke (set
+    # separately in ``make_object_shape_cfg``) flows to the kernel as
+    # ``target_ke`` in the kc_series composition.
     kwargs: dict = dict(
-        ke=material.ke,
+        ke=material.ke_pad_physical,
         kd=material.kd,
         kf=material.kf,
         mu=material.mu,
@@ -104,7 +131,11 @@ def make_pad_shape_cfg(
             cslc_alpha=cslc.alpha,
         )
     elif contact_model == "hydro":
-        kwargs.update(kh=hydro.kh, is_hydroelastic=True)
+        # Under hydro the pad's physical compliance is set via ``kh``
+        # (Pa/m), NOT via ``ke``.  ``ke_pad_physical`` is silently
+        # unused -- it would only affect a hypothetical CSLC pad
+        # building atop the hydro pipeline, which doesn't exist.
+        kwargs.update(kh=material.kh, is_hydroelastic=True)
     # "point": no extra kwargs — bare Hunt-Crossley + Coulomb.
     return newton.ModelBuilder.ShapeConfig(**kwargs)
 
@@ -172,14 +203,21 @@ def build_cslc_handler_with_mesh_pads(
     model,
     mesh_pads_by_shape: dict[int, CSLCLattice],
     cslc: CSLCParams,
+    obj: ObjectParams | None = None,
 ) -> CSLCHandler | None:
     """Build a ``CSLCHandler`` from caller-supplied ``CSLCLattice`` objects.
 
-    Step 7 cleanup: only MESH-like CSLC shapes (with pre-built lattices)
-    are supported; the box auto-gen path was removed alongside the
-    box-target kernels.  Only sphere-vs-sphere pairs are supported in
-    this pass; box / mesh / SDF target geometries are deferred (step
-    7b in ``cslc_main/theory/notes.md``).
+    Supports two dispatch paths per pair (selected by the target shape's
+    geo type):
+
+    * SPHERE target -> sphere-target ``CSLCShapePair`` (single
+      position/radius), routed to ``_launch_vs_sphere``.
+    * BOX target (C2e) -> point-set ``CSLCShapePair`` populated by
+      :func:`make_box_target` over the box's body-local faces, routed
+      to ``_launch_vs_point_set``.  Requires ``obj`` to be passed
+      (``obj.kind == "box"``, ``obj.box_half_extents``,
+      ``obj.box_face_pitch``) -- the sampling parameters live there,
+      not on the Newton model.
 
     Returns ``None`` if there are no usable CSLC pairs.
     """
@@ -193,30 +231,54 @@ def build_cslc_handler_with_mesh_pads(
 
     cslc_set = set(cslc_shape_indices)
     shape_pairs: list[CSLCShapePair] = []
+    # Cache per-other-shape point-set samples so a target shape paired
+    # against multiple pads is sampled exactly once.
+    point_set_samples_by_shape: dict[int, dict] = {}
     if model.shape_contact_pairs is not None:
         for sa, sb in model.shape_contact_pairs.numpy():
             if sa in cslc_set and sb not in cslc_set:
-                gt_other = int(shape_types[sb])
-                if gt_other != _GEOTYPE_SPHERE:
-                    continue
-                shape_pairs.append(
-                    CSLCShapePair(
-                        cslc_shape=int(sa),
-                        other_shape=int(sb),
-                        other_geo_type=gt_other,
-                    )
-                )
+                cslc_shape, other = int(sa), int(sb)
             elif sb in cslc_set and sa not in cslc_set:
-                gt_other = int(shape_types[sa])
-                if gt_other != _GEOTYPE_SPHERE:
-                    continue
+                cslc_shape, other = int(sb), int(sa)
+            else:
+                continue  # both CSLC or neither: not supported here
+            gt_other = int(shape_types[other])
+            if gt_other == _GEOTYPE_SPHERE:
                 shape_pairs.append(
                     CSLCShapePair(
-                        cslc_shape=int(sb),
-                        other_shape=int(sa),
+                        cslc_shape=cslc_shape,
+                        other_shape=other,
                         other_geo_type=gt_other,
                     )
                 )
+            elif gt_other in _POINT_SET_TARGET_TYPES:
+                if obj is None or obj.kind != "box":
+                    raise RuntimeError(
+                        f"CSLC pair has BOX target (shape {other}) but "
+                        f"obj is not a box object (kind="
+                        f"{obj.kind if obj else 'None'!r}).  Pass "
+                        f"obj=config.obj with kind='box' so "
+                        f"make_box_target can sample the surface."
+                    )
+                # Sample on first encounter; reuse for any further pad
+                # pairing with this same target.
+                if other not in point_set_samples_by_shape:
+                    point_set_samples_by_shape[other] = make_box_target(
+                        half_extents=obj.box_half_extents,
+                        pitch=obj.box_face_pitch,
+                        faces=_BOX_APPROACH_FACES,
+                    )
+                shape_pairs.append(
+                    CSLCShapePair(
+                        cslc_shape=cslc_shape,
+                        other_shape=other,
+                        other_geo_type=gt_other,
+                        is_point_set=True,
+                        # target arrays + count + K_max populated below
+                    )
+                )
+            # other geo types: silently skipped (handler emits a
+            # RuntimeWarning per launch via its dispatch fallback).
     if not shape_pairs:
         return None
 
@@ -276,18 +338,58 @@ def build_cslc_handler_with_mesh_pads(
         a, b = sorted((pair.cslc_shape, pair.other_shape))
         model.shape_collision_filter_pairs.add((a, b))
 
-    # Cache per-pair sphere-target info on the CSLCShapePair (avoids a
-    # GPU->CPU sync per kernel launch).
+    # Cache per-pair target info on the CSLCShapePair (avoids a GPU->CPU
+    # sync per kernel launch).  Sphere targets store a single (pos,
+    # radius); point-set targets upload arrays to GPU and store K_max.
     shape_body_np = model.shape_body.numpy()
     shape_transform_np = model.shape_transform.numpy()
     for pair in shape_pairs:
         ke_raw = float(shape_ke[pair.other_shape])
         pair.other_ke = ke_raw if ke_raw > 0.0 else 1.0e9
-        # Only sphere targets reach here (filter above).
         pair.other_body = int(shape_body_np[pair.other_shape])
-        xf = shape_transform_np[pair.other_shape]
-        pair.other_local_pos = (float(xf[0]), float(xf[1]), float(xf[2]))
-        pair.other_radius = float(shape_scale_np[pair.other_shape][0])
+
+        if pair.is_point_set:
+            # C2e: upload point-set samples to GPU + compute K_max from
+            # geometry.  Uses obj's box parameters for the per-face
+            # surface-area math (target_surface_area = 6 faces, clip
+            # cap = max single face area).
+            samples = point_set_samples_by_shape[pair.other_shape]
+            pair.target_positions_local = wp.array(
+                samples["positions"], dtype=wp.vec3, device=model.device
+            )
+            pair.target_radii = wp.array(
+                samples["radii"], dtype=wp.float32, device=model.device
+            )
+            pair.target_count = int(samples["positions"].shape[0])
+
+            # K_max sizing -- see compute_k_max docstring for the
+            # INCLUSION_FACTOR = 50 derivation.  pad_face_clip_area
+            # caps the inclusion disk to the largest sampled face
+            # (the worst case for a pad sphere centred on that face).
+            # ``target_surface_area`` matches the sampled subset so
+            # density math is consistent.
+            assert obj is not None and obj.kind == "box"  # invariant
+            target_surface_area = box_surface_area(
+                obj.box_half_extents, faces=_BOX_APPROACH_FACES
+            )
+            max_face_area = max(
+                box_face_area(obj.box_half_extents, f)
+                for f in _BOX_APPROACH_FACES
+            )
+            pad_lattice = mesh_pads_by_shape[pair.cslc_shape]
+            pair.K_max = compute_k_max(
+                lattice_radii_max=float(pad_lattice.radii.max()),
+                target_radii_max=float(samples["radii"].max()),
+                smoothing_eps=cslc.smoothing_eps,
+                target_count=pair.target_count,
+                target_surface_area=target_surface_area,
+                pad_face_clip_area=max_face_area,
+            )
+        else:
+            # Sphere target -- single position + scalar radius.
+            xf = shape_transform_np[pair.other_shape]
+            pair.other_local_pos = (float(xf[0]), float(xf[1]), float(xf[2]))
+            pair.other_radius = float(shape_scale_np[pair.other_shape][0])
 
     # One contact slot per surface sphere; the handler writes one
     # contact per slot per pair.
@@ -430,5 +532,5 @@ def attach_cslc_handler_to_model(
     construction triggers pipeline creation).
     """
     return build_cslc_handler_with_mesh_pads(
-        model, mesh_pads_by_shape, config.cslc
+        model, mesh_pads_by_shape, config.cslc, obj=config.object
     )

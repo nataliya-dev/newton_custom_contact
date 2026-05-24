@@ -38,6 +38,8 @@ from typing import Literal
 import numpy as np
 from scipy.optimize import minimize
 
+from .cslc_theory import INACTIVE_RAW_EPS_FACTOR
+
 
 LateralLaw = Literal["graph_laplacian", "distance_preserving"]
 
@@ -175,6 +177,104 @@ def make_arc(N: int, R_pad: float, arc_length_spacing: float,
                       np.zeros(N)], axis=1)
     edges = np.stack([np.arange(N - 1), np.arange(1, N)], axis=1).astype(np.int64)
     return Lattice(p=p, n=n_arr, edges=edges, ka=ka, kl=kl)
+
+
+def make_dome(N: int, R_pad: float, half_angle: float,
+              ka: float, kl: float,
+              k_neighbors: int = 6,
+              ) -> tuple[Lattice, float, float]:
+    """Build a 3D spherical-cap lattice via the Fibonacci-spiral sampler.
+
+    Step-5's ``make_arc`` proved the 1D bulge window analytically; this
+    function lifts the same idea to a 2D manifold (the dome) so we can
+    study sphere-vs-sphere contact at production geometry.  Cap layout:
+
+        z_min   = cos(half_angle)              (cap base)
+        z_i     = z_min + (1 - z_min) * (i + 0.5) / N      (equal area)
+        r_xy_i  = sqrt(1 - z_i^2)
+        phi_i   = i * golden_angle             (golden_angle = pi*(3 - sqrt(5)))
+        p_i     = R_pad * (r_xy_i cos phi_i, r_xy_i sin phi_i, z_i)
+        n_i     = p_i / R_pad                  (radial outward unit)
+
+    The Fibonacci spiral with equal-area-per-sample is *quasi-uniform*
+    on the cap (variance of nearest-neighbour distance ~ 5% of the mean
+    on the cap interior), and is the production-equivalent of
+    Lloyd/CVT sampling on an analytic cap (deterministic, no scipy
+    optimiser in the loop).  Edges = unordered k-NN in 3D, which on a
+    quasi-uniform 2D manifold is a close approximation of the surface
+    Delaunay graph and reproduces the production
+    ``make_cslc_pad_from_samples`` topology.
+
+    Apex sits at theta = 0 (top of cap), i.e. ``(0, 0, R_pad)``.
+
+    Args:
+        N: number of lattice spheres.
+        R_pad: dome radius [m] (the *pad* sphere radius, NOT the held
+            object's).  Production fingertip dome: R_pad = 10 mm.
+        half_angle: cap half-angle [rad].  Production fingertip dome
+            spans theta_max ~ 1.26 rad (~72 deg, cos = 0.31).
+        ka: anchor stiffness [N/m].
+        kl: lateral stiffness [N/m].
+        k_neighbors: k for the k-NN neighbour graph (production: 6).
+
+    Returns:
+        ``(lat, spacing, cap_area)`` where ``spacing`` is the mean
+        nearest-neighbour distance [m] (a Fibonacci-spiral invariant
+        analogous to Lloyd's CVT spacing) and ``cap_area`` [m^2] is the
+        analytic spherical-cap area used downstream for Hertz-patch
+        density predictions.
+    """
+    if R_pad <= 0.0 or half_angle <= 0.0 or half_angle >= np.pi:
+        raise ValueError(
+            f"R_pad > 0 and 0 < half_angle < pi required; got "
+            f"R_pad={R_pad}, half_angle={half_angle}")
+    if N < 7:
+        raise ValueError(
+            f"N >= 7 required for a meaningful 2D cap, got N={N}")
+
+    z_min = float(np.cos(half_angle))
+    indices = np.arange(N)
+    z = z_min + (1.0 - z_min) * (indices + 0.5) / N
+    r_xy = np.sqrt(np.maximum(1.0 - z * z, 0.0))
+    golden_angle = float(np.pi * (3.0 - np.sqrt(5.0)))
+    phi = indices * golden_angle
+    unit = np.stack([r_xy * np.cos(phi),
+                     r_xy * np.sin(phi),
+                     z], axis=1)
+    # Move the densest sample (largest z, last index) to be the apex --
+    # so that test drivers can target the apex sphere deterministically.
+    # The Fibonacci-spiral apex is the LAST sample (i = N-1, z closest
+    # to 1).  Roll it to index 0 for convenience.
+    apex_idx = int(np.argmax(unit[:, 2]))
+    perm = np.concatenate(([apex_idx], np.delete(np.arange(N), apex_idx)))
+    unit = unit[perm]
+    p = R_pad * unit
+    n_arr = unit  # outward = radial; ||unit||_2 == 1 by construction
+
+    # k-NN edge graph (undirected) on the 3D positions.  For a
+    # quasi-uniform 2D manifold this is a close approximation of the
+    # geodesic k-NN; we don't bother with the geodesic projection.
+    from scipy.spatial import cKDTree
+    tree = cKDTree(p)
+    _, idx = tree.query(p, k=k_neighbors + 1)  # +1 to drop self
+    edge_set: set[tuple[int, int]] = set()
+    for i in range(N):
+        for j in idx[i, 1:]:
+            a, b = sorted((int(i), int(j)))
+            if a != b:
+                edge_set.add((a, b))
+    edges = np.array(sorted(edge_set), dtype=np.int64)
+
+    # Mean NN distance = lattice spacing (matches the production
+    # ``make_cslc_pad_from_samples`` convention).  Use the first
+    # neighbour column (excluding self at column 0).
+    nn_dists = np.linalg.norm(p[idx[:, 1]] - p, axis=1)
+    spacing = float(np.mean(nn_dists))
+
+    # Spherical-cap area for diagnostics: A = 2 pi R^2 (1 - cos theta_max).
+    cap_area = float(2.0 * np.pi * R_pad * R_pad * (1.0 - z_min))
+
+    return Lattice(p=p, n=n_arr, edges=edges, ka=ka, kl=kl), spacing, cap_area
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -390,6 +490,102 @@ class ContactTarget:
     def __post_init__(self):
         if self.t.shape != (3,):
             raise ValueError(f"t must be (3,), got {self.t.shape}")
+
+
+@dataclass(frozen=True)
+class SphereIndenter:
+    """Sphere indenter that may overlap multiple lattice spheres.
+
+    Used for curved-lattice (arc, dome) scenes where the indenter's
+    contact patch spans many lattice spheres simultaneously -- the
+    equilibrium solver itself figures out which spheres engage.  This is
+    the natural generalisation of :class:`ContactTarget`, which only
+    contacts one sphere by index.
+
+    Each lattice sphere ``i`` sees a per-sphere overlap
+
+        raw_i      = (r_lat[i] + R) - ||q_i - t||,    q_i = p_i - delta_i
+        phi_eff_i  = sigma_eps(raw_i)
+        E_c_i      = (1/2) * kc * phi_eff_i^2
+
+    and the multi-contact energy ``sum_i E_c_i`` is added to the lattice
+    energy ``E_anchor + E_lateral`` for the L-BFGS-B equilibrium solve
+    in :func:`solve_lattice_sphere_indenter`.
+
+    Attributes:
+        t: indenter centre [m] in world frame.
+        R: indenter radius [m].
+        kc: per-sphere contact stiffness [N/m] -- the same kc that
+            production calibrates via :func:`calibrate_kc`.
+    """
+
+    t: np.ndarray
+    R: float
+    kc: float
+
+    def __post_init__(self):
+        if self.t.shape != (3,):
+            raise ValueError(f"t must be (3,), got {self.t.shape}")
+        if self.R <= 0.0 or self.kc <= 0.0:
+            raise ValueError(f"R > 0 and kc > 0 required; "
+                             f"got R={self.R}, kc={self.kc}")
+
+
+@dataclass(frozen=True)
+class PointSetIndenter:
+    """Rigid indenter sampled as M surface points (Step 10 / box-target).
+
+    Multi-point generalisation of :class:`SphereIndenter`.  Where a
+    SphereIndenter is one large rigid sphere that pad spheres contact
+    via a single line-of-centres per pad sphere, a PointSetIndenter is
+    a *collection* of M small target points (each carrying its own
+    position, radius, and precomputed surface normal), and each pad
+    sphere can contact several of them simultaneously.  The
+    equilibrium solver :func:`solve_lattice_point_set_indenter` walks
+    every (pad sphere, target point) pair and sums per-pair
+    contributions into the contact energy.
+
+    Built by sampling a surface mesh (e.g. via
+    :func:`cslc_main.theory.cslc_box.make_box_target` for a trimesh
+    box) and supplying ``kc`` -- the same calibrated contact stiffness
+    used by :class:`SphereIndenter`, applied per (pad_sphere,
+    target_point) pair.
+
+    Attributes:
+        positions: (M, 3) target point positions in world frame [m].
+        radii:     (M,) per-point sphere radii [m].
+        normals:   (M, 3) per-point outward unit normals on the
+                   underlying surface (precomputed at sample time;
+                   used by emission / downstream tangent decomposition,
+                   not by the basic overlap check).
+        kc:        per-pair contact stiffness [N/m].
+    """
+
+    positions: np.ndarray
+    radii: np.ndarray
+    normals: np.ndarray
+    kc: float
+
+    def __post_init__(self):
+        if self.positions.ndim != 2 or self.positions.shape[1] != 3:
+            raise ValueError(
+                f"positions must be (M, 3), got {self.positions.shape}")
+        M = self.positions.shape[0]
+        if M < 1:
+            raise ValueError(f"M >= 1 required; got M = {M}")
+        if self.radii.shape != (M,):
+            raise ValueError(
+                f"radii must be (M,) with M = {M}; got {self.radii.shape}")
+        if self.normals.shape != (M, 3):
+            raise ValueError(
+                f"normals must be (M, 3) with M = {M}; "
+                f"got {self.normals.shape}")
+        if self.kc <= 0.0:
+            raise ValueError(f"kc > 0 required; got kc = {self.kc}")
+
+    @property
+    def M(self) -> int:
+        return int(self.positions.shape[0])
 
 
 def contact_energy_face_on(lat: Lattice, target: ContactTarget,
@@ -639,6 +835,318 @@ def solve_lattice_contact_numerical(lat: Lattice,
     return np.asarray(res.x, dtype=np.float64).reshape(lat.N, 3), info
 
 
+def solve_lattice_sphere_indenter(
+    lat: Lattice,
+    indenter: SphereIndenter,
+    r_lat: np.ndarray | float,
+    *,
+    lateral: LateralLaw = "distance_preserving",
+    delta0: np.ndarray | None = None,
+    eps: float = 5.0e-4,
+    tol: float = 1.0e-12,
+    maxiter: int = 5000,
+) -> tuple[np.ndarray, dict]:
+    """Multi-contact equilibrium of a lattice under a sphere indenter.
+
+    Step-8 generalisation of :func:`solve_lattice_contact_numerical`,
+    which assumed exactly one lattice sphere in contact (the
+    ``target.sphere_idx`` of :class:`ContactTarget`).  On a 3D dome the
+    indenter typically engages many spheres at once, so the equilibrium
+    energy carries one contact term per lattice sphere::
+
+        E_total = E_anchor + E_lateral + sum_i 0.5 * kc * sigma_eps(raw_i)^2
+        raw_i   = (r_lat[i] + R) - ||q_i - t||,    q_i = p_i - delta_i
+
+    The smooth surrogate ``sigma_eps(raw) = 0.5*(raw + sqrt(raw^2 + eps^2))``
+    keeps the gate C^infinity; ``eps`` defaults to the production
+    ``CSLCParams.smoothing_eps = 5e-4`` so theory runs exercise the same
+    regime as the kernel.  Set ``eps`` tiny (~1e-9) for sharp-gate
+    comparisons against the hard ``max(0, .)``.
+
+    The contact gradient picks up the smooth-step factor explicitly
+    (see ``theory.txt`` eq. ``contact-grad``)::
+
+        dE_c / d delta_i = +kc * phi_eff_i * sigma_eps'(raw_i) * e_hat_def_i
+        e_hat_def_i      = (q_i - t) / ||q_i - t||
+
+    matching the production kernel's ``jacobi_step`` load form.  Anchor
+    is isotropic (``ka_t_ratio = 1`` implicitly); friction is not
+    included here -- :class:`SphereIndenter` carries only normal contact.
+    Step-9 adds tangential-load grip on top of this solver.
+
+    Args:
+        lat: lattice (any topology -- chain, arc, dome).
+        indenter: sphere target (centre, radius, kc).
+        r_lat: per-sphere lattice radius [m] -- scalar or shape ``(N,)``.
+        lateral: ``"graph_laplacian"`` or ``"distance_preserving"``.
+        delta0: warm-start ``(N, 3)`` deltas; default zeros.
+        eps: smoothing width [m].
+        tol: L-BFGS-B ``gtol`` and ``ftol``.
+        maxiter: L-BFGS-B iteration cap.
+
+    Returns:
+        ``(deltas, info)`` where ``deltas`` is ``(N, 3)`` and ``info`` is
+        the same diagnostics dict shape as
+        :func:`solve_lattice_contact_numerical`.
+    """
+    N = lat.N
+    if np.isscalar(r_lat):
+        r_arr = np.full(N, float(r_lat), dtype=np.float64)
+    else:
+        r_arr = np.asarray(r_lat, dtype=np.float64)
+        if r_arr.shape != (N,):
+            raise ValueError(
+                f"r_lat must be scalar or shape ({N},), got {r_arr.shape}")
+
+    t = np.asarray(indenter.t, dtype=np.float64)
+    R = float(indenter.R)
+    kc = float(indenter.kc)
+
+    if delta0 is None:
+        delta0 = np.zeros((N, 3))
+
+    def _contact_terms(d: np.ndarray):
+        """Yield (i, phi_eff, smooth_step, e_hat_def) for each sphere
+        whose smoothed contact contribution is non-negligible.
+        ``raw < -50*eps`` is a safe inactive-skip threshold:
+        sigma_eps(raw) and sigma_eps'(raw) are both < 1e-9 there.
+        """
+        for i in range(N):
+            q_i = lat.p[i] - d[i]
+            diff = q_i - t
+            L = float(np.linalg.norm(diff))
+            if L < 1.0e-15:
+                continue
+            raw = (r_arr[i] + R) - L
+            if eps <= 0.0:
+                if raw <= 0.0:
+                    continue
+                phi_eff = raw
+                step = 1.0
+            else:
+                if raw < INACTIVE_RAW_EPS_FACTOR * eps:
+                    continue
+                r2 = raw * raw + eps * eps
+                sqr2 = np.sqrt(r2)
+                phi_eff = 0.5 * (raw + sqr2)
+                step = 0.5 * (1.0 + raw / sqr2)
+            e_hat = diff / L
+            yield i, phi_eff, step, e_hat
+
+    def fun(x: np.ndarray) -> float:
+        d = x.reshape(N, 3)
+        E = anchor_energy(lat, d)
+        if lateral == "graph_laplacian":
+            E += lateral_energy_graph_laplacian(lat, d)
+        elif lateral == "distance_preserving":
+            E += lateral_energy_distance_preserving(lat, d)
+        else:
+            raise ValueError(f"unknown lateral: {lateral!r}")
+        for _, phi_eff, _, _ in _contact_terms(d):
+            E += 0.5 * kc * phi_eff * phi_eff
+        return E
+
+    def jac(x: np.ndarray) -> np.ndarray:
+        d = x.reshape(N, 3)
+        g = np.zeros_like(d)
+        g += lat.ka * d
+        if lateral == "graph_laplacian":
+            for (i, j) in lat.edges:
+                diff = d[i] - d[j]
+                g[i] += lat.kl * diff
+                g[j] -= lat.kl * diff
+        elif lateral == "distance_preserving":
+            for (i, j) in lat.edges:
+                q_i = lat.p[i] - d[i]
+                q_j = lat.p[j] - d[j]
+                v = q_j - q_i
+                l = float(np.linalg.norm(v))
+                if l < 1.0e-15:
+                    continue
+                L_rest = float(np.linalg.norm(lat.p[j] - lat.p[i]))
+                e_hat = v / l
+                contrib = lat.kl * (l - L_rest) * e_hat
+                g[i] += contrib
+                g[j] -= contrib
+        else:
+            raise ValueError(f"unknown lateral: {lateral!r}")
+        for i, phi_eff, step, e_hat in _contact_terms(d):
+            g[i] += kc * phi_eff * step * e_hat
+        return g.reshape(-1)
+
+    res = minimize(
+        fun, delta0.reshape(-1), jac=jac, method="L-BFGS-B",
+        options={"gtol": tol, "ftol": tol, "maxiter": maxiter},
+    )
+    info = {
+        "success": bool(res.success),
+        "nit": int(res.nit),
+        "nfev": int(res.nfev),
+        "final_grad_norm": float(np.linalg.norm(res.jac)),
+        "energy": float(res.fun),
+        "message": str(res.message),
+        "n_active": sum(1 for _ in _contact_terms(res.x.reshape(N, 3))),
+    }
+    return np.asarray(res.x, dtype=np.float64).reshape(N, 3), info
+
+
+def solve_lattice_point_set_indenter(
+    lat: Lattice,
+    indenter: PointSetIndenter,
+    r_lat: np.ndarray | float,
+    *,
+    lateral: LateralLaw = "distance_preserving",
+    delta0: np.ndarray | None = None,
+    eps: float = 5.0e-4,
+    tol: float = 1.0e-12,
+    maxiter: int = 5000,
+) -> tuple[np.ndarray, dict]:
+    """Multi-pad multi-target equilibrium against a :class:`PointSetIndenter`.
+
+    Mirror of :func:`solve_lattice_sphere_indenter`, generalised from
+    one rigid sphere to M target points.  Each pad sphere can engage
+    several target points simultaneously; the contact energy is the
+    double sum
+
+        E_contact  =  sum_i  sum_j  (1/2) * kc * phi_eff_ij^2,
+        raw_ij     =  (r_lat[i] + R_j) - ||q_i - t_j||,
+        q_i        =  lat.p[i] - delta_i,
+        phi_eff_ij =  sigma_eps(raw_ij).
+
+    Reduces to ``solve_lattice_sphere_indenter`` for the single-point
+    case (M = 1, where the single point's radius = R and position = t).
+    This is the theory-side gold reference for the box-target kernel
+    work in Step 10 / C1.
+
+    Args:
+        lat: pad lattice.
+        indenter: :class:`PointSetIndenter` carrying M target points
+            + ``kc`` per pair.
+        r_lat: per-pad-sphere radius -- scalar (broadcasts to all
+            pad spheres) or shape (N,).
+        lateral: ``"distance_preserving"`` (default; matches
+            production) or ``"graph_laplacian"``.
+        delta0: warm-start (N, 3) array; defaults to zeros.
+        eps: smoothing width for the gates (matches production
+            ``CSLCParams.smoothing_eps = 5e-4`` by default).
+        tol, maxiter: passed straight through to L-BFGS-B.
+
+    Returns:
+        ``(deltas, info)`` -- same shape as
+        :func:`solve_lattice_sphere_indenter` plus ``info["n_active_pairs"]``
+        counting active (i, j) contacts at convergence.
+    """
+    N = lat.N
+    if np.isscalar(r_lat):
+        r_arr = np.full(N, float(r_lat), dtype=np.float64)
+    else:
+        r_arr = np.asarray(r_lat, dtype=np.float64)
+        if r_arr.shape != (N,):
+            raise ValueError(
+                f"r_lat must be scalar or shape ({N},), got {r_arr.shape}")
+
+    M = indenter.M
+    t_positions = np.asarray(indenter.positions, dtype=np.float64)  # (M, 3)
+    t_radii = np.asarray(indenter.radii, dtype=np.float64)          # (M,)
+    kc = float(indenter.kc)
+
+    if delta0 is None:
+        delta0 = np.zeros((N, 3))
+
+    def _contact_terms(d: np.ndarray):
+        """Yield ``(i, j, phi_eff, step, e_hat)`` for every active
+        (pad_sphere i, target_point j) pair.
+
+        ``raw < -50*eps`` is the safe inactive-skip threshold:
+        ``sigma_eps(raw)`` and ``sigma_eps'(raw)`` are both < 1e-9 there.
+        The same threshold the SphereIndenter solver uses.
+        """
+        for i in range(N):
+            q_i = lat.p[i] - d[i]
+            r_i = r_arr[i]
+            for j in range(M):
+                diff = q_i - t_positions[j]
+                L = float(np.linalg.norm(diff))
+                if L < 1.0e-15:
+                    continue
+                raw = (r_i + t_radii[j]) - L
+                if eps <= 0.0:
+                    if raw <= 0.0:
+                        continue
+                    phi_eff = raw
+                    step = 1.0
+                else:
+                    if raw < INACTIVE_RAW_EPS_FACTOR * eps:
+                        continue
+                    r2 = raw * raw + eps * eps
+                    sqr2 = np.sqrt(r2)
+                    phi_eff = 0.5 * (raw + sqr2)
+                    step = 0.5 * (1.0 + raw / sqr2)
+                e_hat = diff / L
+                yield i, j, phi_eff, step, e_hat
+
+    def fun(x: np.ndarray) -> float:
+        d = x.reshape(N, 3)
+        E = anchor_energy(lat, d)
+        if lateral == "graph_laplacian":
+            E += lateral_energy_graph_laplacian(lat, d)
+        elif lateral == "distance_preserving":
+            E += lateral_energy_distance_preserving(lat, d)
+        else:
+            raise ValueError(f"unknown lateral: {lateral!r}")
+        for _, _, phi_eff, _, _ in _contact_terms(d):
+            E += 0.5 * kc * phi_eff * phi_eff
+        return E
+
+    def jac(x: np.ndarray) -> np.ndarray:
+        d = x.reshape(N, 3)
+        g = np.zeros_like(d)
+        g += lat.ka * d
+        if lateral == "graph_laplacian":
+            for (i, j) in lat.edges:
+                diff = d[i] - d[j]
+                g[i] += lat.kl * diff
+                g[j] -= lat.kl * diff
+        elif lateral == "distance_preserving":
+            for (i, j) in lat.edges:
+                q_i = lat.p[i] - d[i]
+                q_j = lat.p[j] - d[j]
+                v = q_j - q_i
+                l = float(np.linalg.norm(v))
+                if l < 1.0e-15:
+                    continue
+                L_rest = float(np.linalg.norm(lat.p[j] - lat.p[i]))
+                e_hat = v / l
+                contrib = lat.kl * (l - L_rest) * e_hat
+                g[i] += contrib
+                g[j] -= contrib
+        else:
+            raise ValueError(f"unknown lateral: {lateral!r}")
+        # Contact gradient -- per-pair contribution at pad sphere i
+        # along ``e_hat_ij``.  Same series-spring chain-rule with
+        # ``smooth_step`` factor that the single-target solver uses;
+        # see ``theory.txt`` eq. ``contact-grad``.
+        for i, _, phi_eff, step, e_hat in _contact_terms(d):
+            g[i] += kc * phi_eff * step * e_hat
+        return g.reshape(-1)
+
+    res = minimize(
+        fun, delta0.reshape(-1), jac=jac, method="L-BFGS-B",
+        options={"gtol": tol, "ftol": tol, "maxiter": maxiter},
+    )
+    info = {
+        "success": bool(res.success),
+        "nit": int(res.nit),
+        "nfev": int(res.nfev),
+        "final_grad_norm": float(np.linalg.norm(res.jac)),
+        "energy": float(res.fun),
+        "message": str(res.message),
+        "n_active_pairs": sum(
+            1 for _ in _contact_terms(res.x.reshape(N, 3))),
+    }
+    return np.asarray(res.x, dtype=np.float64).reshape(N, 3), info
+
+
 # ────────────────────────────────────────────────────────────────────────
 #  Equilibrium solvers (no contact in step 2 -- just anchor + lateral
 #  + external load)
@@ -758,8 +1266,11 @@ __all__ = [
     "Lattice",
     "LateralLaw",
     "ContactTarget",
+    "SphereIndenter",
+    "PointSetIndenter",
     "make_chain",
     "make_arc",
+    "make_dome",
     "build_K_matrix",
     "chain_analytical_eigenvalues",
     "chain_discrete_decay_length",
@@ -768,6 +1279,8 @@ __all__ = [
     "solve_chain_contact_linear",
     "solve_lattice_contact_linear",
     "solve_lattice_contact_numerical",
+    "solve_lattice_sphere_indenter",
+    "solve_lattice_point_set_indenter",
     "anchor_force_all",
     "anchor_energy",
     "lateral_force_graph_laplacian",

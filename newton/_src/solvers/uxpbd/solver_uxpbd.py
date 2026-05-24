@@ -532,6 +532,65 @@ class SolverUXPBD(SolverBase):
                     device=model.device,
                 )
                 state_out.particle_q = new_q_stab
+
+                # §4.4 extension: SM-rigid rigidity restoration (position-only).
+                # The contact pass above shifts only the penetrating particles,
+                # which leaves any SM-rigid cluster non-rigidly deformed. The
+                # main loop's apply_particle_deltas_uxpbd uses the PBD-R
+                # v_new = vp + d/dt update, so leaving the deformation for the
+                # main loop to undo injects velocity (sub-mm d over dt~6e-4 s
+                # is m/s-scale v; see srxpbd.pdf §III-B for the velocity-update
+                # rationale, uppfrta_preprint.pdf §4.4 for stabilization).
+                # Resolving rigidity here -- still position-only, so particle_qd
+                # is untouched and §4.4's no-velocity-injection contract holds
+                # -- pre-empts that velocity injection without breaking the
+                # fluid path (fluid particles aren't in any SM group, so the
+                # SM kernel writes delta=0 for them and apply_particle_deltas_
+                # position_only passes them through unchanged).
+                # Required to make SM-rigid + fluid scenes (Macklin '14 Fig. 1
+                # bunnies-in-water) stable in PBD-R-updated UXPBD.
+                if (self._num_dynamic_groups > 0
+                        and model.particle_count > 0):
+                    self._particle_deltas.zero_()
+                    self._P_b4.zero_()
+                    self._L_b4.zero_()
+                    bd_sm = self._shape_match_block_dim
+                    wp.launch(
+                        kernel=solve_shape_matching_batch_tiled,
+                        dim=(self._num_dynamic_groups, bd_sm),
+                        inputs=[
+                            state_out.particle_q,
+                            self.particle_q_rest,
+                            state_out.particle_qd,
+                            self.total_group_mass,
+                            model.particle_mass,
+                            self._group_particle_start,
+                            self._group_particle_count,
+                            self._group_particles_flat,
+                        ],
+                        outputs=[
+                            self._particle_deltas,
+                            self._P_b4,
+                            self._L_b4,
+                        ],
+                        block_dim=bd_sm,
+                        device=model.device,
+                    )
+                    new_q_stab_sm = self._alt_particle_q(state_out)
+                    wp.launch(
+                        kernel=apply_particle_deltas_position_only,
+                        dim=model.particle_count,
+                        inputs=[
+                            state_out.particle_q,
+                            model.particle_flags,
+                            model.particle_mass,
+                            self._particle_deltas,
+                        ],
+                        outputs=[new_q_stab_sm],
+                        device=model.device,
+                    )
+                    state_out.particle_q = new_q_stab_sm
+
                 # Re-sync lattice particle positions from the (unchanged)
                 # body_q so the next stabilization iter sees consistent state.
                 self.update_lattice_world_positions(state_out)

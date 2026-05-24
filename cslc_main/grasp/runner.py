@@ -13,6 +13,7 @@ viewer's ``Example`` exposes ``step``/``render``/``test_final`` so the
 from __future__ import annotations
 
 import time
+import types
 from typing import Any
 
 import numpy as np
@@ -27,6 +28,31 @@ from .params import GraspConfig
 from .scene import SceneArtifacts, build_scene
 from .solvers import make_solver
 from .visualization import LatticeRenderer, StatsPanel, save_lattice_preview, save_postsim_plots
+
+
+# ── Wrench instrumentation ─────────────────────────────────────────────
+
+
+def _attach_qfrc_actuator(states: tuple, model) -> None:
+    """Pre-allocate ``state.mujoco.qfrc_actuator`` on each state.
+
+    Benchmark §7.1 / Appendix A wrench-readout pattern.  MuJoCo's
+    solver writes the per-DOF joint-actuator force into
+    ``state.mujoco.qfrc_actuator`` only if the field exists at
+    ``solver.step`` call time.  The conventional
+    ``Contacts.rigid_contact_force`` buffer is allocated by Newton
+    but NEVER populated by MuJoCo's solver path — qfrc_actuator is
+    the only working route for per-pad real contact wrench.
+
+    Safe to call unconditionally: on non-MuJoCo solvers the buffer
+    is allocated but ignored.  Adds ~``model.joint_dof_count *
+    4 bytes`` of GPU memory per state (negligible).
+    """
+    for state in states:
+        state.mujoco = types.SimpleNamespace()
+        state.mujoco.qfrc_actuator = wp.zeros(
+            model.joint_dof_count, dtype=wp.float32, device=model.device,
+        )
 
 
 # ── Shared sim step ─────────────────────────────────────────────────────
@@ -85,6 +111,7 @@ def run_headless(config: GraspConfig) -> Metrics:
     control = model.control()
     contacts = model.contacts()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+    _attach_qfrc_actuator((state_0, state_1), model)
 
     logger = CSVLogger(config)
     if config.logging.save_lattice_preview:
@@ -197,6 +224,7 @@ class Example:
         self.control = self.model.control()
         self.contacts = self.model.contacts()
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        _attach_qfrc_actuator((self.state_0, self.state_1), self.model)
 
         self.logger = CSVLogger(config)
         if config.logging.save_lattice_preview:

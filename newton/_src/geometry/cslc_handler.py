@@ -22,11 +22,14 @@ import warp as wp
 from .cslc_data import CSLCData, CSLCLattice, calibrate_kc
 from .cslc_kernels import (
     compute_cslc_penetration,
+    compute_cslc_penetration_point_set,
     compute_outward_normals_world,
     cslc_copy_active,
     jacobi_step,
+    jacobi_step_point_set,
     lattice_solve_equilibrium,
     write_cslc_contacts,
+    write_cslc_contacts_point_set,
 )
 
 if TYPE_CHECKING:
@@ -47,10 +50,17 @@ _GEOTYPE_SPHERE = 3   # GeoType.SPHERE
 class CSLCShapePair:
     """A shape pair where one shape has the CSLC flag.
 
-    Only sphere targets are supported in this pass.  ``other_geo_type``
-    is kept as a field so that re-adding mesh / box targets in step 7b
-    (one of the deferred items in notes.md) is a localised change to
-    the dispatch path, not a dataclass shape change.
+    Supports two target geometries (selected by ``is_point_set``):
+
+    * Sphere target (``is_point_set = False``): single (local position,
+      radius) pair.  Dispatched to ``_launch_vs_sphere``.
+    * Point-set target (``is_point_set = True``): arrays of target
+      positions / radii, plus the per-pair K_max contact-buffer budget.
+      Dispatched to ``_launch_vs_point_set`` (C2d).
+
+    The sphere fields stay valid (and unused) when ``is_point_set =
+    True``; the point-set fields stay ``None`` / ``0`` when
+    ``is_point_set = False``.
     """
 
     cslc_shape: int
@@ -63,9 +73,24 @@ class CSLCShapePair:
     # mean composition kc_series = kc·ke / (kc+ke+eps²).  Default 1e9
     # recovers the rigid-target limit (kc_series → kc) automatically.
     other_ke: float = 1.0e9
-    # Sphere-target fields:
+    # Sphere-target fields (consumed by _launch_vs_sphere):
     other_local_pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
     other_radius: float = 0.0
+    # C2d point-set target fields (consumed by _launch_vs_point_set).
+    # ``is_point_set`` is the dispatch flag in ``launch()``;
+    # ``target_positions_local`` and ``target_radii`` are GPU-resident
+    # wp.arrays in the target body's local frame, sized by
+    # ``target_count``.  ``K_max`` is the per-pad-sphere contact-buffer
+    # budget; size from geometry using INCLUSION_FACTOR from
+    # cslc_main/theory/cslc_theory.py (see C2e helper
+    # ``cslc_main.grasp.objects.compute_k_max``).  The handler's
+    # runtime truncation counter (see ``_launch_vs_point_set``) is the
+    # backstop if the sizing under-counts on a new geometry.
+    is_point_set: bool = False
+    target_positions_local: wp.array | None = None
+    target_radii: wp.array | None = None
+    target_count: int = 0
+    K_max: int = 0
 
 class CSLCHandler:
     """CSLC contact generation handler for Newton's collision pipeline.
@@ -92,8 +117,28 @@ class CSLCHandler:
            (``write_cslc_contacts``).
 
     Attributes:
-        contact_count: Number of contact slots CSLC writes
-            (``= n_surface_spheres * n_pair_blocks``).
+        contact_count: Number of contact slots CSLC writes.  For a
+            mixed-pair handler the slot budget is heterogeneous:
+
+                sphere pair        -> n_surface_spheres   slots
+                point-set pair     -> n_surface_spheres * pair.K_max
+
+            ``contact_count`` returns the sum across all pairs.  This
+            saves memory vs uniform K_max allocation -- typically a few
+            MB at production densities -- and keeps the sphere kernel's
+            single-slot-per-pad-sphere write pattern untouched.
+
+    Diagnostic-array gap (C2d)
+    --------------------------
+    The per-contact diagnostic arrays
+    (``dbg_pen_scale``, ``dbg_solver_pen``, ``dbg_effective_r``,
+    ``dbg_d_proj``, ``dbg_radial``) are populated only by
+    ``write_cslc_contacts`` (sphere targets).  ``write_cslc_contacts_point_set``
+    does NOT take these as outputs -- per-pair diagnostics for point-set
+    targets are deferred to C3+.  Readers of the diagnostic arrays must
+    check ``shape_pairs[pair_idx].is_point_set`` and treat a True as
+    "no per-contact diagnostics for this pair block; expect the
+    sentinel pen_scale = -1.0".
     """
 
     def __init__(
@@ -170,30 +215,77 @@ class CSLCHandler:
         self._jacobi_a = wp.zeros(n, dtype=wp.vec3, device=self.device)
         self._jacobi_b = wp.zeros(n, dtype=wp.vec3, device=self.device)
 
+        # C2d: per-pair truncation counter for point-set pairs.  One
+        # int32 array per pair (sized 1, atomic-incremented inside
+        # write_cslc_contacts_point_set, zeroed at the start of each
+        # launch).  Sphere pairs allocate a buffer too -- unused, but
+        # keeps the per-pair indexing trivial.  Read on CPU after
+        # ``launch()`` returns; non-zero entries mean the K_max for
+        # that pair undersized at runtime (see RuntimeWarning in
+        # _launch_vs_point_set).
+        self.truncation_count_pairs = [
+            wp.zeros(1, dtype=wp.int32, device=self.device)
+            for _ in range(max(n_pair_blocks, 1))
+        ]
+
 
     @property
     def contact_count(self) -> int:
-        return self.n_surface_contacts * self.n_pair_blocks
+        """Total CSLC contact-buffer slots, summed across pairs.
 
-
-    def get_phi_for_cslc_shape(self, cslc_shape_idx: int) -> wp.array:
-        """Return the raw_penetration buffer that was last written for a
-        given CSLC body (by shape index).
-
-        Each pair launch uses its own scratch buffer; kernel 1 zeros every
-        sphere that doesn't belong to the active lattice.  So to read body P's
-        phi after collide() we need the buffer from the pair that had
-        cslc_shape == P.  Returns None if the CSLC body has no supported pair.
+        Heterogeneous per-pair sizing:
+          * sphere pair    -> n_surface_contacts   slots
+          * point-set pair -> n_surface_contacts * pair.K_max  slots
         """
-        # Walk shape_pairs in the same order launch() does, but only count
-        # sphere pairs (the ones that actually allocate a buffer).
-        sphere_pair_idx = 0
+        total = 0
         for pair in self.shape_pairs:
-            if pair.other_geo_type != _GEOTYPE_SPHERE:
-                continue
+            if pair.is_point_set:
+                total += self.n_surface_contacts * pair.K_max
+            else:
+                total += self.n_surface_contacts
+        return total
+
+
+    def get_phi_for_cslc_shape(self, cslc_shape_idx: int) -> wp.array | None:
+        """Return the raw_penetration buffer last written for a CSLC body.
+
+        Walks ``shape_pairs`` and returns the per-pair scratch buffer
+        for the FIRST pair whose ``cslc_shape == cslc_shape_idx``.
+
+        Phi semantics by pair type
+        --------------------------
+        * Sphere pair (``is_point_set == False``):
+          ``phi_rest = smooth_relu((r_lat + R_target) - dist, eps) *
+          smooth_step(dist, eps)``, single-target overlap; what every
+          existing diagnostic reader (Step 11 figures, calibration
+          scripts) was built against.
+
+        * Point-set pair (``is_point_set == True``):
+          argmax-overlap warm-start phi (the ``compute_cslc_penetration_point_set``
+          output -- the per-pad-sphere most-overlapping target's phi).
+          NOT a sum across all overlapping targets; if you need the
+          aggregate normal-axis force you have to walk the contact
+          buffer instead.
+
+        Index correctness note (C2d)
+        ----------------------------
+        ``raw_penetration_pairs`` is allocated with one entry per
+        ``shape_pairs`` entry, indexed by the FULL pair index (the same
+        ``pair_idx`` that ``launch()`` passes to ``_launch_vs_sphere``
+        / ``_launch_vs_point_set``).  An earlier version of this getter
+        walked only sphere pairs with a separate counter -- which
+        happened to coincide with the full pair index in sphere-only
+        scenes, but returned the wrong buffer on the first mixed sphere
+        + point-set scene.  The full-index walk below is correct for
+        both.
+
+        Returns:
+            The raw_penetration buffer for the first matching pair, or
+            ``None`` if no pair has ``cslc_shape == cslc_shape_idx``.
+        """
+        for pair_idx, pair in enumerate(self.shape_pairs):
             if pair.cslc_shape == cslc_shape_idx:
-                return self.raw_penetration_pairs[sphere_pair_idx]
-            sphere_pair_idx += 1
+                return self.raw_penetration_pairs[pair_idx]
         return None
 
 
@@ -393,6 +485,21 @@ class CSLCHandler:
 
         Called by CollisionPipeline.collide() AFTER the standard narrow phase.
 
+        Dispatch:
+          * ``pair.is_point_set``                 -> ``_launch_vs_point_set`` (C2d)
+          * ``pair.other_geo_type == SPHERE``     -> ``_launch_vs_sphere``
+          * otherwise                             -> RuntimeWarning, skipped
+
+        Per-pair buffer offsets accumulate heterogeneously (sphere pair
+        = ``n_surface_contacts`` slots; point-set pair = ``n_surface_contacts
+        * pair.K_max`` slots) -- see the ``contact_count`` property.
+
+        After all pairs launch, CPU-reads the per-pair truncation
+        counters for point-set pairs and raises ``RuntimeWarning`` if
+        any pad sphere overflowed its K_max budget -- the actionable
+        signal to raise ``K_max`` in the caller's geometry-derived
+        sizing.
+
         Args:
             model: The simulation Model.
             state: Current State (provides body_q).
@@ -400,19 +507,51 @@ class CSLCHandler:
             contact_offset: Starting index in contacts buffer for CSLC slots.
         """
 
-        # Walk sphere-target pairs.  Step 7 cleanup: box / mesh / SDF
-        # targets are deferred to step 7b.
-        pair_idx = 0
-        for pair in self.shape_pairs:
-            if pair.other_geo_type == _GEOTYPE_SPHERE:
-                pair_contact_offset = contact_offset + pair_idx * self.n_surface_contacts
+        # Accumulate the per-pair contact-buffer offset.  Heterogeneous
+        # sizing means we cannot use ``pair_idx * n_surface_contacts``
+        # uniformly any more.
+        pair_offset = contact_offset
+        truncation_pairs: list[tuple[int, int]] = []  # (pair_idx, K_max)
+        for pair_idx, pair in enumerate(self.shape_pairs):
+            if pair.is_point_set:
+                self._launch_vs_point_set(
+                    model, state, contacts, pair_offset, pair, pair_idx)
+                pair_offset += self.n_surface_contacts * pair.K_max
+                truncation_pairs.append((pair_idx, pair.K_max))
+            elif pair.other_geo_type == _GEOTYPE_SPHERE:
                 self._launch_vs_sphere(
-                    model, state, contacts, pair_contact_offset, pair, pair_idx)
-                pair_idx += 1
+                    model, state, contacts, pair_offset, pair, pair_idx)
+                pair_offset += self.n_surface_contacts
             else:
                 warnings.warn(
-                    f"CSLC vs geometry type {pair.other_geo_type} not yet implemented. "
-                    "Only CSLC vs SPHERE is supported (step 7).",
+                    f"CSLC vs geometry type {pair.other_geo_type} not yet "
+                    "implemented.  Supported: SPHERE (sphere-target path), "
+                    "or any geo with ``pair.is_point_set = True`` (point-set "
+                    "path).  Pair skipped.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+        # CPU read of truncation counters for point-set pairs.  Each
+        # counter is the number of PAD SPHERES that overflowed K_max
+        # (not the number of dropped pairs).  Non-zero means K_max was
+        # under-sized for this scene's geometry -- the active-set
+        # inclusion radius (r_lat + R + INCLUSION_FACTOR*eps from
+        # cslc_main/theory/cslc_theory.py) is wider than the K_max
+        # buffer accommodated, so a non-trivial slice of contact
+        # wrench was silently dropped.
+        for pair_idx, k_max in truncation_pairs:
+            n_trunc = int(self.truncation_count_pairs[pair_idx].numpy()[0])
+            if n_trunc > 0:
+                warnings.warn(
+                    f"CSLC point-set pair {pair_idx} truncated K_max={k_max} "
+                    f"on {n_trunc} pad sphere(s).  Up to "
+                    f"{n_trunc} * (active_pairs_per_pad - K_max) contact "
+                    f"pairs were silently dropped, with per-pair force in "
+                    f"the 0.025-0.4 N range each at production parameters. "
+                    f"Raise K_max for this pair (either in the geometry-"
+                    f"derived sizing in cslc_main/grasp/objects.compute_k_max, "
+                    f"or via direct CSLCShapePair.K_max override).",
                     RuntimeWarning,
                     stacklevel=2,
                 )
@@ -618,4 +757,189 @@ class CSLCHandler:
                 ],
                 device=self.device,
             )
+
+
+    def _launch_vs_point_set(
+        self,
+        model: "Model",
+        state: "State",
+        contacts: "Contacts",
+        contact_offset: int,
+        pair: CSLCShapePair,
+        pair_idx: int,
+    ) -> None:
+        """Per-pair kernel pipeline for CSLC lattice vs PointSetTarget (C2d).
+
+        Structural mirror of :meth:`_launch_vs_sphere` with the point-set
+        kernel triple substituted in.  Launch order:
+
+            1. ``compute_cslc_penetration_point_set``   (argmax-overlap warm-start)
+            2. ``compute_outward_normals_world``        (shared with sphere path)
+            3. ``lattice_solve_equilibrium``            (unchanged — consumes phi + n_eff)
+            4. ``jacobi_step_point_set`` × ``n_iter``   (point-set Jacobi refinement)
+            5. ``cslc_copy_active``                     (active-lattice selective copy)
+            6. ``write_cslc_contacts_point_set``        (K_max contacts per pad sphere)
+
+        The warm-start uses the argmax-overlap target per pad sphere
+        (C2d option a').  This picks the single most-overlapping target
+        per pad sphere, then feeds the resulting (phi_rest, n_eff)
+        pair into the existing ``lattice_solve_equilibrium`` solver --
+        no new linear-solve kernel.  The dominant single-contact
+        equilibrium is absorbed by the warm-start; ``jacobi_step_point_set``
+        sweeps refine the multi-point correction.  At production
+        ``n_iter=40`` this matches the sphere-target convergence
+        characterisation, so the same iteration budget applies to both
+        paths.
+        """
+        data = self.cslc_data
+
+        # Each pair gets its own raw_penetration scratch (reused across
+        # sphere and point-set warm-starts).  The externally-visible
+        # alias points at this pair so post-collide() readers see the
+        # latest phi for this lattice.
+        pen_buf = self.raw_penetration_pairs[pair_idx]
+        self.raw_penetration = pen_buf
+
+        eps = float(data.smoothing_eps)
+
+        # Reset the per-pair truncation counter before this launch.
+        # CPU read happens in ``launch()`` after collide() returns.
+        self.truncation_count_pairs[pair_idx].zero_()
+
+        # ── Kernel 1: Argmax-overlap warm-start penetration ──
+        # NOTE: signature differs slightly from compute_cslc_penetration
+        # -- no sphere_outward_normal (point-set kernel handles
+        # degenerate-coincident targets by ``continue``, never falls
+        # back to the rest outward normal).
+        wp.launch(
+            kernel=compute_cslc_penetration_point_set,
+            dim=data.n_spheres,
+            inputs=[
+                data.positions, data.radii, data.sphere_delta,
+                data.sphere_shape, data.is_surface,
+                state.body_q, model.shape_body, model.shape_transform,
+                pair.cslc_shape,
+                pair.other_body,
+                pair.target_positions_local, pair.target_radii,
+                pair.target_count,
+                eps,
+            ],
+            outputs=[pen_buf, self.contact_normal_scratch],
+            device=self.device,
+        )
+
+        # ── Kernel 1b: World-frame outward normals (shared) ──
+        wp.launch(
+            kernel=compute_outward_normals_world,
+            dim=data.n_spheres,
+            inputs=[
+                data.outward_normals, data.sphere_shape,
+                state.body_q, model.shape_body, model.shape_transform,
+            ],
+            outputs=[self.out_normal_world_scratch],
+            device=self.device,
+        )
+
+        # ── Kernel 2: Lattice equilibrium solve (unchanged from sphere path) ──
+        # See _launch_vs_sphere for the linear-warm-start rationale; the
+        # closed-form solve consumes the argmax-overlap (phi, n_eff) pair
+        # exactly as it does for sphere targets.
+        if data.A_inv is not None:
+            wp.launch(
+                kernel=lattice_solve_equilibrium,
+                dim=data.n_spheres,
+                inputs=[data.A_inv, data.A_inv_t, pen_buf,
+                        self.contact_normal_scratch,
+                        self.out_normal_world_scratch, data.kc],
+                outputs=[self._jacobi_a],
+                device=self.device,
+            )
+            src, dst = self._jacobi_a, self._jacobi_b
+        else:
+            wp.copy(self._jacobi_a, data.sphere_delta)
+            src, dst = self._jacobi_a, self._jacobi_b
+
+        # ── Damped Jacobi refinement with the point-set contact law ──
+        # Same n_iter budget as the sphere path: the argmax-overlap
+        # warm-start absorbs the dominant single-contact equilibrium,
+        # leaving only the multi-point correction for the Jacobi
+        # sweeps to converge.
+        for _ in range(self.n_iter):
+            wp.launch(
+                kernel=jacobi_step_point_set,
+                dim=data.n_spheres,
+                inputs=[
+                    src, dst,
+                    data.radii,
+                    data.positions,
+                    data.neighbor_rest_length,
+                    data.is_surface,
+                    data.neighbor_start, data.neighbor_count,
+                    data.neighbor_list,
+                    data.ka, data.kl, data.kc, self.alpha,
+                    data.sphere_shape, pair.cslc_shape,
+                    data.outward_normals,
+                    state.body_q, model.shape_body, model.shape_transform,
+                    data.ka_tangent_ratio,
+                    data.k_stick, data.mu_friction,
+                    pair.target_positions_local, pair.target_radii,
+                    pair.target_count, pair.other_body,
+                    # No external tangential load in production
+                    # (apex_idx = -1 is the no-op sentinel).
+                    int(-1), wp.vec3(0.0, 0.0, 0.0),
+                    eps,
+                ],
+                device=self.device,
+            )
+            src, dst = dst, src
+
+        # ── Active-lattice selective copy of converged delta ──
+        wp.launch(
+            kernel=cslc_copy_active,
+            dim=data.n_spheres,
+            inputs=[src, data.sphere_shape, pair.cslc_shape],
+            outputs=[data.sphere_delta],
+            device=self.device,
+        )
+
+        # ── Kernel 3: Write per-pair contacts (up to K_max per pad sphere) ──
+        # Per-pad-sphere diagnostic arrays (dbg_pen_scale, etc.) are NOT
+        # populated by this kernel -- the point-set emit path does not
+        # take them as outputs.  See the class docstring's "Diagnostic-
+        # array gap" note; the diagnostic readers must check
+        # ``shape_pairs[pair_idx].is_point_set`` and skip these blocks.
+        wp.launch(
+            kernel=write_cslc_contacts_point_set,
+            dim=data.n_spheres,
+            inputs=[
+                data.positions, data.radii, src,
+                data.sphere_shape, data.is_surface, data.outward_normals,
+                state.body_q, model.shape_body, model.shape_transform,
+                pair.cslc_shape,
+                pair.other_body, pair.other_shape,
+                pair.target_positions_local, pair.target_radii,
+                pair.target_count,
+                contact_offset, pair.K_max, self.surface_slot_map,
+                contacts.rigid_contact_shape0,
+                contacts.rigid_contact_shape1,
+                contacts.rigid_contact_point0,
+                contacts.rigid_contact_point1,
+                contacts.rigid_contact_offset0,
+                contacts.rigid_contact_offset1,
+                contacts.rigid_contact_normal,
+                contacts.rigid_contact_margin0,
+                contacts.rigid_contact_margin1,
+                contacts.rigid_contact_tids,
+                model.shape_material_mu,
+                data.kc,
+                pair.other_ke,
+                data.dc,
+                eps,
+                contacts.rigid_contact_stiffness,
+                contacts.rigid_contact_damping,
+                contacts.rigid_contact_friction,
+                self.truncation_count_pairs[pair_idx],
+            ],
+            device=self.device,
+        )
 

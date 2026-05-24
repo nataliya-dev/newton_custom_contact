@@ -44,19 +44,25 @@ from scipy.optimize import minimize
 from cslc_main.theory.cslc_lattice import (
     ContactTarget,
     Lattice,
+    PointSetIndenter,
     anchor_energy,
     lateral_energy_distance_preserving,
     solve_lattice_contact_numerical,
+    solve_lattice_point_set_indenter,
 )
 from cslc_main.theory.cslc_theory import (
+    INACTIVE_RAW_EPS_FACTOR,
     LatticeSphere,
+    PointSetTarget,
     RigidTarget,
     contact_raw_overlap,
     deformed_centre,
     effective_penetration,
     equilibrium_face_on_analytical,
     equilibrium_numerical,
+    equilibrium_point_set_numerical,
     equilibrium_with_friction_smooth_numerical,
+    point_set_raw_overlaps,
     rest_overlap,
     smooth_step,
 )
@@ -102,6 +108,13 @@ class KernelScene:
             to the lattice sphere (single-sphere scenes only -- the
             multi-sphere solver doesn't currently accept an external
             tangential load).
+        target_point_set: optional ``PointSetTarget`` for box / mesh /
+            multi-point targets (Step 10 onwards).  When set, the
+            ``target_position`` and ``target_radius`` fields are
+            IGNORED and per-(pad_sphere, target_point) contact is
+            computed via :func:`cslc_theory.point_set_raw_overlaps`
+            and friends.  Backward compatible: existing single-sphere
+            scenes leave this ``None`` and behave exactly as before.
     """
 
     positions: np.ndarray
@@ -119,10 +132,15 @@ class KernelScene:
     mu_friction: float = 0.0
     eps: float = 1.0e-5
     f_ext_tangent: np.ndarray | None = None
+    target_point_set: PointSetTarget | None = None
 
     @property
     def n_spheres(self) -> int:
         return int(self.positions.shape[0])
+
+    @property
+    def is_point_set(self) -> bool:
+        return self.target_point_set is not None
 
     def __post_init__(self) -> None:
         if self.positions.shape[1] != 3:
@@ -150,6 +168,10 @@ class KernelScene:
                 "f_ext_tangent is only supported for single-sphere scenes; "
                 "the multi-sphere theory solver doesn't accept an external "
                 "tangential load yet.")
+        if self.target_point_set is not None and self.f_ext_tangent is not None:
+            raise ValueError(
+                "f_ext_tangent + target_point_set is deferred to C2+; "
+                "C1a covers normal contact only on the point-set path.")
 
 
 @dataclass
@@ -187,13 +209,93 @@ class KernelSolution:
 def solve_theory(scene: KernelScene) -> KernelSolution:
     """Solve the scene's quasi-static equilibrium via the theory primitives.
 
-    Dispatches to the single-sphere solver for ``N == 1`` and to the
-    lattice solver for ``N >= 2``.  Returns the gold-reference
-    ``KernelSolution`` for kernel comparison.
+    Dispatch matrix:
+
+      * ``scene.target_point_set is not None`` -- route through the
+        point-set path (Step 10 / C1).  Single pad sphere uses
+        :func:`cslc_theory.equilibrium_point_set_numerical`; multi-pad
+        uses :func:`cslc_lattice.solve_lattice_point_set_indenter`.
+
+      * Otherwise (sphere target) -- existing single-sphere /
+        multi-sphere paths (Step 7).
     """
+    if scene.is_point_set:
+        if scene.n_spheres == 1:
+            return _solve_single_sphere_point_set(scene)
+        return _solve_lattice_point_set(scene)
     if scene.n_spheres == 1:
         return _solve_single_sphere(scene)
     return _solve_lattice(scene)
+
+
+def compute_contact_force_point_set(scene: KernelScene,
+                                    deltas: np.ndarray) -> np.ndarray:
+    """Per-pad-sphere aggregate contact force for a point-set scene.
+
+    For each pad sphere ``i``, sum the per-target-point contact force
+
+        f_ij = kc * smooth_relu(raw_ij, eps) * (q_i - t_j)/||q_i - t_j||
+
+    over every overlapping target point ``j``.  Returns a (N, 3) vec3
+    field where row ``i`` is the aggregate force on pad sphere ``i``.
+
+    This is the theory's "per-pad sum" that Step C1's smoke-test kernel
+    is expected to converge to (the kernel computes the same sum on
+    the GPU before C2 wires per-pair contact emission).
+
+    **Inactive-pair skip** (B1 fix).  We exclude pairs with
+    ``raw_ij < -50 * eps`` from the sum, matching the kernel's
+    ``compute_pad_force_vs_point_set`` and the solver's
+    ``_contact_terms`` helper in ``cslc_lattice`` / the bridge's own
+    ``_solve_lattice_multi_contact``.  Without the skip, the gold
+    reference would silently sum ~ ``kc * eps / 200`` worth of
+    "smooth-tail" residual per excluded pair -- harmless on
+    cancellation-friendly face-on scenes (where the test passed at
+    4e-6 rel err in C1c), but would attribute kernel-correct behavior
+    to "drift" on off-axis / asymmetric scenes.  Also brings the
+    evaluator self-consistent with the solver it sits next to.
+
+    Args:
+        scene: must have ``scene.target_point_set is not None``.
+        deltas: (N, 3) per-pad-sphere displacements.
+
+    Returns:
+        (N, 3) per-pad-sphere aggregate contact force in world frame.
+    """
+    if not scene.is_point_set:
+        raise ValueError(
+            "compute_contact_force_point_set requires a point-set scene; "
+            "use compute_contact_force for single-sphere targets.")
+    if deltas.shape != (scene.n_spheres, 3):
+        raise ValueError(
+            f"deltas must be ({scene.n_spheres}, 3), got {deltas.shape}")
+    pst = scene.target_point_set
+    f = np.zeros((scene.n_spheres, 3), dtype=np.float64)
+    for i in range(scene.n_spheres):
+        if not bool(scene.is_surface[i]):
+            continue
+        sphere = LatticeSphere(
+            p=scene.positions[i].astype(np.float64),
+            r=float(scene.radii[i]),
+            n=scene.outward_normals[i].astype(np.float64),
+            ka=scene.ka,
+        )
+        raws, dirs = point_set_raw_overlaps(
+            sphere, pst, deltas[i].astype(np.float64))
+        # Inactive-pair skip matches the kernel exactly via the shared
+        # INACTIVE_RAW_EPS_FACTOR constant:
+        # raw < FACTOR * eps  ==>  smooth_relu(raw, eps) < 1e-9 anyway,
+        # so the excluded contribution is below numerical noise.
+        if scene.eps <= 0.0:
+            active = raws > 0.0
+            phi_effs = np.where(active, raws, 0.0)
+        else:
+            active = raws >= INACTIVE_RAW_EPS_FACTOR * scene.eps
+            phi_effs = 0.5 * (raws + np.sqrt(
+                raws * raws + scene.eps * scene.eps))
+            phi_effs = np.where(active, phi_effs, 0.0)
+        f[i] = scene.kc * (phi_effs[:, None] * dirs).sum(axis=0)
+    return f
 
 
 def compute_contact_force(scene: KernelScene,
@@ -499,7 +601,7 @@ def _solve_lattice_multi_contact(scene: KernelScene,
                 phi_eff = raw
                 step = 1.0
             else:
-                if raw < -50.0 * eps:
+                if raw < INACTIVE_RAW_EPS_FACTOR * eps:
                     continue
                 r2 = raw * raw + eps * eps
                 sqr2 = np.sqrt(r2)
@@ -560,9 +662,79 @@ def _solve_lattice_multi_contact(scene: KernelScene,
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────
+#  Point-set dispatch (Step 10 / C1: box / mesh / multi-point targets)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _solve_single_sphere_point_set(scene: KernelScene) -> KernelSolution:
+    """One pad sphere vs a ``PointSetTarget``.
+
+    Wraps :func:`cslc_theory.equilibrium_point_set_numerical` and
+    returns the same KernelSolution shape the bridge uses elsewhere.
+    """
+    pst = scene.target_point_set
+    sphere = LatticeSphere(
+        p=scene.positions[0].astype(np.float64),
+        r=float(scene.radii[0]),
+        n=scene.outward_normals[0].astype(np.float64),
+        ka=scene.ka, ka_t_ratio=scene.ka_t_ratio,
+    )
+    delta_local, info_num = equilibrium_point_set_numerical(
+        sphere, pst, scene.kc,
+        eps=scene.eps, tol=1.0e-12,
+    )
+    deltas = delta_local[np.newaxis, :].astype(np.float64)
+    f_contact = compute_contact_force_point_set(scene, deltas)
+    contact_idx = 0 if (bool(scene.is_surface[0])
+                        and np.linalg.norm(f_contact[0]) > 0) else -1
+    info: dict = {"regime": "point_set_single", **info_num}
+    return KernelSolution(
+        delta=deltas, contact_force=f_contact,
+        contact_sphere_idx=contact_idx, solver_info=info,
+    )
+
+
+def _solve_lattice_point_set(scene: KernelScene) -> KernelSolution:
+    """Multi-pad vs ``PointSetTarget`` -- dispatches to the canonical
+    :func:`cslc_lattice.solve_lattice_point_set_indenter`.
+
+    Anisotropic anchor not yet supported on this path (the lattice-
+    side anchor is isotropic in :mod:`cslc_lattice`; same constraint
+    as the existing ``_solve_lattice_multi_contact``).
+    """
+    if scene.ka_t_ratio != 1.0:
+        raise NotImplementedError(
+            "Anisotropic anchor (ka_t_ratio != 1) not supported on the "
+            "lattice + point-set path -- the canonical lattice anchor "
+            "is isotropic.  Use a single-sphere scene for anisotropic "
+            "verification (same constraint as the single-sphere-target "
+            "lattice path).")
+    pst = scene.target_point_set
+    lat = _build_lattice(scene)
+    indenter = PointSetIndenter(
+        positions=pst.positions.astype(np.float64),
+        radii=pst.radii.astype(np.float64),
+        normals=pst.normals.astype(np.float64),
+        kc=scene.kc,
+    )
+    delta_lat, info_num = solve_lattice_point_set_indenter(
+        lat, indenter, r_lat=scene.radii.astype(np.float64),
+        lateral="distance_preserving",
+        eps=scene.eps, tol=1.0e-12, maxiter=5000,
+    )
+    f_contact = compute_contact_force_point_set(scene, delta_lat)
+    return KernelSolution(
+        delta=delta_lat, contact_force=f_contact,
+        contact_sphere_idx=-1,
+        solver_info={"regime": "point_set_lattice", **info_num},
+    )
+
+
 __all__ = [
     "KernelScene",
     "KernelSolution",
     "solve_theory",
     "compute_contact_force",
+    "compute_contact_force_point_set",
 ]

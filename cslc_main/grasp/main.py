@@ -46,9 +46,50 @@ def _add_grasp_args(parser: argparse.ArgumentParser) -> None:
         help="Per-shape contact model (default: cslc).",
     )
     g.add_argument(
-        "--pad-kind", choices=["box", "dome"], default=None,
-        help="Pad geometry (default: box).",
+        "--pad-kind", choices=["box", "dome", "dome_param"], default=None,
+        help="Pad geometry (default: box).  'dome' loads the shipped "
+             "fingertip OBJ; 'dome_param' generates a parametric "
+             "spherical-cap pad from --pad-r-pad and --pad-half-angle.",
     )
+    g.add_argument(
+        "--pad-r-pad", type=float, default=None,
+        help="Parametric-dome cap radius [m] (only used with "
+             "--pad-kind dome_param).  Production-equivalent default: 0.010.",
+    )
+    g.add_argument(
+        "--pad-half-angle", type=float, default=None,
+        help="Parametric-dome cap half-angle [deg] (only used with "
+             "--pad-kind dome_param).  Production-equivalent default: 72.",
+    )
+
+    # C2e: held-object kind + box-target sampling.
+    g.add_argument(
+        "--object-kind", choices=["sphere", "box"], default=None,
+        help="Held-object kind (default: sphere).  'box' (C2e) uses the "
+             "CSLC point-set contact path -- each box face is uniformly "
+             "sampled at --box-face-pitch and routed to "
+             "_launch_vs_point_set.",
+    )
+    g.add_argument(
+        "--box-side", type=float, default=None,
+        help="Cube full side length [m] when --object-kind box (default "
+             "0.025 = 25mm).  Below ~25mm the contact patch overflows "
+             "the box edges and mixes normals; the scene builder warns "
+             "when 2*hx < 2*patch_radius + 6mm.",
+    )
+    g.add_argument(
+        "--box-face-pitch", type=float, default=None,
+        help="Target-point pitch [m] on each box face when --object-kind "
+             "box (default 0.001 = 1mm).  Pitch sets target-sphere "
+             "radius (= pitch/2) and the per-pair K_max budget.",
+    )
+    g.add_argument(
+        "--object-spawn-y-offset", type=float, default=None,
+        help="Lateral spawn jitter [m] along Y.  Used to drive multi-"
+             "seed statistics for the C2 ke-sweep falsification "
+             "(3 seeds at {-1mm, 0, +1mm}).  Default 0 = centred.",
+    )
+
     g.add_argument(
         "--solver", choices=["mujoco", "semi"], default=None,
         help="Physics solver (default: mujoco).",
@@ -69,6 +110,34 @@ def _add_grasp_args(parser: argparse.ArgumentParser) -> None:
                    help="Override CSLC lateral stiffness kl [N/m].")
     g.add_argument("--cslc-ka", type=float, default=None,
                    help="Override CSLC anchor stiffness ka [N/m].")
+    g.add_argument("--cslc-alpha", type=float, default=None,
+                   help="Override damped-Jacobi damping factor alpha [-]. "
+                        "Default 0.3.  Lower = more damped (more stable, "
+                        "slower convergence); higher = more aggressive.")
+    g.add_argument("--cslc-n-iter", type=int, default=None,
+                   help="Override damped-Jacobi iteration count.  Default 40.")
+    g.add_argument("--material-ke", type=float, default=None,
+                   help="LEGACY alias: sets BOTH --ke-physical and "
+                        "--ke-constraint to the same value.  Preserves "
+                        "pre-C2-split recipes (dome_curved_flat, day-1 "
+                        "ke-sweep) bit-identically.  New code should use "
+                        "the explicit per-role flags.")
+    g.add_argument("--ke-physical", type=float, default=None,
+                   help="CSLC pad's bulk Young's-modulus-equivalent [N/m]. "
+                        "Drives calibrate_kc on the pad lattice.  Unused "
+                        "under --contact-model hydro (hydro uses --kh "
+                        "instead).  See MaterialParams.ke_pad_physical.")
+    g.add_argument("--ke-constraint", type=float, default=None,
+                   help="Object's harmonic-mean composition partner [N/m]. "
+                        "Drives kc_series target_ke in the CSLC emission "
+                        "kernel, and the MuJoCo rigid-contact stiffness "
+                        "(regularisation timeconst).  Under hydro, also "
+                        "the MuJoCo constraint stiffness.  See "
+                        "MaterialParams.ke_target_constraint.")
+    g.add_argument("--kh", type=float, default=None,
+                   help="Hydroelastic physical-compliance modulus [Pa/m]. "
+                        "Used only under --contact-model hydro; ignored "
+                        "under CSLC / point.  See MaterialParams.kh.")
     g.add_argument(
         "--cslc-contact-fraction", type=float, default=None,
         help="Override CSLC contact-fraction prior used by kc recalibration.",
@@ -93,6 +162,63 @@ def _apply_args_to_config(args, config: GraspConfig) -> GraspConfig:
         config.cslc.ka = args.cslc_ka
     if args.cslc_contact_fraction is not None:
         config.cslc.contact_fraction = args.cslc_contact_fraction
+    if args.cslc_alpha is not None:
+        config.cslc.alpha = args.cslc_alpha
+    if args.cslc_n_iter is not None:
+        config.cslc.n_iter = args.cslc_n_iter
+    # Legacy --material-ke alias goes first; --ke-physical /
+    # --ke-constraint / --kh overrides apply on top so explicit
+    # per-role flags win over the alias.
+    if args.material_ke is not None:
+        config.material.ke = args.material_ke   # setter writes both ke fields
+    if args.ke_physical is not None:
+        config.material.ke_pad_physical = args.ke_physical
+    if args.ke_constraint is not None:
+        config.material.ke_target_constraint = args.ke_constraint
+    if args.kh is not None:
+        config.material.kh = args.kh
+    if args.pad_r_pad is not None:
+        config.pad.dome_param_R_pad = args.pad_r_pad
+    if args.pad_half_angle is not None:
+        import math as _math
+        config.pad.dome_param_half_angle = args.pad_half_angle * _math.pi / 180.0
+
+    # C2e: held-object overrides.
+    if args.object_kind is not None:
+        config.object.kind = args.object_kind
+    if args.box_side is not None:
+        half = args.box_side * 0.5
+        config.object.box_half_extents = (half, half, half)
+    if args.box_face_pitch is not None:
+        config.object.box_face_pitch = args.box_face_pitch
+    if args.object_spawn_y_offset is not None:
+        config.object.spawn_y_offset = args.object_spawn_y_offset
+
+    # C2e geometric-constraint warning: dome contact patch must fit
+    # inside one box face (with a 3mm margin per side) -- otherwise the
+    # patch overflows the edge, mixes face normals, and creates a local
+    # wedge that confounds the ke-sweep falsification.
+    if config.object.kind == "box" and config.pad.kind in ("dome", "dome_param"):
+        import math as _math
+        import warnings as _warnings
+        R_pad = config.pad.dome_param_R_pad
+        half_angle = config.pad.dome_param_half_angle  # radians
+        patch_radius = R_pad * _math.sin(half_angle)
+        margin = 0.003  # 3 mm per handoff
+        min_side = 2.0 * patch_radius + 2.0 * margin
+        actual_side = 2.0 * min(config.object.box_half_extents)
+        if actual_side < min_side:
+            _warnings.warn(
+                f"box side {actual_side * 1000:.1f}mm < geometric "
+                f"minimum {min_side * 1000:.1f}mm "
+                f"(2 * patch_radius {patch_radius * 1000:.1f}mm + "
+                f"2 * 3mm margin).  Contact patch will overflow the box "
+                f"edges, mixing normals and creating a local wedge.  "
+                f"This invalidates the C2 ke-sweep falsification.  "
+                f"Raise --box-side to >= {min_side * 1000:.0f}mm.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
     return config
 
 

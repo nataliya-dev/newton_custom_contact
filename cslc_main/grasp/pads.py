@@ -89,8 +89,202 @@ def build_pad_trimesh(p: PadParams) -> tuple[trimesh.Trimesh, np.ndarray]:
             )
         return mesh, contact_mask
 
+    if p.kind == "dome_param":
+        # The builder explicitly returns the cap-face mask so we
+        # capture the entire spherical cap (including the wrap-around
+        # region for half_angle > pi/2 where ``n_z < 0.3`` would have
+        # cut it off) AND exclude the back cylinder's top/bottom caps
+        # which the ``n_z > 0.3`` heuristic would otherwise leak.
+        mesh, contact_mask = _build_dome_param_trimesh(
+            R_pad=p.dome_param_R_pad,
+            half_angle=p.dome_param_half_angle,
+            back_height=p.dome_param_back_height,
+            n_theta=p.dome_param_n_theta,
+            n_phi=p.dome_param_n_phi,
+        )
+        if not contact_mask.any():
+            raise RuntimeError(
+                "Parametric dome produced no cap faces; check "
+                f"half_angle ({math.degrees(p.dome_param_half_angle):.1f} deg)."
+            )
+        return mesh, contact_mask
+
     raise ValueError(
-        f"Unknown pad kind: {p.kind!r} (expected 'box' or 'dome')")
+        f"Unknown pad kind: {p.kind!r} "
+        "(expected 'box', 'dome', or 'dome_param')")
+
+
+def _build_dome_param_trimesh(*, R_pad: float, half_angle: float,
+                              back_height: float, n_theta: int,
+                              n_phi: int
+                              ) -> tuple[trimesh.Trimesh, np.ndarray]:
+    """Build a parametric dome fingertip mesh + a cap-face mask.
+
+    Geometry (apex points along local +z; ``pad_shape_xform`` rotates
+    this to ±x in world for left/right pads):
+
+    * **Spherical cap**, radius ``R_pad``, polar angle ``theta in
+      [0, half_angle]``.  Apex sits at ``(0, 0, R_pad)``.  Sampled on
+      an ``(n_theta + 1)`` ring × ``n_phi`` sector grid.
+    * **Cylindrical sidewall**, axis along z, top-ring SHARED with the
+      cap's base ring (single watertight mesh, not concatenation).
+      Radius equals the cap's base-ring radius
+      ``R_pad·sin(half_angle)`` for ``half_angle <= pi/2``.
+    * **Bottom disk** at the bottom of the sidewall.  Triangle fan
+      from a single bottom-centre vertex to the sidewall bottom ring.
+
+    For ``half_angle <= pi/2`` the result is a single watertight mesh
+    (``is_volume=True``, ``euler_number=2``) — required by Newton's
+    hydroelastic SDF builder, which needs a proper interior to compute
+    contact pressure (the v0.9b root cause finding,
+    benchmark_spec.md §7 Block B retraction).
+
+    For ``half_angle > pi/2`` (wrap-around / mushroom caps) the
+    closure topology is non-trivial because the cap's widest part is
+    the equator, not the base ring.  Falls back to the legacy open
+    concatenation with a runtime warning; hydro and point contact
+    modes will produce zero force on those pads.
+
+    Tessellation: triangle fan at the apex pole, quad strips between
+    successive ``theta`` rings (split into two triangles each), quad
+    strips for the cylindrical sidewall (split into two triangles
+    each), triangle fan at the bottom centre.
+
+    Math matches :func:`cslc_main.theory.cslc_lattice.make_dome` so
+    the grasp pad and the theory dome lattice share their cap.
+
+    Returns:
+        ``(mesh, cap_face_mask)`` -- the watertight cap+sidewall+bottom
+        mesh and a boolean mask of length ``len(mesh.faces)``
+        selecting only the spherical-cap faces (the first
+        ``n_phi + 2 * n_phi * (n_theta - 1)`` faces by construction;
+        used by CSLC's surface-sphere sampler).
+    """
+    if R_pad <= 0.0 or half_angle <= 0.0 or half_angle >= math.pi:
+        raise ValueError(
+            f"Require R_pad > 0 and 0 < half_angle < pi; got "
+            f"R_pad={R_pad}, half_angle={half_angle}")
+
+    thetas = np.linspace(0.0, half_angle, n_theta + 1)
+    phis = np.linspace(0.0, 2.0 * math.pi, n_phi, endpoint=False)
+
+    # ── 1.  Cap vertices: apex + n_theta rings ──
+    # Apex at vertex index 0; ring r (r = 0..n_theta-1) starts at
+    # index 1 + r * n_phi and contains n_phi vertices.
+    vertices: list[list[float]] = [[0.0, 0.0, R_pad]]  # apex
+    for theta in thetas[1:]:  # n_theta rings, from ring 0 (near apex) to last (base)
+        cap_z = R_pad * math.cos(theta)
+        cap_r_xy = R_pad * math.sin(theta)
+        for phi in phis:
+            vertices.append([cap_r_xy * math.cos(phi),
+                             cap_r_xy * math.sin(phi),
+                             cap_z])
+    cap_base_ring_start = 1 + (n_theta - 1) * n_phi  # last cap ring index
+
+    # ── 2.  Cap faces: apex fan + inter-ring quad strips ──
+    cap_faces: list[list[int]] = []
+    # Apex fan (n_phi triangles, normals out by +z·R_pad gradient).
+    for j in range(n_phi):
+        j1 = (j + 1) % n_phi
+        cap_faces.append([0, 1 + j, 1 + j1])
+    # Quad strips between successive rings.
+    for r in range(n_theta - 1):
+        ring0 = 1 + r * n_phi
+        ring1 = ring0 + n_phi
+        for j in range(n_phi):
+            j1 = (j + 1) % n_phi
+            cap_faces.append([ring0 + j, ring1 + j, ring1 + j1])
+            cap_faces.append([ring0 + j, ring1 + j1, ring0 + j1])
+    n_cap_faces = len(cap_faces)
+
+    # ── 3.  Wrap-around fallback for half_angle > 90° ──
+    if half_angle > 0.5 * math.pi:
+        import warnings as _warnings
+        _warnings.warn(
+            f"dome_param with half_angle = {math.degrees(half_angle):.1f}° "
+            f"(> 90°) uses the legacy OPEN-cap mesh; hydro and point "
+            f"contact modes will produce zero contact force on this pad "
+            f"(see benchmark_spec.md §7 Block B v0.9b retraction).  "
+            f"Use --pad-kind box for non-CSLC modes at wrap-around half-"
+            f"angles.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        # Legacy: separate cylinder concatenation, not closed.
+        cap_vertices_arr = np.asarray(vertices, dtype=np.float64)
+        cap = trimesh.Trimesh(
+            vertices=cap_vertices_arr,
+            faces=np.asarray(cap_faces, dtype=np.int64),
+            process=False,
+        )
+        back_r = R_pad  # equator radius for wrap-around case
+        base_ring_z = R_pad * math.cos(half_angle)
+        back = trimesh.creation.cylinder(
+            radius=back_r, height=back_height, sections=n_phi)
+        back.apply_translation([0.0, 0.0, base_ring_z - 0.5 * back_height])
+        combined = trimesh.util.concatenate([cap, back])
+        cap_face_mask = np.zeros(len(combined.faces), dtype=bool)
+        cap_face_mask[:n_cap_faces] = True
+        return combined, cap_face_mask
+
+    # ── 4.  Closed-mesh construction for half_angle <= 90° ──
+    # Sidewall = cap base ring (already in `vertices`) + new bottom
+    # ring at z = base_ring_z - back_height.  Sharing the top ring
+    # with the cap is what makes the combined mesh watertight; the
+    # legacy concatenation didn't share vertices and trimesh saw
+    # the cap as having an open boundary edge.
+    base_ring_z = R_pad * math.cos(half_angle)
+    base_ring_r = R_pad * math.sin(half_angle)
+    bottom_z = base_ring_z - back_height
+
+    bottom_ring_start = len(vertices)
+    for phi in phis:
+        vertices.append([base_ring_r * math.cos(phi),
+                         base_ring_r * math.sin(phi),
+                         bottom_z])
+
+    # Sidewall faces: 2 triangles per phi sector, normals pointing
+    # radially outward.  Winding [top_j, bot_j, bot_j1] + [top_j,
+    # bot_j1, top_j1] gives outward normals under right-hand rule
+    # when ring vertices are listed counterclockwise viewed from +z
+    # (which they are, since phi increases counterclockwise).
+    sidewall_faces: list[list[int]] = []
+    for j in range(n_phi):
+        j1 = (j + 1) % n_phi
+        top_j = cap_base_ring_start + j
+        top_j1 = cap_base_ring_start + j1
+        bot_j = bottom_ring_start + j
+        bot_j1 = bottom_ring_start + j1
+        sidewall_faces.append([top_j, bot_j, bot_j1])
+        sidewall_faces.append([top_j, bot_j1, top_j1])
+
+    # Bottom disk: single centre vertex + fan to bottom ring.
+    # Winding [centre, bot_j1, bot_j] gives normals pointing in -z
+    # (outward at the bottom face).
+    bottom_centre_idx = len(vertices)
+    vertices.append([0.0, 0.0, bottom_z])
+    bottom_faces: list[list[int]] = []
+    for j in range(n_phi):
+        j1 = (j + 1) % n_phi
+        bottom_faces.append([bottom_centre_idx,
+                             bottom_ring_start + j1,
+                             bottom_ring_start + j])
+
+    all_vertices = np.asarray(vertices, dtype=np.float64)
+    all_faces = np.asarray(
+        cap_faces + sidewall_faces + bottom_faces, dtype=np.int64)
+    mesh = trimesh.Trimesh(vertices=all_vertices, faces=all_faces,
+                           process=False)
+
+    # Defensive: ensure face windings give consistently outward
+    # normals.  fix_normals walks the mesh and flips inconsistent
+    # faces; on a correctly-wound watertight mesh it's a no-op.
+    mesh.fix_normals()
+
+    # Cap-face mask for CSLC sampling (only the spherical-cap faces).
+    cap_face_mask = np.zeros(len(all_faces), dtype=bool)
+    cap_face_mask[:n_cap_faces] = True
+    return mesh, cap_face_mask
 
 #
 # ── Contact-face sampling ────────────────────────────────────────────────
@@ -181,7 +375,10 @@ def pad_shape_xform(p: PadParams, side: str) -> wp.transform:
             wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), math.pi),
         )
 
-    if p.kind == "dome":
+    if p.kind in ("dome", "dome_param"):
+        # Both dome variants put the contact apex at local +z; rotate
+        # ±π/2 about y so the apex maps to world ±x (inward toward the
+        # held object on each side).
         angle = +math.pi / 2 if side == "left" else -math.pi / 2
         return wp.transform(
             wp.vec3(0.0, 0.0, 0.0),

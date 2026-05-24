@@ -51,9 +51,13 @@ class Example:
         self.fps = 100
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        # 16 substeps + stabilization keeps the cube from launching off
-        # the fluid surface during the impact frame.
-        self.sim_substeps = 16
+        # 10 substeps + iterations=4/pbf=2/stab=1: A/B-tuned cross-substrate
+        # config, ~4.8x faster than the older 16/6/4/2 baseline. Higher
+        # substeps with reduced iterations destabilize because the PBF
+        # per-iteration clamp at fluid.py:508 is hit more times per frame
+        # and the cumulative artifact compounds. See solver_uxpbd.py
+        # PBF inner loop for the iteration math.
+        self.sim_substeps = 10
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.viewer = viewer
         self.args = args
@@ -120,12 +124,25 @@ class Example:
         self.model = builder.finalize()
         self.model.particle_mu = 0.0
         self.model.soft_contact_mu = 0.0
+        # Cap particle velocity to suppress cross-substrate "impact launch":
+        # solve_particle_particle_contacts_uxpbd computes per-pair position
+        # corrections with no aggregate clamp, so when the lattice cube
+        # impacts the pool a fluid particle with N lattice neighbors gets
+        # ~N x (penetration*relaxation) per iteration. The apply kernel
+        # then computes v_new = vp + d/dt, converting deep penetration
+        # into m/s velocity injection. Without this cap, the pool scatters
+        # to ~4.75 m wide; with v_max=2.0 it stays under ~1.3 m. v_max
+        # only clamps mass>0 particles (lattice spheres have mass=0 and
+        # pass through apply_particle_deltas_uxpbd unchanged), so the
+        # cube's body dynamics are unaffected. Free-fall impact velocity
+        # is ~2 m/s so this floor matches the physical impact regime.
+        self.model.particle_max_velocity = 2.0
 
         self.solver = newton.solvers.SolverUXPBD(
             self.model,
-            iterations=6,
-            fluid_iterations=4,
-            stabilization_iterations=2,   # double pass for fluid-on-ground
+            iterations=4,
+            fluid_iterations=2,
+            stabilization_iterations=1,
         )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()

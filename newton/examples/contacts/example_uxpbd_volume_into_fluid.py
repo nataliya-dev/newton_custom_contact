@@ -45,7 +45,7 @@ class Example:
         self.fps = 100
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 16
+        self.sim_substeps = 10
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.viewer = viewer
         self.args = args
@@ -106,12 +106,20 @@ class Example:
         self.model = builder.finalize()
         self.model.particle_mu = 0.0
         self.model.soft_contact_mu = 0.0
+        # Cap particle velocity to suppress cross-substrate "impact launch"
+        # in solve_particle_particle_contacts_uxpbd; see the parallel comment
+        # in example_uxpbd_lattice_into_fluid.py for the root-cause analysis.
+        # v_max=2.0 clamps both fluid AND ball particles (both mass>0); ball
+        # free-fall to fluid surface from z=0.30 to z=0.10 gives ~1.98 m/s
+        # impact, so 2.0 leaves headroom while bounding the post-impact
+        # cross-coupling.
+        self.model.particle_max_velocity = 2.0
 
         self.solver = newton.solvers.SolverUXPBD(
             self.model,
-            iterations=6,
-            fluid_iterations=4,
-            stabilization_iterations=2,
+            iterations=4,
+            fluid_iterations=2,
+            stabilization_iterations=1,
         )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()

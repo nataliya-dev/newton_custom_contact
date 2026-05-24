@@ -147,6 +147,13 @@ def compute_cslc_penetration(
         #   phi ≈ pen_3d when pen_3d > 0 AND d_proj > 0
         #   phi ≈ 0 otherwise
         # Continuous and C^∞ for eps > 0.
+        # DEFENSIVE: smooth_step(d_proj, eps) is ~1 under current
+        # control flow (d_proj = dist > eps via the `if dist > eps`
+        # branch above; degenerate path falls back to out_n and never
+        # reaches this line).  Kept as belt-and-suspenders against a
+        # future refactor that removes the dist > eps guard or routes
+        # the degenerate case through here — do NOT remove without
+        # adding an explicit `if dist > 0` precondition.
         phi = smooth_relu(pen_3d, eps) * smooth_step(d_proj, eps)
 
     raw_penetration[tid] = phi
@@ -587,17 +594,34 @@ def jacobi_step(
         delta_t_mag = wp.length(delta_t)
         inv_dt_mag = delta_t_mag / (delta_t_mag * delta_t_mag + eps * eps)
         cone_scale = mu_friction * f_n_mag * inv_dt_mag
-        # scale_used = harmonic mean of k_stick and cone_scale.  The
-        # `+ eps` in the denominator is a kernel-parity regulariser
-        # against an in-flight Jacobi iterate where k_stick +
-        # cone_scale would otherwise hit exact zero (e.g. first
-        # iteration with δ_t = 0 and f_n = 0).  Theory dropped this
-        # term in its smooth surrogate (bug #5 fix) because
-        # scipy.minimize_scalar / L-BFGS-B never see those transient
-        # residuals; kernel keeps it consciously.  Below test
-        # resolution at production eps; intentional, documented
-        # divergence from theory.
-        scale_used = (k_stick * cone_scale) / (k_stick + cone_scale + eps)
+        # scale_used = harmonic mean of k_stick and cone_scale.
+        # Two-part regulariser, both dimensionally consistent with
+        # k_stick + cone_scale [N/m]:
+        #   (1) `1e-6 * (k_stick + cone_scale)` — relative floor that
+        #       scales with the dominant stiffness.  Biases scale_used
+        #       by 1/(1+1e-6) ≈ 1 - 1 ppm, far below any test
+        #       resolution.  Stays fixed FRACTION of the operating
+        #       stiffness across any k_stick > 0, so a low-friction
+        #       sweep where k_stick is reduced doesn't see the
+        #       regulariser become non-trivial.  Prior form `+ eps`
+        #       (m only) was dimensionally inconsistent AND would
+        #       have shifted scale_used by ~50% at k_stick ≈ 1 N/m —
+        #       a latent footgun in any low-friction regime.
+        #   (2) `+ 1.0e-30` — absolute denormalise-floor for the
+        #       k_stick = 0 AND cone_scale = 0 corner (non-friction
+        #       scenes where mu_friction = 0; numerator is also 0 so
+        #       result is 0/1e-30 = 0).  Without (2), (1) alone
+        #       NaN-poisons every non-friction scene (verified by
+        #       regression).  1e-30 is well inside IEEE 754 normal
+        #       range; conventionally treated as N/m for unit
+        #       accounting, magnitude is too tiny for the convention
+        #       to matter.
+        # Theory dropped both regularisers entirely (cslc_theory
+        # friction_force_smooth, bug #5 fix) because L-BFGS-B never
+        # sees the transient; kernel keeps a floor for the in-flight
+        # Jacobi residual.  Intentional, documented divergence.
+        scale_used = (k_stick * cone_scale) / (
+            (1.0 + 1.0e-6) * (k_stick + cone_scale) + 1.0e-30)
         f_friction_vec = -scale_used * delta_t
 
     # Optional external tangential load (bridge test only).  Production
@@ -834,6 +858,10 @@ def write_cslc_contacts(
     # With normal_ab = diff / dist, d_proj = dist by construction.  Kept
     # explicit so the smooth-step gate and the diagnostic field below
     # read the same value the rigid-body solver will reconstruct.
+    # DEFENSIVE: d_proj is non-negative by construction of normal_ab
+    # (line above) and the dist > eps branch.  smooth_step(d_proj, eps)
+    # below is therefore ~1, but is kept for symmetry with the
+    # jacobi_step gate and as a future-refactor safety net.
     d_proj = wp.dot(diff, normal_ab)
 
     # Step 7 D4: true 3-D deformed overlap phi_def = (r_lat + R) - dist_def.
@@ -964,4 +992,724 @@ def write_cslc_contacts(
     out_friction[buf_idx]  = 1.0
 
     debug_reason[slot] = 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Step 10 / C1b: per-pad-sphere aggregate force vs a PointSetTarget
+#
+#  This is a STANDALONE smoke-test kernel that does NOT participate in the
+#  production sphere-target pipeline.  It exists so the kernel-vs-theory
+#  bridge can verify that the GPU implementation of
+#
+#      F_i = sum_j  kc * smooth_relu(raw_ij, eps) * (q_i - t_j) / ||q_i - t_j||
+#      raw_ij = (r_lat_i + R_j) - ||q_i - t_j||,  q_i = p_i_world - delta_i
+#
+#  matches `cslc_main.theory.kernel_bridge.compute_contact_force_point_set`
+#  element-wise at production deltas.  Once verified, C1c extends test_07
+#  with box-target scenes; C2 then wires per-pair contact emission to
+#  MuJoCo (no aggregation -- this kernel is for verification of the
+#  per-pad SUM, not for emission).
+#
+#  Kept independent so production sphere-target code paths cannot
+#  accidentally regress through edits here.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@wp.kernel
+def compute_pad_force_vs_point_set(
+    # ── Pad lattice state (same arrays as compute_cslc_penetration) ──
+    sphere_pos_local: wp.array(dtype=wp.vec3),
+    sphere_radii: wp.array(dtype=wp.float32),
+    sphere_delta: wp.array(dtype=wp.vec3),
+    sphere_shape: wp.array(dtype=wp.int32),
+    is_surface: wp.array(dtype=wp.int32),
+    sphere_outward_normal: wp.array(dtype=wp.vec3),
+    body_q: wp.array(dtype=wp.transform),
+    shape_body: wp.array(dtype=wp.int32),
+    shape_transform: wp.array(dtype=wp.transform),
+    active_cslc_shape_idx: int,
+    # ── Point-set target ──
+    # Positions / radii / normals are TARGET BODY LOCAL; transformed
+    # to world per-thread using the target body's body_q transform.
+    target_positions_local: wp.array(dtype=wp.vec3),
+    target_radii: wp.array(dtype=wp.float32),
+    target_normals_local: wp.array(dtype=wp.vec3),   # currently unused;
+                                                     # stored for C2+ emission
+    target_count: int,
+    target_body_idx: int,
+    # ── Constants ──
+    kc: float,
+    eps: float,
+    # ── Output ──
+    pad_force_world: wp.array(dtype=wp.vec3),
+):
+    """Per-pad-sphere aggregate contact force from a point-set target.
+
+    Each kernel thread = one pad lattice sphere.  Inactive lattice
+    spheres (sphere_shape != active_cslc_shape_idx) and non-surface
+    spheres write a zero force.  No active-gate culling on the
+    pad-sphere level -- the per-pair raw threshold (raw > -50*eps)
+    decides which target points contribute.
+
+    This kernel does NOT write Newton contacts; it only computes the
+    aggregate force vector for verification against the theory's
+    ``compute_contact_force_point_set``.  The contact-emission kernel
+    (one MuJoCo contact per overlapping (pad_sphere, target_point)
+    pair) lives in C2.
+    """
+    tid = wp.tid()
+
+    # Lattice filter + surface filter -- both produce a zero force.
+    if sphere_shape[tid] != active_cslc_shape_idx:
+        pad_force_world[tid] = wp.vec3(0.0, 0.0, 0.0)
+        return
+    if is_surface[tid] == 0:
+        pad_force_world[tid] = wp.vec3(0.0, 0.0, 0.0)
+        return
+
+    # Pad sphere world-frame deformed centre.  Same transform chain
+    # the production kernels use: q_world = X_wb * X_ws * p_local - delta.
+    s_idx = sphere_shape[tid]
+    b_idx = shape_body[s_idx]
+    X_ws  = shape_transform[s_idx]
+    X_wb  = body_q[b_idx]
+
+    p_i_local = sphere_pos_local[tid]
+    p_i_world = wp.transform_point(X_wb, wp.transform_point(X_ws, p_i_local))
+    q_i_world = p_i_world - sphere_delta[tid]
+    r_i = sphere_radii[tid]
+
+    # Target body transform (constant across all target points; lift
+    # out of the inner loop).
+    X_tb = body_q[target_body_idx]
+
+    # Accumulate per-target-point contributions.  No early-exit on the
+    # pad sphere -- a fully-disengaged pad sphere will accumulate the
+    # zero vector through every smooth-relu floor.  (Cost is bounded
+    # by target_count, which is fixed at scene init.)
+    F = wp.vec3(0.0, 0.0, 0.0)
+    for j in range(target_count):
+        t_j_world = wp.transform_point(X_tb, target_positions_local[j])
+        diff = q_i_world - t_j_world
+        L = wp.length(diff)
+        if L < 1.0e-15:
+            continue
+        R_j = target_radii[j]
+        raw = (r_i + R_j) - L
+        # Inactive-pair skip threshold.  MUST match the canonical
+        # Python constant ``INACTIVE_RAW_EPS_FACTOR = -50.0`` defined
+        # in ``cslc_main/theory/cslc_theory.py``.  The literal is
+        # baked in here because Warp kernel constants are compiled
+        # in -- can't import a Python module-level value at kernel
+        # build time.  If you change the constant on the Python side,
+        # update this literal too and rerun
+        # test_07_kernel_bridge to confirm scenes H/I still pass.
+        # At raw < -50*eps: smooth_relu(raw, eps) and smooth_step(raw, eps)
+        # are both < 1e-9, so the excluded contribution is below
+        # numerical noise.
+        if raw < -50.0 * eps:
+            continue
+        phi_eff = smooth_relu(raw, eps)
+        # Force on the PAD sphere is in the direction (q_i - t_j)/L,
+        # i.e. AWAY from the target point.  Matches the theory's
+        # ``point_set_contact_force`` and ``cslc_theory.contact_force``
+        # sign convention.
+        F = F + kc * phi_eff * (diff / L)
+
+    pad_force_world[tid] = F
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  C2d: point-set warm-start penetration (argmax-overlap)
+#
+#  Structural twin of ``compute_cslc_penetration`` for PointSetTarget
+#  targets.  For each pad sphere, walks the target point set and picks
+#  the SINGLE most-overlapping target point (argmax over j of raw_ij at
+#  the rest position), then writes the same two outputs as the sphere
+#  kernel: scalar ``phi_rest`` and rest-frame line-of-centres normal.
+#
+#  This is the option-(a') warm-start: ``lattice_solve_equilibrium`` is
+#  unchanged and consumes the same scalar+vec3 fields per pad sphere as
+#  in the sphere-target path.  No new linear-solve kernel needed.  The
+#  remaining multi-point correction is exactly what
+#  ``jacobi_step_point_set`` is built to handle.
+#
+#  Non-smoothness caveat (deferred to C3+)
+#  ---------------------------------------
+#  argmax(j) is non-smooth in pose at the boundary where two target
+#  points have near-equal overlap with the same pad sphere.  This is
+#  fine for warm-start convergence -- the nonlinear Jacobi sweeps
+#  absorb the resulting transient -- but it breaks differentiability
+#  of the warm-start with respect to body pose.  Downstream gradient-
+#  based optimisation (MPC, RL, sim-to-real policy gradients) that
+#  wants to backprop through the lattice solve will eventually need a
+#  softmax-blended weighted-average warm-start; see C3+ deferred items
+#  in cslc_main/theory/notes.md.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@wp.kernel
+def compute_cslc_penetration_point_set(
+    sphere_pos_local: wp.array(dtype=wp.vec3),
+    sphere_radii: wp.array(dtype=wp.float32),
+    # Kept in the signature for symmetry with ``compute_cslc_penetration``.
+    # Not read here (the warm-start works at the REST position;
+    # jacobi_step_point_set recomputes overlap at the deformed centre
+    # each iteration).
+    sphere_delta: wp.array(dtype=wp.vec3),
+    sphere_shape: wp.array(dtype=wp.int32),
+    is_surface: wp.array(dtype=wp.int32),
+    # NOTE: ``compute_cslc_penetration`` (sphere variant) takes
+    # ``sphere_outward_normal`` for the degenerate-centres-coincide
+    # fallback.  This point-set variant ``continue``s past the
+    # degenerate target instead and relies on a NEAR-coincident
+    # target to supply a non-degenerate normal, so the outward normal
+    # is genuinely unused -- omitted from this kernel's signature.
+    body_q: wp.array(dtype=wp.transform),
+    shape_body: wp.array(dtype=wp.int32),
+    shape_transform: wp.array(dtype=wp.transform),
+    active_cslc_shape_idx: int,
+    target_body_idx: int,
+    # Point-set target (replaces target_local_pos + target_radius).
+    target_positions_local: wp.array(dtype=wp.vec3),
+    target_radii: wp.array(dtype=wp.float32),
+    target_count: int,
+    eps: float,
+    raw_penetration: wp.array(dtype=wp.float32),
+    contact_normal_out: wp.array(dtype=wp.vec3),
+):
+    """REST 3-D argmax-overlap penetration per lattice sphere (warm-start).
+
+    For each active surface pad sphere i, picks the target point j* with
+    the largest rest overlap ``raw_ij = (r_i + R_j) - ||t_j - p_i||``
+    (subject to the same active-set skip ``raw_ij >= -50*eps`` used by
+    every other point-set kernel; MUST match ``INACTIVE_RAW_EPS_FACTOR``
+    in cslc_main/theory/cslc_theory.py).
+
+    Outputs match ``compute_cslc_penetration`` so that
+    ``lattice_solve_equilibrium`` can consume the result with no
+    signature change:
+
+      * ``raw_penetration[i] = smooth_relu(raw_ij*, eps) * smooth_step(dist*, eps)``
+      * ``contact_normal_out[i] = (t_j* - p_i_world) / ||t_j* - p_i_world||``
+
+    Pad spheres with no target points passing the active-set skip get
+    ``phi = 0`` and ``n = 0``; the warm-start linear solve produces a
+    near-zero local displacement for those spheres (lateral coupling
+    still propagates other spheres' warm-start delta through the
+    Laplacian).
+    """
+    tid = wp.tid()
+
+    # Active-lattice filter (matches compute_cslc_penetration).
+    if sphere_shape[tid] != active_cslc_shape_idx:
+        raw_penetration[tid] = 0.0
+        contact_normal_out[tid] = wp.vec3(0.0, 0.0, 0.0)
+        return
+
+    if is_surface[tid] == 0:
+        raw_penetration[tid] = 0.0
+        contact_normal_out[tid] = wp.vec3(0.0, 0.0, 0.0)
+        return
+
+    s_idx = sphere_shape[tid]
+    b_idx = shape_body[s_idx]
+    X_ws  = shape_transform[s_idx]
+    X_wb  = body_q[b_idx]
+
+    p_local = sphere_pos_local[tid]
+    r_lat   = sphere_radii[tid]
+
+    q_body  = wp.transform_point(X_ws, p_local)
+    q_world = wp.transform_point(X_wb, q_body)
+
+    X_tb = body_q[target_body_idx]
+
+    # Argmax search over target points.  ``found`` distinguishes "no
+    # target passed the active-set skip" (phi := 0) from "found at
+    # least one active pair".  Tracking dist_best separately avoids a
+    # back-derivation from raw_best (which would need R_j*).
+    found     = int(0)
+    raw_best  = float(0.0)
+    dist_best = float(0.0)
+    n_best    = wp.vec3(0.0, 0.0, 0.0)
+
+    for j in range(target_count):
+        t_j_world = wp.transform_point(X_tb, target_positions_local[j])
+        diff = t_j_world - q_world
+        dist = wp.length(diff)
+        # Degenerate centres-coincide: same convention as
+        # compute_pad_force_vs_point_set / jacobi_step_point_set --
+        # 1e-15 is numerical zero, NOT eps (which is the smooth-gate
+        # width, 5e-4 m in production; using eps here would silently
+        # drop deeply-overlapping contacts).
+        if dist < 1.0e-15:
+            continue
+        R_j = target_radii[j]
+        raw_j = (r_lat + R_j) - dist
+        # Active-set skip.  MUST match INACTIVE_RAW_EPS_FACTOR = -50.0 in
+        # cslc_main/theory/cslc_theory.py.  Below this threshold both
+        # smooth_relu and smooth_step are <1e-9, so the per-pair
+        # contribution is below numerical noise.  Skip is also a real
+        # performance win: at target_count = 3750 (full 25mm box, 1mm
+        # pitch) most points are >25mm from any given pad sphere and
+        # get culled in the first 'continue'.
+        if raw_j < -50.0 * eps:
+            continue
+        if (found == 0) or (raw_j > raw_best):
+            found     = 1
+            raw_best  = raw_j
+            dist_best = dist
+            n_best    = diff / dist
+
+    if found == 1:
+        # Same smooth_relu * smooth_step composition as
+        # compute_cslc_penetration.  smooth_step(dist_best, eps) ~= 1 for
+        # any reasonable dist > eps; it's kept for symmetry and to
+        # preserve C^inf behaviour at the degenerate dist -> 0 limit.
+        # DEFENSIVE: the `dist < 1.0e-15` continue above ensures
+        # dist_best > 0 here, so smooth_step ~= 1.  Do NOT remove the
+        # degenerate-check `continue` without re-deriving this gate.
+        phi = smooth_relu(raw_best, eps) * smooth_step(dist_best, eps)
+        raw_penetration[tid] = phi
+        contact_normal_out[tid] = n_best
+    else:
+        raw_penetration[tid] = 0.0
+        contact_normal_out[tid] = wp.vec3(0.0, 0.0, 0.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Step 10 / C2b: point-set Jacobi iteration
+#
+#  Structural twin of ``jacobi_step`` for PointSetTarget targets.  Each pad
+#  sphere accumulates contact contributions from every overlapping target
+#  point in an inner loop; anchor, lateral, friction, and the damped Jacobi
+#  update are otherwise identical in shape to the sphere-target kernel.
+#
+#  Differences from ``jacobi_step``, contained to the contact block:
+#    * No single (target_local_pos, target_radius) -- instead arrays
+#      ``target_positions_local[0:M]``, ``target_radii[0:M]``.
+#    * Contact force = SUM over target points of per-pair series-spring
+#      contribution.  Same active-set threshold (-50 * eps) as the kernel-1
+#      smoke-test ``compute_pad_force_vs_point_set`` (MUST match
+#      INACTIVE_RAW_EPS_FACTOR in cslc_main/theory/cslc_theory.py).
+#    * Implicit-diagonal stabilisation S_n picks up the SUM of contact
+#      gates over j instead of a single gate -- contractive Jacobi update
+#      still holds because Σ kc·gate_j upper-bounds the linearised contact
+#      operator on the normal axis.
+#
+#  Friction uses the pad sphere's own outward normal as the local frame
+#  (same as the existing anisotropic-anchor decomposition in
+#  jacobi_step).  ``f_n_mag = |F_contact · n_outward|`` -- the aggregate
+#  normal-axis component of the multi-point contact wrench.  This is the
+#  least-surprising extension from the single-target friction physics; a
+#  per-pair friction model is C3+ work.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@wp.kernel
+def jacobi_step_point_set(
+    delta_src: wp.array(dtype=wp.vec3),
+    delta_dst: wp.array(dtype=wp.vec3),
+    sphere_radii: wp.array(dtype=wp.float32),
+    sphere_pos_local: wp.array(dtype=wp.vec3),
+    neighbor_rest_length: wp.array(dtype=wp.float32),
+    is_surface: wp.array(dtype=wp.int32),
+    neighbor_start: wp.array(dtype=wp.int32),
+    neighbor_count: wp.array(dtype=wp.int32),
+    neighbor_list: wp.array(dtype=wp.int32),
+    ka: float,
+    kl: float,
+    kc: float,
+    alpha: float,
+    sphere_shape: wp.array(dtype=wp.int32),
+    active_cslc_shape_idx: int,
+    sphere_outward_normal: wp.array(dtype=wp.vec3),
+    body_q: wp.array(dtype=wp.transform),
+    shape_body: wp.array(dtype=wp.int32),
+    shape_transform: wp.array(dtype=wp.transform),
+    ka_tangent_ratio: float,
+    k_stick: float,
+    mu_friction: float,
+    # ── Point-set target (replaces target_local_pos + target_radius) ──
+    target_positions_local: wp.array(dtype=wp.vec3),
+    target_radii: wp.array(dtype=wp.float32),
+    target_count: int,
+    target_body_idx: int,
+    # External tangential load (same as jacobi_step; -1 = no-op).
+    f_ext_apex_idx: int,
+    f_ext_apex: wp.vec3,
+    eps: float,
+):
+    """One damped Jacobi sweep for the ACTIVE lattice against a PointSetTarget.
+
+    Equilibrium (per active surface sphere i, in pad sphere i's local
+    rest-normal frame):
+
+      0 =  -K_anchor · δ_i
+           + Σ_{j ∈ N(i)} k_l (‖q_j − q_i‖ − L_ij) ê_ij(δ)     (lateral)
+           + Σ_{m=0..M-1} k_c · phi_eff_im · gate_im · n_eff_im (contact, point-set)
+           + f_friction(δ_t, |F_contact · n_outward|, k_stick, μ) (stick-slip)
+           + f_ext_apex                                          (only at apex_idx)
+
+    where for each target point m:
+       raw_im   = (r_lat_i + R_m) - ||t_m_world - q_i_world||
+       phi_eff_im = smooth_relu(raw_im, eps)
+       gate_im    = smooth_step(raw_im, eps)
+       n_eff_im   = (t_m_world - q_i_world) / ||·||
+    -- the same series-spring law as ``jacobi_step``, summed.
+
+    Active-set skip: pairs with ``raw_im < -50 * eps`` are excluded
+    (MUST match INACTIVE_RAW_EPS_FACTOR in cslc_theory.py).
+    """
+    tid = wp.tid()
+
+    # Lattice filter (same as jacobi_step).
+    if sphere_shape[tid] != active_cslc_shape_idx:
+        delta_dst[tid] = delta_src[tid]
+        return
+
+    delta_old = delta_src[tid]
+    n_neighbors = neighbor_count[tid]
+
+    s_idx = sphere_shape[tid]
+    b_idx = shape_body[s_idx]
+    X_ws  = shape_transform[s_idx]
+    X_wb  = body_q[b_idx]
+
+    p_i_local = sphere_pos_local[tid]
+    p_i_world = wp.transform_point(X_wb, wp.transform_point(X_ws, p_i_local))
+    q_i_world = p_i_world - delta_old
+
+    out_n_local = sphere_outward_normal[tid]
+    out_n_world = wp.transform_vector(X_wb, wp.transform_vector(X_ws, out_n_local))
+
+    # Lateral (distance-preserving), identical to jacobi_step.
+    f_lateral = wp.vec3(0.0, 0.0, 0.0)
+    start = neighbor_start[tid]
+    for n in range(n_neighbors):
+        edge = start + n
+        j = neighbor_list[edge]
+        p_j_local = sphere_pos_local[j]
+        p_j_world = wp.transform_point(X_wb, wp.transform_point(X_ws, p_j_local))
+        q_j_world = p_j_world - delta_src[j]
+        d = q_j_world - q_i_world
+        dist = wp.length(d)
+        inv_dist = dist / (dist * dist + eps * eps)
+        L_ij = neighbor_rest_length[edge]
+        # Step 7 sign fix: load form (= -gradient) carries minus sign
+        # relative to physical force.  Matches jacobi_step exactly.
+        f_lateral = f_lateral - kl * (dist - L_ij) * d * inv_dist
+
+    # Point-set CONTACT: sum over target points.
+    f_contact_vec = wp.vec3(0.0, 0.0, 0.0)
+    sum_gate = float(0.0)
+    f_friction_vec = wp.vec3(0.0, 0.0, 0.0)
+
+    if is_surface[tid] == 1:
+        r_i = sphere_radii[tid]
+        X_tb = body_q[target_body_idx]
+        for j in range(target_count):
+            t_j_world = wp.transform_point(X_tb, target_positions_local[j])
+            diff = t_j_world - q_i_world
+            L = wp.length(diff)
+            # Degenerate centres-coincide check.  MUST be ~1e-15
+            # (numerical zero), NOT ``eps`` -- ``eps`` is the smooth-
+            # gate width (production: 5e-4 m), and skipping pairs at
+            # that radius would silently drop deeply-overlapping
+            # contacts.  See compute_pad_force_vs_point_set above for
+            # the same convention.
+            if L < 1.0e-15:
+                continue
+            R_j = target_radii[j]
+            raw = (r_i + R_j) - L
+            # MUST match INACTIVE_RAW_EPS_FACTOR = -50.0 in
+            # cslc_main/theory/cslc_theory.py.  Excluded contribution
+            # is below 1e-9 in both phi_eff and step there, so this is
+            # numerically-safe pruning that keeps the inner loop tight
+            # at production densities (e.g. 600-point box at production
+            # eps = 5e-4 m means a pair is skipped if it's more than
+            # ~25 mm away from the pad sphere, comfortably outside the
+            # engaged patch).
+            if raw < -50.0 * eps:
+                continue
+            phi_eff = smooth_relu(raw, eps)
+            gate = smooth_step(raw, eps)
+            n_eff = diff / L
+            # Load form: kernel uses (t-q)/||·|| direction; load
+            # gradient sign convention matches theory's (q-t)/||·||
+            # force direction (both negations cancel; see theory.txt
+            # tab:signs).
+            f_contact_vec = f_contact_vec + kc * phi_eff * gate * n_eff
+            sum_gate = sum_gate + gate
+
+        # Stick-slip friction.  Aggregate normal-axis magnitude used
+        # as the cone reference; tangent decomposition done in pad
+        # outward frame (same as the existing anisotropic-anchor
+        # decomposition below).
+        f_n_signed = wp.dot(f_contact_vec, out_n_world)
+        # Compression should give f_contact_vec · n_outward < 0 (force
+        # pushes pad sphere along -n_outward, i.e. into the body).
+        # Take absolute value for the cone magnitude either way; the
+        # cone is symmetric.
+        f_n_mag = wp.abs(f_n_signed)
+
+        delta_proj_n_outward = wp.dot(delta_old, out_n_world)
+        delta_t = delta_old - delta_proj_n_outward * out_n_world
+        delta_t_mag = wp.length(delta_t)
+        inv_dt_mag = delta_t_mag / (delta_t_mag * delta_t_mag + eps * eps)
+        cone_scale = mu_friction * f_n_mag * inv_dt_mag
+        # Harmonic-mean smooth-min surrogate.  v0.8 dimensionally-clean
+        # regulariser: relative floor `1e-6 * (k_stick + cone_scale)`
+        # (dimensionless × N/m = N/m, ~1 ppm bias on scale_used) +
+        # absolute denormalise-floor `1.0e-30` for the k_stick = 0
+        # AND cone_scale = 0 corner (non-friction scenes that would
+        # otherwise NaN).  See jacobi_step's matching block for full
+        # rationale; the two sites MUST stay in sync.
+        scale_used = (k_stick * cone_scale) / (
+            (1.0 + 1.0e-6) * (k_stick + cone_scale) + 1.0e-30)
+        f_friction_vec = -scale_used * delta_t
+
+    # External tangential load (bridge / experiment driver only; -1 in
+    # production).
+    f_ext_vec = wp.vec3(0.0, 0.0, 0.0)
+    if tid == f_ext_apex_idx:
+        f_ext_vec = -f_ext_apex
+
+    # Anisotropic block-Jacobi in pad sphere's local rest-normal frame.
+    # S_n picks up the SUM of contact gates (vs the single gate in
+    # jacobi_step).  This sum upper-bounds |d(f_contact·n)/d(δ_n)|
+    # over the active set, so the iteration's contraction property
+    # carries over from the single-target case.
+    rhs_explicit = f_contact_vec + f_lateral + f_friction_vec + f_ext_vec
+    rhs_n_scalar = wp.dot(rhs_explicit, out_n_world)
+    rhs_t_vec    = rhs_explicit - rhs_n_scalar * out_n_world
+
+    delta_old_n = wp.dot(delta_old, out_n_world)
+    delta_old_t = delta_old - delta_old_n * out_n_world
+
+    ka_t = ka * ka_tangent_ratio
+    S_n  = kl * float(n_neighbors) + kc * sum_gate
+    S_t  = kl * float(n_neighbors)
+    k_diag_n = ka + S_n
+    k_diag_t = ka_t + S_t
+
+    rhs_n_total = rhs_n_scalar + S_n * delta_old_n
+    rhs_t_total = rhs_t_vec    + S_t * delta_old_t
+
+    delta_jacobi_n = rhs_n_total / k_diag_n
+    delta_jacobi_t = rhs_t_total / k_diag_t
+    delta_jacobi   = delta_jacobi_n * out_n_world + delta_jacobi_t
+
+    delta_dst[tid] = (1.0 - alpha) * delta_old + alpha * delta_jacobi
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Step 10 / C2c: per-pair contact emission for PointSetTarget
+#
+#  Per (pad_sphere, target_point) pair that's geometrically overlapping at
+#  the converged delta, emit one MuJoCo contact -- same emission convention
+#  as ``write_cslc_contacts`` (deformed-centre point0, r_lat margin, target
+#  radius R_j, line-of-centres normal), just K of them per pad sphere
+#  instead of one.  No aggregation, no resultant-projection hack -- each
+#  contact is a genuine sphere-vs-sphere contact pair.
+#
+#  Buffer layout
+#  -------------
+#  Pad sphere ``i`` (with ``surface_slot_map[i] = s_i >= 0``) writes its
+#  contacts to absolute slots
+#
+#       contact_offset + s_i · K_max + 0 .. K_max-1.
+#
+#  Excess slots (beyond the actual K_i ≤ K_max overlapping pairs for this
+#  pad sphere) are filled with the ``out_shape0 = -1`` sentinel, so the
+#  downstream MuJoCo conversion kernel
+#  (``convert_newton_contacts_to_mjwarp_kernel``) culls them via its
+#  ``shape_a < 0`` early-out.
+#
+#  K_max sizing
+#  ------------
+#  Total contacts per pad sphere is bounded by the number of target points
+#  inside radius ``r_lat + R_target`` of the pad sphere's deformed centre.
+#  For a 25 mm box face sampled at ~1 mm pitch with r_lat=1.5 mm and
+#  R_target=1 mm, that bound is ~π(2.5mm)²/(1mm)² ≈ 20 points.  K_max = 32
+#  is the production default in the handler -- comfortable margin,
+#  doesn't blow the buffer at production lattice sizes.  At N_pad = 150,
+#  K_max = 32, n_pair_blocks = 2: total = 9600 slots, well under MuJoCo's
+#  default naconmax (100k+).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@wp.kernel
+def write_cslc_contacts_point_set(
+    sphere_pos_local: wp.array(dtype=wp.vec3),
+    sphere_radii: wp.array(dtype=wp.float32),
+    sphere_delta: wp.array(dtype=wp.vec3),
+    sphere_shape: wp.array(dtype=wp.int32),
+    is_surface: wp.array(dtype=wp.int32),
+    sphere_outward_normal: wp.array(dtype=wp.vec3),
+    body_q: wp.array(dtype=wp.transform),
+    shape_body: wp.array(dtype=wp.int32),
+    shape_transform: wp.array(dtype=wp.transform),
+    active_cslc_shape_idx: int,
+    target_body_idx: int,
+    target_shape_idx: int,
+    target_positions_local: wp.array(dtype=wp.vec3),
+    target_radii: wp.array(dtype=wp.float32),
+    target_count: int,
+    contact_offset: int,
+    K_max: int,
+    surface_slot_map: wp.array(dtype=wp.int32),
+    out_shape0: wp.array(dtype=wp.int32),
+    out_shape1: wp.array(dtype=wp.int32),
+    out_point0: wp.array(dtype=wp.vec3),
+    out_point1: wp.array(dtype=wp.vec3),
+    out_offset0: wp.array(dtype=wp.vec3),
+    out_offset1: wp.array(dtype=wp.vec3),
+    out_normal: wp.array(dtype=wp.vec3),
+    out_margin0: wp.array(dtype=wp.float32),
+    out_margin1: wp.array(dtype=wp.float32),
+    out_tids: wp.array(dtype=wp.int32),
+    shape_material_mu: wp.array(dtype=wp.float32),
+    cslc_kc: float,
+    target_ke: float,
+    cslc_dc: float,
+    eps: float,
+    out_stiffness: wp.array(dtype=wp.float32),
+    out_damping: wp.array(dtype=wp.float32),
+    out_friction: wp.array(dtype=wp.float32),
+    # C2d: per-pair truncation counter.  Atomic-incremented once per pad
+    # sphere whose active-pair count would have exceeded K_max.  Read on
+    # CPU by the handler after collide() to RuntimeWarning if any pair
+    # block under-sized K_max; see cslc_handler._launch_vs_point_set.
+    truncation_count: wp.array(dtype=wp.int32),
+):
+    """Emit one MuJoCo contact per overlapping (pad_sphere, target_point) pair.
+
+    Mirror of ``write_cslc_contacts`` for PointSetTarget targets.  Active
+    pairs are those passing both
+        (a) ``raw_ij >= -50 * eps``  -- MUST match
+            ``INACTIVE_RAW_EPS_FACTOR`` in cslc_main/theory/cslc_theory.py;
+        (b) ``smooth_step(d_proj)·smooth_step(raw_ij) >= 1e-4`` -- the same
+            ``gate_threshold`` cull the sphere-target emission applies
+            (deep tail is sub-nN force, machine-zero gradient).
+
+    Note: with the algebraic smooth_step (``0.5*(1 + x/sqrt(x^2+eps^2))``)
+    these two thresholds COINCIDE at raw = -50*eps (see INCLUSION_FACTOR
+    in cslc_main/theory/cslc_theory.py); any pair passing (a) also
+    passes (b).  ``K_max`` must therefore be sized against the active-
+    set inclusion radius r_inclusion = r_lat + R + INCLUSION_FACTOR*eps,
+    NOT against geometric overlap (raw > 0) alone.
+
+    Each emitted contact carries margin0 = r_lat[i], margin1 = R_j; MuJoCo
+    reconstructs solver_pen = (r_lat + R_j) - ||t_j - q_def||  = phi_def
+    per pair, so per-contact force = stiffness · solver_pen
+    = kc_series · gate · phi_def -- the same series-spring law that
+    ``jacobi_step_point_set`` converges on.
+    """
+    tid = wp.tid()
+    base_slot = surface_slot_map[tid]
+    if base_slot < 0:
+        return
+
+    # Initialise this pad sphere's K_max slot block with the "no
+    # contact" sentinel.  Excess slots beyond the active pair count
+    # stay culled.
+    for k in range(K_max):
+        buf_idx_init = contact_offset + base_slot * K_max + k
+        out_shape0[buf_idx_init] = -1
+        out_stiffness[buf_idx_init] = 0.0
+
+    # Pair filter -- only the active CSLC lattice writes.
+    if sphere_shape[tid] != active_cslc_shape_idx:
+        return
+
+    s_idx = sphere_shape[tid]
+    b_idx = shape_body[s_idx]
+    X_ws  = shape_transform[s_idx]
+    X_wb  = body_q[b_idx]
+    X_wb_inv = wp.transform_inverse(X_wb)
+
+    p_i_local = sphere_pos_local[tid]
+    r_i = sphere_radii[tid]
+    q_world = wp.transform_point(X_wb, wp.transform_point(X_ws, p_i_local))
+    q_world_def = q_world - sphere_delta[tid]
+
+    X_tb = body_q[target_body_idx]
+    X_tb_inv = wp.transform_inverse(X_tb)
+
+    # Series stiffness composition: same as write_cslc_contacts.
+    kc_series = (cslc_kc * target_ke) / (cslc_kc + target_ke + eps * eps)
+
+    pair_count = int(0)
+    truncated  = int(0)
+    for j in range(target_count):
+        t_world = wp.transform_point(X_tb, target_positions_local[j])
+        diff = t_world - q_world_def
+        dist = wp.length(diff)
+        if dist < 1.0e-15:
+            continue
+        R_j = target_radii[j]
+        pen_3d = (r_i + R_j) - dist
+        # Active-set skip.  MUST match INACTIVE_RAW_EPS_FACTOR = -50.0.
+        if pen_3d < -50.0 * eps:
+            continue
+
+        normal_ab = diff / dist
+        d_proj = dist
+        contact_gate = smooth_step(d_proj, eps) * smooth_step(pen_3d, eps)
+
+        # Hard cull below the production gate threshold -- matches
+        # write_cslc_contacts's hybrid emission policy (line ~903).
+        if contact_gate < 1.0e-4:
+            continue
+
+        # Pair j is active AND emittable.  Now check buffer space:
+        # placing the overflow check HERE (rather than at the top of
+        # the loop) avoids false-positive truncation warnings when the
+        # remaining target indices j..target_count-1 are all inactive
+        # (would be skipped by the pen_3d / contact_gate culls above).
+        # At geometry-derived K_max sizing this matters: K_max is
+        # tuned to the active-pair count, so an off-by-one in
+        # over-warning erodes signal quality.  We may under-report
+        # by leaving emittable pairs at indices > j uncounted, but
+        # the metric is "did any pad sphere overflow", and ANY
+        # overflow is sufficient to fire the warning -- the per-
+        # dropped-pair count was never the actionable number.
+        if pair_count >= K_max:
+            truncated = 1
+            break
+
+        # Body-frame contact geometry (same convention as
+        # write_cslc_contacts).
+        p0_body      = wp.transform_point(X_wb_inv, q_world_def)
+        p1_body      = wp.transform_point(X_tb_inv, t_world)
+        offset0_body = wp.transform_vector(X_wb_inv,  r_i  * normal_ab)
+        offset1_body = wp.transform_vector(X_tb_inv, -R_j  * normal_ab)
+
+        buf_idx = contact_offset + base_slot * K_max + pair_count
+        out_shape0[buf_idx]   = s_idx
+        out_shape1[buf_idx]   = target_shape_idx
+        out_point0[buf_idx]   = p0_body
+        out_point1[buf_idx]   = p1_body
+        out_offset0[buf_idx]  = offset0_body
+        out_offset1[buf_idx]  = offset1_body
+        out_normal[buf_idx]   = normal_ab
+        out_margin0[buf_idx]  = r_i
+        out_margin1[buf_idx]  = R_j
+        out_tids[buf_idx]     = 0
+        out_stiffness[buf_idx] = smooth_relu(
+            kc_series * contact_gate, 1.0e-9)
+        # Match sphere-target conventions (see comments at the existing
+        # write_cslc_contacts for the friction/damping rationale).
+        out_damping[buf_idx]   = 0.0
+        out_friction[buf_idx]  = 1.0
+
+        pair_count = pair_count + 1
+
+    if truncated == 1:
+        # One atomic per pad sphere that overflowed -- not per dropped
+        # pair -- so the CPU read after collide() reports the number of
+        # affected pad spheres, which is the more actionable count.
+        wp.atomic_add(truncation_count, 0, 1)
 

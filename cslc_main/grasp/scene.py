@@ -168,9 +168,12 @@ def build_scene(config: GraspConfig) -> SceneArtifacts:
     )
 
     # Spawn each pad so its inner face sits ``approach_gap`` from the
-    # object surface.  Pad body origin = object_radius + face_offset + gap.
+    # object surface.  Pad body origin = object_grasp_half + face_offset + gap.
+    # ``grasp_axis_half`` is the object's half-extent along the lateral
+    # (X) approach direction; on a sphere this is just ``radius``, on a
+    # box it's ``box_half_extents[0]`` (see ObjectParams).
     spawn_x = (
-        config.object.radius
+        config.object.grasp_axis_half
         + _pad_thickness(config)
         + config.pad.approach_gap
     )
@@ -178,14 +181,14 @@ def build_scene(config: GraspConfig) -> SceneArtifacts:
     # PadParams.pad_center_z for the auto logic.  Box pads need to
     # clear the ground (their box_hz extends below the body centre),
     # so the auto value lifts the body so the bottom of the pad is
-    # 5 mm above z=0.  Dome pads are short — they sit on the
-    # object's equator.
+    # 5 mm above z=0.  Dome pads are short -- they sit on the
+    # object's settled vertical centre (``settled_z_center``).
     if config.pad.pad_center_z is not None:
         spawn_z = config.pad.pad_center_z
     elif config.pad.kind == "box":
-        spawn_z = max(config.object.radius, config.pad.box_hz + 0.005)
-    else:  # dome
-        spawn_z = config.object.radius
+        spawn_z = max(config.object.settled_z_center, config.pad.box_hz + 0.005)
+    else:  # dome / dome_param -- centre apex on the object's equator
+        spawn_z = config.object.settled_z_center
 
     pad_body_indices: dict[str, int] = {}
     pad_shape_indices: dict[str, int] = {}
@@ -230,7 +233,8 @@ def build_scene(config: GraspConfig) -> SceneArtifacts:
         b.joint_armature[dof] = 0.01
 
     obj_body, obj_shape, _j_free = objects.add_object(
-        b, config.object, obj_cfg, (0.0, 0.0, config.object.start_z)
+        b, config.object, obj_cfg,
+        (0.0, config.object.spawn_y_offset, config.object.start_z)
     )
 
     # Request the per-contact "force" attribute so we can read solver-
@@ -316,4 +320,10 @@ def _pad_thickness(config: GraspConfig) -> float:
             return float(mesh.bounds[1, 2])
         except Exception:
             return 0.01  # 10 mm — matches the shipped fingertip-scale OBJ.
+    if p.kind == "dome_param":
+        # Apex sits at z = R_pad in pad-local frame by construction
+        # (see ``pads._build_dome_param_trimesh``).  After
+        # ``pad_shape_xform`` rotates +z → ±x, the apex protrudes by
+        # ``R_pad`` along the body's local +x toward the held object.
+        return p.dome_param_R_pad
     raise ValueError(f"Unknown pad kind: {p.kind!r}")

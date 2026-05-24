@@ -37,6 +37,74 @@ from scipy.optimize import minimize
 
 
 # ────────────────────────────────────────────────────────────────────────
+#  Active-set threshold constant
+#
+#  The active-set inactive-skip threshold for per-pair contact terms.
+#  A pair with ``raw_ij < INACTIVE_RAW_EPS_FACTOR * eps`` is skipped:
+#  ``smooth_relu(raw, eps) < 1e-9`` and ``smooth_step(raw, eps) < 1e-9``
+#  at that distance, so the excluded contribution is below numerical
+#  noise.  THIS IS THE LOAD-BEARING CONSTANT that keeps theory-side
+#  gold-reference evaluators consistent with the Warp kernels' inner
+#  loops -- e.g. ``compute_pad_force_vs_point_set``, ``jacobi_step``,
+#  and the C2 ``jacobi_step_point_set`` all use the same threshold.
+#
+#  Both Python and Warp kernel sites must use this exact value:
+#
+#    Python: import INACTIVE_RAW_EPS_FACTOR from cslc_main.theory.cslc_theory
+#    Warp  : kernels embed the literal ``-50.0`` with a comment pointing
+#            back to this constant (Warp can't import Python module
+#            constants -- kernel literals are compiled in).
+#
+#  test_07_kernel_bridge's scene H/I comparators assert kernel == theory
+#  at <1e-5 relative error; any drift in this convention would surface
+#  there immediately on asymmetric scenes (the B1 fix that landed the
+#  threshold on the theory side was triggered exactly by this argument).
+# ────────────────────────────────────────────────────────────────────────
+
+
+INACTIVE_RAW_EPS_FACTOR: float = -50.0
+
+
+# ────────────────────────────────────────────────────────────────────────
+#  Emission inclusion factor (C2d)
+#
+#  ``INCLUSION_FACTOR = -INACTIVE_RAW_EPS_FACTOR = 50.0`` is the positive
+#  magnitude used to size the K_max-per-pad-sphere contact-buffer
+#  allocation for point-set targets.  A target point j contributes
+#  measurably to a pad sphere i's wrench iff
+#      raw_ij = (r_i + R_j) - ||t_j - q_i||  >=  -INCLUSION_FACTOR * eps,
+#  equivalently iff ``||t_j - q_i|| <= r_i + R_j + INCLUSION_FACTOR*eps``.
+#
+#  Why 50, and not something smaller (e.g. ~3 for tanh/erf-style cutoffs)?
+#  The smooth_step surrogate used in the kernels is the ALGEBRAIC form
+#  ``0.5*(1 + x/sqrt(x*x + eps*eps))`` (cslc_kernels.smooth_step), not
+#  tanh or erf.  Algebraic tails are heavy: smooth_step hits the 1e-4
+#  emission-gate threshold at exactly ``x = -50*eps`` (k/sqrt(k^2+1) =
+#  1 - 2e-4 -> k ~= 50).  So the active-set skip threshold and the
+#  emission gate cull threshold COINCIDE at -50*eps; they are not
+#  separated by an order of magnitude as a tanh/erf surrogate would
+#  imply.  This is a load-bearing coincidence: it means
+#  ``r_inclusion = r_lat + R + INCLUSION_FACTOR*eps`` is the EXACT
+#  bound on pad-vs-target distance for any pair that will write a
+#  non-trivial contact.  C2d's K_max sizing depends on this bound being
+#  tight; under-sizing (e.g. using 3*eps from a tanh assumption) would
+#  silently truncate ~0.025-0.4 N per-pair contributions in the
+#  raw in [-50*eps, -3*eps] annular shell, losing 10s of N of total
+#  wrench at production densities.  See cslc_handler._launch_vs_point_set
+#  for the per-pair truncation counter that guards against this formula
+#  being subtly wrong on new geometries.
+#
+#  If you change the smooth_step surrogate family (e.g. swap to erf or
+#  tanh), both INACTIVE_RAW_EPS_FACTOR and INCLUSION_FACTOR need to be
+#  recomputed against the new surrogate's 1e-9 / 1e-4 thresholds and
+#  the kernel literals updated.
+# ────────────────────────────────────────────────────────────────────────
+
+
+INCLUSION_FACTOR: float = 50.0
+
+
+# ────────────────────────────────────────────────────────────────────────
 #  Lattice sphere description
 # ────────────────────────────────────────────────────────────────────────
 
@@ -90,6 +158,72 @@ class RigidTarget:
     def __post_init__(self):
         if self.t.shape != (3,):
             raise ValueError(f"t must be shape (3,), got {self.t.shape}")
+
+
+@dataclass(frozen=True)
+class PointSetTarget:
+    """A rigid target represented as a discrete set of contact points.
+
+    Each point is a small rigid sphere with its own position, radius,
+    and a precomputed outward surface normal on the underlying geometry
+    the points were sampled from.  A pad sphere contacts every
+    overlapping target point independently and the per-point forces sum:
+
+        f_contact(q) = sum_j  kc * smooth_relu(raw_j) * gate_j * d_hat_j
+        raw_j        = (r_lat + R_j) - ||q - t_j||
+        d_hat_j      = (q - t_j) / ||q - t_j||                      (line of centres)
+
+    This generalises ``RigidTarget`` (which is one sphere) to arbitrary
+    target shapes sampled as point sets (box face, mesh, dome).  For a
+    single point with ``positions=[t]`` / ``radii=[R]`` it reduces
+    exactly to ``RigidTarget`` -- ``test_10_pad_vs_box.py``'s scene A
+    is the verification of that reduction.
+
+    The ``normals`` are NOT used by the basic sphere-vs-sphere overlap
+    check (which is geometry-agnostic line-of-centres); they are stored
+    as metadata of the underlying surface and are read by:
+
+      * the area-weighting / calibration path that scales ``kc`` so the
+        integrated stiffness matches a user-supplied bulk target (eq.
+        ``calibration``, theory.txt:979-989); and
+      * the eventual emission to MuJoCo, where they replace the
+        sphere-target line-of-centres direction with the local surface
+        normal at the contact patch -- the "symmetry-robust direction"
+        fix discussed in notes.md Step 11.
+
+    Attributes:
+        positions: (M, 3) target point centres in world frame [m].
+        radii:     (M,)  per-point sphere radii [m].
+        normals:   (M, 3) per-point outward unit normals on the
+                   underlying surface (precomputed at sample time).
+        areas:     (M,) per-point area weights [m^2] (the Voronoi /
+                   per-sample patch area on the underlying surface).
+                   Optional metadata; pass ``None`` if not yet computed.
+    """
+
+    positions: np.ndarray
+    radii: np.ndarray
+    normals: np.ndarray
+    areas: np.ndarray | None = None
+
+    def __post_init__(self):
+        if self.positions.ndim != 2 or self.positions.shape[1] != 3:
+            raise ValueError(
+                f"positions must be (M, 3), got {self.positions.shape}")
+        M = self.positions.shape[0]
+        if self.radii.shape != (M,):
+            raise ValueError(
+                f"radii must be (M,) with M={M}, got {self.radii.shape}")
+        if self.normals.shape != (M, 3):
+            raise ValueError(
+                f"normals must be (M, 3) with M={M}, got {self.normals.shape}")
+        if self.areas is not None and self.areas.shape != (M,):
+            raise ValueError(
+                f"areas must be (M,) with M={M}, got {self.areas.shape}")
+
+    @property
+    def M(self) -> int:
+        return int(self.positions.shape[0])
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -411,6 +545,192 @@ def equilibrium_numerical(
         "final_grad_norm": float(np.linalg.norm(res.jac)),
         "energy": float(res.fun),
         "message": str(res.message),
+    }
+    return np.asarray(res.x, dtype=np.float64), info
+
+
+# ────────────────────────────────────────────────────────────────────────
+#  Multi-point target (step 10): pad sphere vs PointSetTarget
+#
+#  These functions mirror the single-target primitives above but sum the
+#  contact contributions over every overlapping target point.  For a
+#  point set of size M = 1 they reduce exactly to the single-sphere
+#  versions; that's the reduction test_10 scene A pins down.
+# ────────────────────────────────────────────────────────────────────────
+
+
+def point_set_raw_overlaps(
+    sphere: LatticeSphere,
+    target: PointSetTarget,
+    delta: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-point raw overlaps and contact directions for one pad sphere.
+
+    Vectorised version of ``contact_raw_overlap`` + ``contact_direction``
+    over all M target points:
+
+        raw_j   = (r_lat + R_j) - ||q - t_j||,    q = p - delta
+        d_hat_j = (q - t_j) / ||q - t_j||         (unit, target -> sphere)
+
+    Direction matches the single-sphere convention: contact pushes the
+    pad sphere AWAY from each target point.  At degenerate coincidence
+    (centres equal) the direction falls back to the rest outward normal
+    so callers never see NaN -- same fix as ``contact_direction``.
+
+    Returns:
+        raws:       (M,) signed overlaps [m].  Positive when the pair
+                    is geometrically overlapping; clamped through
+                    ``smooth_relu`` downstream.
+        directions: (M, 3) unit vectors from each target point to the
+                    pad sphere's deformed centre.
+    """
+    q = deformed_centre(sphere, delta)
+    diffs = q - target.positions                # (M, 3)
+    dists = np.linalg.norm(diffs, axis=1)       # (M,)
+    raws = (sphere.r + target.radii) - dists
+
+    # Avoid division by zero for any coincident centres; fall back to
+    # the sphere's own rest outward normal where dists ~ 0.  This is the
+    # vectorised analogue of contact_direction's degenerate branch.
+    safe = dists > 1.0e-15
+    inv = np.where(safe, 1.0 / np.where(safe, dists, 1.0), 0.0)
+    directions = diffs * inv[:, None]
+    if not bool(safe.all()):
+        directions = np.where(safe[:, None], directions, sphere.n[None, :])
+    return raws, directions
+
+
+def point_set_contact_energy(
+    sphere: LatticeSphere,
+    target: PointSetTarget,
+    delta: np.ndarray,
+    kc: float,
+    *,
+    eps: float = 0.0,
+) -> float:
+    """Sum of per-point Hookean contact energies.
+
+        E_contact = sum_j  (1/2) * kc * phi_eff_j^2,
+        phi_eff_j = sigma_eps(raw_j).
+
+    Reduces to ``contact_energy`` for M = 1.
+    """
+    raws, _ = point_set_raw_overlaps(sphere, target, delta)
+    if eps <= 0.0:
+        phi_effs = np.maximum(0.0, raws)
+    else:
+        phi_effs = 0.5 * (raws + np.sqrt(raws * raws + eps * eps))
+    return 0.5 * kc * float(np.sum(phi_effs * phi_effs))
+
+
+def point_set_contact_force(
+    sphere: LatticeSphere,
+    target: PointSetTarget,
+    delta: np.ndarray,
+    kc: float,
+    *,
+    eps: float = 0.0,
+) -> np.ndarray:
+    """Sum of per-point contact forces on one pad sphere.
+
+        f_contact = sum_j  kc * phi_eff_j * d_hat_j
+
+    GRADIENT WARNING.  This is the SPRING FORCE, not the gradient of the
+    contact energy when ``eps > 0``.  The energy gradient picks up the
+    smooth-step chain-rule factor at each point:
+
+        dE/d delta = sum_j  kc * phi_eff_j * smooth_step(raw_j, eps) * d_hat_j
+
+    See ``equilibrium_point_set_numerical`` for the gradient-correct
+    Jacobian (and the single-sphere ``contact_force`` docstring for the
+    silent-gradient-bug story).
+    """
+    raws, directions = point_set_raw_overlaps(sphere, target, delta)
+    if eps <= 0.0:
+        phi_effs = np.maximum(0.0, raws)
+    else:
+        phi_effs = 0.5 * (raws + np.sqrt(raws * raws + eps * eps))
+    return kc * (phi_effs[:, None] * directions).sum(axis=0)
+
+
+def total_energy_point_set(
+    sphere: LatticeSphere,
+    target: PointSetTarget,
+    delta: np.ndarray,
+    kc: float,
+    *,
+    eps: float = 0.0,
+) -> float:
+    """E_total = E_anchor + E_contact_point_set.  Minimised at equilibrium."""
+    return (anchor_energy(sphere, delta)
+            + point_set_contact_energy(sphere, target, delta, kc, eps=eps))
+
+
+def equilibrium_point_set_numerical(
+    sphere: LatticeSphere,
+    target: PointSetTarget,
+    kc: float,
+    *,
+    eps: float = 1.0e-7,
+    delta0: np.ndarray | None = None,
+    tol: float = 1.0e-12,
+) -> tuple[np.ndarray, dict]:
+    """L-BFGS-B equilibrium for one pad sphere against a PointSetTarget.
+
+    Minimises  E_anchor + sum_j  (1/2) kc phi_eff_j^2  over delta in R^3.
+    The anchor energy + each per-point contact energy is convex on its
+    own active set; the sum is strongly convex whenever ka > 0, so the
+    minimiser is unique.
+
+    Gradient (with the chain-rule ``smooth_step`` factor that is the
+    silent-gradient-bug fix from notes.md lesson #4):
+
+        dE/d delta = ka * delta + kc * sum_j  phi_eff_j * smooth_step(raw_j, eps) * d_hat_j
+
+    Args:
+        sphere, target, kc: as elsewhere.
+        eps: smoothing width [m].  1e-7 m default matches the
+             ``equilibrium_numerical`` (single-target) precision setting.
+        delta0: warm-start.  Defaults to zero.
+        tol: optimiser tolerance for ``gtol`` and ``ftol``.
+
+    Returns:
+        (delta, info).
+    """
+    if delta0 is None:
+        delta0 = np.zeros(3)
+
+    def fun(d: np.ndarray) -> float:
+        return total_energy_point_set(sphere, target, d, kc, eps=eps)
+
+    def jac(d: np.ndarray) -> np.ndarray:
+        grad = anchor_force(sphere, d)
+        raws, directions = point_set_raw_overlaps(sphere, target, d)
+        if eps <= 0.0:
+            phi_effs = np.maximum(0.0, raws)
+            steps = np.where(raws > 0.0, 1.0,
+                             np.where(raws == 0.0, 0.5, 0.0))
+        else:
+            denom = np.sqrt(raws * raws + eps * eps)
+            phi_effs = 0.5 * (raws + denom)
+            steps = 0.5 * (1.0 + raws / denom)
+        # d raw_j / d delta = +d_hat_j  (derivation in cslc_theory.py
+        # single-sphere jac() and in theory.txt eq. contact-grad).
+        contact_grad = kc * (phi_effs * steps)[:, None] * directions
+        return grad + contact_grad.sum(axis=0)
+
+    res = minimize(
+        fun, delta0, jac=jac, method="L-BFGS-B",
+        options={"gtol": tol, "ftol": tol, "maxiter": 500},
+    )
+    info = {
+        "success": bool(res.success),
+        "nit": int(res.nit),
+        "nfev": int(res.nfev),
+        "final_grad_norm": float(np.linalg.norm(res.jac)),
+        "energy": float(res.fun),
+        "message": str(res.message),
+        "M": target.M,
     }
     return np.asarray(res.x, dtype=np.float64), info
 
@@ -842,8 +1162,11 @@ def kernel_contact_force_n_axis(
 
 
 __all__ = [
+    "INACTIVE_RAW_EPS_FACTOR",
+    "INCLUSION_FACTOR",
     "LatticeSphere",
     "RigidTarget",
+    "PointSetTarget",
     "deformed_centre",
     "rest_overlap",
     "effective_penetration",
@@ -855,6 +1178,11 @@ __all__ = [
     "total_energy",
     "equilibrium_face_on_analytical",
     "equilibrium_numerical",
+    "point_set_raw_overlaps",
+    "point_set_contact_energy",
+    "point_set_contact_force",
+    "total_energy_point_set",
+    "equilibrium_point_set_numerical",
     "friction_force_smooth",
     "friction_energy_smooth",
     "equilibrium_with_friction_analytical",
