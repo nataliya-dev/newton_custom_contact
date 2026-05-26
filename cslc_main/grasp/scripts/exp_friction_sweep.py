@@ -3,13 +3,16 @@
 
 """Friction sweep on the R=20mm/72deg dome.
 
-Question: can stronger CSLC friction (raise ``mu_friction``, raise
+Question: can stronger CSLC friction (raise ``material.mu``, raise
 ``k_stick``) overcome the geometric wedge instability on the curved
 dome?  Static math says yes (tan(tilt) < mu should be stable); the
 slow-LIFT experiment suggested no.  This is the empirical test.
 
+Post-unification: a single ``material.mu`` drives both the lattice
+stick-slip block AND MuJoCo's Coulomb cone on emitted contacts.
+
 Runs:
-  * baseline:          mu=0.3,  k_stick=2.5e4   (production defaults)
+  * baseline:          mu=0.3,  k_stick=2.5e4
   * high mu:           mu=1.0,  k_stick=2.5e4
   * high k_stick:      mu=0.3,  k_stick=2.5e5
   * both:              mu=1.0,  k_stick=2.5e5
@@ -28,7 +31,7 @@ def make_cfg(*, mu: float, k_stick: float, label: str) -> GraspConfig:
     cfg.pad.kind = "dome_param"
     cfg.pad.dome_param_R_pad = 0.020
     cfg.pad.dome_param_half_angle = 72.0 * math.pi / 180.0
-    cfg.cslc.mu_friction = mu
+    cfg.material.mu = mu
     cfg.cslc.k_stick = k_stick
     cfg.logging.run_label = label
     cfg.logging.use_timestamp = False

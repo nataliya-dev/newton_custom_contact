@@ -1,13 +1,18 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% CSLC -- Compliant Sphere Lattice Contact
+% CSLC -- Compliant Sphere Lattice Contact  (v2 contract)
 % Theory + verification document, matched 1-to-1 against the code in
 %   cslc_main/theory/cslc_theory.py
 %   cslc_main/theory/cslc_lattice.py
+%   cslc_main/theory/cslc_targets.py            (NEW in v2)
 %   newton/_src/geometry/cslc_kernels.py
 %   newton/_src/geometry/cslc_data.py
 %   newton/_src/geometry/cslc_handler.py
-% Equation numbers are stable; cross-references between equations and code use
-% the labels declared next to each equation.
+% Equation numbers are stable; cross-references between equations and code
+% use the labels declared next to each equation.
+%
+% v2 contract reference: cslc_main/theory/contract_v2.md.
+% This document supersedes the sphere-vs-sphere v1 theory note.  Glossary
+% of v1->v2 differences is in Appendix A.
 %
 % Compiles as-is in Overleaf with `pdflatex`.
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -34,6 +39,8 @@
 \newcommand{\bq}{\mathbf{q}}
 \newcommand{\bt}{\mathbf{t}}
 \newcommand{\bn}{\hat{\mathbf{n}}}
+\newcommand{\bnf}{\hat{\mathbf{n}}_{\!f}}     % target face normal
+\newcommand{\bnp}{\hat{\mathbf{n}}_{p}}       % pad outward normal
 \newcommand{\bdelta}{\bm{\delta}}
 \newcommand{\bef}{\mathbf{f}}
 \newcommand{\real}{\mathbb{R}}
@@ -42,89 +49,150 @@
 \newcommand{\hatu}{\hat{\mathbf{e}}}
 
 \title{\Large\bfseries
-Compliant Sphere Lattice Contact (CSLC):\\
+Compliant Sphere Lattice Contact (CSLC), v2:\\
 Theory and Verification Reference}
-\author{Internal theory note, derived from \texttt{cslc\_main/theory}}
+\author{Internal theory note, derived from \texttt{cslc\_main/theory}\\
+Built against contract \texttt{cslc\_main/theory/contract\_v2.md}}
 \date{\today}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-This document is the theoretical and numerical reference for the CSLC
-contact model implemented in \texttt{newton/\_src/geometry/cslc\_kernels.py}.
-It states every equation that the kernels are required to satisfy, gives
-the closed-form solutions used to verify the kernels, and lists the
-verification figures produced by the six theory test drivers
-\texttt{cslc\_main/theory/test\_0[1-6]\_*.py} together with the
-kernel-to-theory bridge \texttt{test\_07\_kernel\_bridge.py}.
-The model itself is built from standard ingredients (Hookean springs,
-Hunt--Crossley penalty, regularised Coulomb friction, smoothed positive
-parts); the novel content is the way these ingredients are coupled on a
-\emph{sphere lattice} so as to recover distributed pressure and
-rotational restoring moments while remaining $C^{\infty}$ in the
-rigid-body pose.
+This document is the theoretical and numerical reference for the
+\emph{v2} CSLC contact model implemented in
+\texttt{newton/\_src/geometry/cslc\_kernels.py}.  The defining v2
+change is that every \emph{(pad sphere, target sample)} pair contacts
+via the signed \emph{half-space overlap}
+$\mathrm{raw}_{ij} = r_i - \bnf_{\!j}\!\cdot\!(\bq_i - \bt_j)$
+(eq.~\eqref{eq:raw}), in place of the v1 sphere-vs-sphere overlap
+$(r+R)-\|\bq-\bt\|$ which was non-monotone past face crossing and
+required a target sample radius $R$ that has no physical meaning on a
+mesh.  This single substitution propagates through every layer of the
+model: the contact direction is now the target's outward face normal
+(not the line of centres), curved targets are sampled as
+\emph{point-set} surfaces with no per-sample radius, and the
+distance-preserving lateral law (the v1 source of curvature-driven
+Poisson bulging) is replaced by graph-Laplacian throughout, with the
+\emph{no-bulge} property of the resulting equilibrium guarded by
+regression test T-G.  The unified half-space formulation is verified
+against the production Warp kernel by the bridge harness T-K + T-L at
+production smoothing $\varepsilon = 5\times 10^{-4}\,\mathrm{m}$.
+A glossary of v1$\to$v2 differences is in
+Appendix~\ref{sec:v1-v2-glossary}.
 \end{abstract}
 
 \section{Overview and Scope}
 \label{sec:overview}
 
 A robot fingertip is approximated by a rigid body wrapped in a layer
-of $n$ surface spheres, the \emph{lattice}.  Each surface sphere
-$i$ has a rest centre $\bp_i\in\real^3$, a rest radius $r_i$, an outward
-unit rest normal $\bn_i$, and a set of \emph{lattice neighbours}
+of $n$ surface spheres, the \emph{lattice}.  Each surface sphere $i$
+has a rest centre $\bp_i\in\real^3$, a rest radius $r_i$, an outward
+unit rest normal $\bnp_i$, and a set of \emph{lattice neighbours}
 $\mathcal{N}(i)$ (its first ring of edges in the lattice).  When the
-body presses into a rigid target (modelled here as a sphere of centre
-$\bt$ and radius $R$), each lattice sphere's centre translates by a
-vector displacement $\bdelta_i\in\real^3$, while the rest radius $r_i$
-is kept fixed.  The displaced (\emph{deformed}) centre is
+body presses into a target, each lattice sphere's centre translates by
+a vector displacement $\bdelta_i\in\real^3$, while the rest radius
+$r_i$ is kept fixed.  The displaced (\emph{deformed}) centre is
 \begin{equation}
   \bq_i \;=\; \bp_i \;-\; \bdelta_i.
   \label{eq:def-centre}
 \end{equation}
 This convention (centre moves, radius does not) is the
-\emph{deformed-centre} formulation.  It is the choice that makes the
+\emph{deformed-centre} formulation.  It is the choice that lets the
 anchor and the contact springs sit cleanly in series at the level of a
-single sphere (\cref{sec:single}) and lets the same kinematics carry
-through to lateral coupling, curvature-driven Poisson bulging, and
-stick--slip friction without any sign-convention drift between the
-modules.\footnote{An earlier formulation, used in the conference
-paper~\texttt{cslc\_mujoco/docs/overleaf\_theory\_cslc\_icra.txt}, kept
-the centre fixed and reduced the radius instead
-($r_i^{\mathrm{eff}}=r_i-\delta_i$).  That choice produces a scalar
-$\delta_i\in[0,r_i]$ and a slightly simpler equilibrium, but loses
-tangential information and so cannot represent off-axis contact, lateral
-shear, or stick--slip via a tangential $\bdelta_t$.}
+single sphere (\cref{sec:single}) and carries through to lateral
+coupling, anisotropic anchor, and stick--slip friction without any
+sign-convention drift between the modules.
 
-Three forces act on each lattice sphere:
-the \emph{anchor} (\cref{sec:anchor}), pulling $\bq_i$ back toward
-$\bp_i$; the \emph{lateral coupling}
-(\cref{sec:lateral}), springs that connect $\bq_i$ to its lattice
-neighbours; and the \emph{contact} force (\cref{sec:contact}) at sphere
-$i$ when its deformed centre overlaps the target.  Stick--slip friction
-(\cref{sec:friction}) is added as a fourth term acting in the tangent
-plane at the contact patch.  Every gate that would otherwise introduce
+\paragraph{Target model (v2).}  A target is \emph{any} surface,
+sampled as a discrete set of $M$ \emph{points} carrying outward face
+normals and Voronoi areas:
+\begin{equation}
+  \mathrm{target} \;=\; \{\,(\bt_j,\ \bnf_{\!j},\ A_j)\,\}_{j=1}^{M},
+  \qquad
+  \|\bnf_{\!j}\|=1,\ A_j > 0\ [\mathrm{m}^2].
+  \label{eq:target}
+\end{equation}
+There is \emph{no per-sample radius}.  The v1 sphere indenter
+(\texttt{RigidTarget(t, R)}) is reborn as a Fibonacci-spiral
+sampling of the sphere's surface
+(\texttt{make\_sphere\_target(t, R, n\_samples)}), with each sample
+carrying the radial outward normal as $\bnf_{\!j}$.  Other targets are
+flat faces, axis-aligned boxes, and general triangle meshes -- all
+samplers live in \texttt{cslc\_main/theory/cslc\_targets.py} and
+return a \texttt{PointSetTargetV2} dataclass.  This unification is the
+\emph{point-set abstraction}: any shape becomes a point cloud with
+face normals, and the same contact code runs against all of them.
+
+\paragraph{Half-space contact (v2).}  The pad sphere $i$ contacts the
+target sample $j$ via the signed half-space overlap
+\begin{equation}
+  \mathrm{raw}_{ij}(\bdelta_i)
+  \;=\; r_i \;-\; \bnf_{\!j}\!\cdot\!(\bq_i - \bt_j).
+  \label{eq:raw}
+\end{equation}
+The contact direction is the \emph{target face normal} $\bnf_{\!j}$
+(not the line of centres $(\bq_i-\bt_j)/\|\cdot\|$).  Three properties
+follow directly:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+\item \emph{Monotonicity at any depth.}  Fix $\bnf_{\!j}$ and
+$\bt_j$; let $\bq_i$ vary along the $-\bnf_{\!j}$ direction (deeper into the
+target).  Then $\bnf_{\!j}\!\cdot\!(\bq_i-\bt_j)$ strictly
+\emph{decreases}, so $\mathrm{raw}_{ij}$ strictly \emph{increases}.
+There is no sign flip; deep-penetration is well-defined.  Regression
+guarded by T-A (\texttt{test\_half\_space\_monotonicity.py}) and T-B
+(\texttt{test\_half\_space\_deep\_penetration.py}).
+\item \emph{Face-defined contact direction.}  The contact force is
+along $\pm\bnf_{\!j}$, regardless of where $\bq_i$ sits relative to
+$\bt_j$.  Closing along the face normal means a pad sphere whose
+centre has crossed the face still experiences a force that points
+\emph{out of the body}; the v1 line-of-centres form sign-flipped at
+face crossing.
+\item \emph{No target sample radius $R$.}  Every term in \eqref{eq:raw}
+is a property of either the pad ($r_i$) or the target's local
+surface geometry ($\bnf_{\!j}, \bt_j$).  The v1 ``$R$'' was a
+discretisation hack ($R=\mathrm{pad\_spacing}/2$ on a mesh); v2 drops
+it entirely.
+\end{enumerate}
+
+Three forces act on each surface lattice sphere: the \emph{anchor}
+(\cref{sec:anchor}), pulling $\bq_i$ back toward $\bp_i$; the
+\emph{lateral coupling} (\cref{sec:lateral}), graph-Laplacian springs
+that connect $\bq_i$ to its lattice neighbours; and the
+\emph{contact} sum (\cref{sec:contact}) over active target samples.
+Stick--slip friction (\cref{sec:friction}) is added as a fourth term
+acting in the tangent plane of $\bnp_i$ (the \emph{pad's} outward
+normal, contract \S6.4).  Every gate that would otherwise introduce
 non-differentiability is replaced by a $C^{\infty}$ surrogate
 parameterised by a single smoothing width $\varepsilon$
-(\cref{sec:smoothing}).
+(\cref{sec:smooth-surrogates}).
+
+\paragraph{What this document supersedes.}  v1 included a
+\emph{distance-preserving} lateral law on edge length and a curvature-
+driven \emph{Poisson bulge} phenomenon as physical predictions.  Both
+are deleted in v2: the only lateral law is graph-Laplacian, and the
+\emph{absence} of bulge is a regression-guarded property of the model
+(T-G, \texttt{test\_dome\_flattens.py}).  See
+Appendix~\ref{sec:v1-v2-glossary} for the full v1$\to$v2 diff.
 
 \paragraph{Sign conventions.}  Throughout this document, $\delta_n>0$
-means the sphere has been compressed \emph{inward} (i.e. $\bq_i$ lies on
-the \emph{body} side of $\bp_i$).  Because $\bq_i=\bp_i-\bdelta_i$ the
-chain rule contributes a $-1$ when converting between
-$\partial/\partial\bq_i$ and $\partial/\partial\bdelta_i$, so the
-physical force on the sphere
-$\bef^{\mathrm{phys}}_i=-\partial E/\partial\bq_i=+\partial E/\partial\bdelta_i$
-coincides in direction with the energy gradient with respect to
-$\bdelta_i$.  We therefore work in terms of $\partial E/\partial\bdelta_i$
-throughout, and write the equilibrium directly as
+means the sphere has been compressed \emph{inward}, i.e.\ $\bq_i$ lies
+on the \emph{body} side of $\bp_i$ along the pad's outward normal
+$\bnp_i$.  Because $\bq_i=\bp_i-\bdelta_i$ the chain rule contributes
+a $-1$ when converting between $\partial/\partial\bq_i$ and
+$\partial/\partial\bdelta_i$, so the physical force on the sphere
+$\bef^{\mathrm{phys}}_i=-\partial E/\partial\bq_i=+\partial
+E/\partial\bdelta_i$ coincides in direction with the energy gradient
+with respect to $\bdelta_i$.  We therefore work in terms of
+$\partial E/\partial\bdelta_i$ throughout, and write the equilibrium
+directly as
 $\partial E_{\mathrm{tot}}/\partial\bdelta_i=0$ (sum of gradient
-contributions equals zero).  The Warp kernel
-(\texttt{cslc\_kernels.py}\,L568, L601) names its per-iteration force
-quantities \emph{loads}, defined as $-\partial E_X/\partial\bdelta$;
-this is the same physics with the opposite sign convention, and we
-flag the sign flip explicitly when we cite the kernel code.  These
-conventions are collected in \cref{tab:signs}.
+contributions equals zero).  The Warp kernel names its per-iteration
+force quantities \emph{loads}, defined as $-\partial
+E_X/\partial\bdelta$; this is the same physics with the opposite sign
+convention, and we flag the sign flip explicitly when we cite the
+kernel.  These conventions are collected in \cref{tab:signs}.
 
 \begin{table}[h]
 \centering\small
@@ -132,935 +200,1263 @@ conventions are collected in \cref{tab:signs}.
 \toprule
 Symbol & Meaning & Value / convention\\
 \midrule
-$\bdelta_i$         & displacement of sphere $i$'s centre               & $\delta_n>0 \Rightarrow$ compressed inward\\
+$\bdelta_i$         & displacement of pad sphere $i$'s centre           & $\delta_n>0 \Rightarrow$ compressed inward\\
 $\bq_i = \bp_i - \bdelta_i$ & deformed centre                            & \\
-$\bn_i$             & rest outward normal                                & unit, body $\to$ vacuum\\
-$\phi^{\mathrm{rest}}$  & rest overlap $(r+R)-\|\bp-\bt\|$              & $>0$ at rest contact\\
-$\phi^{\mathrm{eff}}$  & active (smoothed) overlap, see \eqref{eq:phi-eff} & $=\sigma_\varepsilon\!\bigl((r+R)-\|\bt-\bq\|\bigr)$ \\
-$\hatu_c$           & contact direction (theory), see \eqref{eq:n-eff-def} & $(\bq-\bt)/\|\bq-\bt\|$ \\
-$\hatu_{ij}$        & lattice-edge direction (theory)                    & $(\bq_j-\bq_i)/\|\bq_j-\bq_i\|$ \\
-$\partial E_a/\partial\bdelta_i$ & anchor gradient (isotropic)         & $+k_a\,\bdelta_i$ \\
-$\partial E_c/\partial\bdelta_i$ & contact gradient                    & $+k_c\,\phi^{\mathrm{eff}}\,\Sigma_\varepsilon(\mathrm{raw})\,\hatu_c$ \\
-$\bef^{\mathrm{load}}$ (kernel) & kernel "load" $= -\partial E/\partial\bdelta$ & opposite sign \emph{and} $\hatu$ direction \\
+$\bnp_i$            & pad outward normal at rest                         & unit, body $\to$ vacuum\\
+$\bnf_{\!j}$        & target outward face normal at sample $j$           & unit, target body $\to$ vacuum\\
+$r_i$               & pad sphere radius (skin thickness)                 & typically $\mathrm{pad\_spacing}/2$\\
+$A_j$               & target Voronoi area at sample $j$ [m$^2$]          & set by sampler (\cref{sec:targets})\\
+$\mathrm{raw}_{ij}$ & half-space overlap, \eqref{eq:raw}                  & $>0$ when pad penetrates the half-plane\\
+$\phi^{\mathrm{eff}}_{ij}$ & smoothed overlap                            & $=\sigma_\varepsilon(\mathrm{raw}_{ij})$ \\
+$\mathrm{gate}_{ij}$ & smoothed activation                                & $=\Sigma_\varepsilon(\mathrm{raw}_{ij})$\\
+$w^{t}_{ij}$        & tangential locality kernel                          & $=\Sigma_\varepsilon(3r_i - d^{t}_{ij})$\\
+$a_{ij}$            & alignment gate (\cref{sec:active-set})              & $=\mathrm{smoothstep}(-\bnf_{\!j}\!\cdot\!\bnp_i)$\\
+$\partial E_a/\partial\bdelta_i$ & anchor gradient (anisotropic)         & $k_a\delta_{n,i}\bnp_i + (k_a\rho)\bdelta_{t,i}$\\
+$\partial E_c/\partial\bdelta_i$ & contact gradient                       & $\sum_j k_c A_j w^{t}_{ij} a_{ij}\,\phi^{\mathrm{eff}}_{ij}\,\mathrm{gate}_{ij}\,\bnf_{\!j}$\\
+$\bef^{\mathrm{load}}$ (kernel) & kernel load $=-\partial E/\partial\bdelta$ & opposite sign of the gradient\\
 \bottomrule
 \end{tabular}
 \caption{Sign conventions used in this document and in the code.  The
-theory's contact direction $\hatu_c=(\bq-\bt)/\|\bq-\bt\|$ points from
-target to sphere; the kernel's
-$\mathbf{n}_{\mathrm{eff}}=(\bt-\bq)/\|\bt-\bq\|=-\hatu_c$ points the
-other way.  This sign flip exactly compensates the gradient-vs-load
-sign convention, so the two implementations satisfy the same
-equilibrium $\partial E_{\mathrm{tot}}/\partial\bdelta=0$.}
+gradient terms all have a $+$ sign so that
+$\partial E_{\mathrm{tot}}/\partial\bdelta=0$ is the equilibrium.  The
+kernel implements the algebraically equivalent load form
+$\bef^{\mathrm{load}}=-\partial E/\partial\bdelta$ with the equation
+$k_a\bdelta=\sum_X\bef^{\mathrm{load}}_X$; the kernel's
+$\mathbf{n}_{\mathrm{eff}}=-\bnf$ (kernel L1516) cancels the load sign so
+both implementations satisfy the same equilibrium.}
 \label{tab:signs}
 \end{table}
 
-\section{Single sphere: anchor + series-spring contact}
+% ---------------------------------------------------------------------
+\section{Geometry primitives}
+\label{sec:primitives}
+
+\subsection{Half-space raw overlap}
+
+For pad sphere $i$ at displacement $\bdelta_i$, the deformed centre is
+$\bq_i = \bp_i - \bdelta_i$, and the (signed) half-space overlap with
+target sample $j$ is~\eqref{eq:raw}.  The \emph{rest} overlap is the
+value at $\bdelta_i = 0$:
+\begin{equation}
+  d_{ij}^{\mathrm{rest}}
+  \;=\; r_i \;-\; \bnf_{\!j}\!\cdot\!(\bp_i - \bt_j).
+  \label{eq:raw-rest}
+\end{equation}
+Code: \texttt{half\_space\_raw}, \texttt{half\_space\_phi\_eff}
+(\texttt{cslc\_theory.py}).
+
+\paragraph{Monotonicity.}  For fixed $(\bnf_{\!j}, \bt_j)$ and any
+sphere-translation $\bdelta_i \to \bdelta_i + t\,\bnp_i$ that moves
+$\bq_i$ \emph{into} the target body (along $-\bnf_{\!j}$ when
+$\bnp_i$ and $\bnf_{\!j}$ are anti-parallel),
+\begin{equation*}
+  \frac{\partial\,\mathrm{raw}_{ij}}{\partial\bdelta_i}
+  \;=\; -\,\bnf_{\!j}\!\cdot\!\frac{\partial\bq_i}{\partial\bdelta_i}
+  \;=\; +\,\bnf_{\!j},
+\end{equation*}
+so $\mathrm{raw}$ grows linearly with the penetration depth, without
+sign flip at $\bq_i = \bt_j$ (the v1 cliff).  This is the
+defining property of the half-space form; it is the regression target
+of T-A and T-B.
+
+\subsection{Tangential distance and locality kernel}
+
+The tangential displacement of $\bq_i$ relative to sample $j$ in the
+face plane is
+\begin{equation}
+  \mathbf{d}^{t}_{ij}
+  \;=\; (\bq_i - \bt_j) \;-\;
+        \bigl[\bnf_{\!j}\!\cdot\!(\bq_i - \bt_j)\bigr]\,\bnf_{\!j},
+  \qquad
+  d^{t}_{ij} \;=\; \|\mathbf{d}^{t}_{ij}\|.
+  \label{eq:dt}
+\end{equation}
+The \emph{tangential locality kernel} caps each pad sphere's reach to
+a few pad radii in the face plane:
+\begin{equation}
+  w^{t}_{ij}
+  \;=\; \Sigma_{\varepsilon}\!\bigl(3 r_i - d^{t}_{ij}\bigr),
+  \qquad
+  \Sigma_{\varepsilon}(x) =
+  \tfrac{1}{2}\bigl(1 + x/\sqrt{x^2+\varepsilon^2}\bigr).
+  \label{eq:w-t}
+\end{equation}
+Kernel half-width $3 r_i$ exceeds typical pad spacing so the contact
+patch is sampled by several target points; below that $w^{t}$ falls
+smoothly to zero and prevents a pad sphere from coupling to far-away
+samples (e.g.\ samples on the opposite face of a box).
+
+\subsection{Smooth surrogates}
+\label{sec:smooth-surrogates}
+
+Two $C^{\infty}$ surrogates replace the hard ReLU and Heaviside:
+\begin{align}
+  \sigma_{\varepsilon}(x)
+  &\;=\; \tfrac{1}{2}\bigl(x + \sqrt{x^2 + \varepsilon^2}\bigr),
+  &&\text{(smooth ReLU; }\sigma_{\varepsilon}\to[x]_+\text{ as }\varepsilon\to 0\text{)}
+  \label{eq:sigma}\\
+  \Sigma_{\varepsilon}(x)
+  &\;=\; \tfrac{1}{2}\!\left(1 + \frac{x}{\sqrt{x^2+\varepsilon^2}}\right),
+  &&\text{(smooth Heaviside; }\Sigma_{\varepsilon}\to\Theta(x)\text{ as }\varepsilon\to 0\text{)}
+  \label{eq:Sigma}
+\end{align}
+both with pointwise error bounded by $\varepsilon/2$, and satisfying
+the chain-rule identity $\sigma_{\varepsilon}^{\prime} =
+\Sigma_{\varepsilon}$.
+
+The active-set quantities at each $(i, j)$ pair are then
+\begin{equation}
+  \phi^{\mathrm{eff}}_{ij}
+  \;=\; \sigma_{\varepsilon}\bigl(\mathrm{raw}_{ij}\bigr),
+  \qquad
+  \mathrm{gate}_{ij}
+  \;=\; \Sigma_{\varepsilon}\bigl(\mathrm{raw}_{ij}\bigr).
+  \label{eq:phi-eff-and-gate}
+\end{equation}
+\paragraph{Production default.}  $\varepsilon = 5\times 10^{-4}\,$m
+makes the gate effectively binary above $5\,$mm of penetration while
+keeping the contact force $C^{\infty}$ in the rigid-body pose.
+
+\subsection{Active-set culling}
+\label{sec:active-set}
+
+A pair $(i, j)$ is \emph{inactive} and may be skipped without
+numerical error iff \emph{either}
+\begin{equation}
+  \mathrm{raw}_{ij} \;<\; -50\,\varepsilon
+  \qquad\text{(depth gate),}
+  \label{eq:inactive}
+\end{equation}
+or the face normals are not opposing,
+\begin{equation}
+  -\,\bnf_{\!j}\!\cdot\!\bnp_i \;\le\; -\,\varepsilon_{\mathrm{align}}
+  \qquad\text{(alignment gate, contract \S3.6).}
+  \label{eq:align-cull}
+\end{equation}
+The constant $-50$ is \texttt{INACTIVE\_RAW\_EPS\_FACTOR} in
+\texttt{cslc\_theory.py} and is hand-copied as the literal
+\texttt{-50.0 * eps} at each kernel site; the constant-discipline
+guard in \texttt{test\_07\_kernel\_bridge.py} regression-tests both
+parts (magnitude match and adjacent comment naming the symbol) at
+every commit.  Similarly $\varepsilon_{\mathrm{align}} = 0.05$ is
+\texttt{EPS\_ALIGN\_DEFAULT} in \texttt{cslc\_theory.py} and is
+hand-copied as the literal \texttt{0.05} in
+\texttt{jacobi\_step\_point\_set}; the same guard regression-tests
+this literal in parallel.
+
+\paragraph{Why the alignment gate.}  The half-space form alone gives
+spurious ``contact'' on the \emph{far} side of a closed convex body
+(sphere, box, mesh) -- the pad's deformed centre is geometrically
+inside the half-plane of every far-side sample, but those samples'
+outward face normals point \emph{away} from the pad and represent
+surfaces facing away.  v1 implicitly culled them via the 3-D distance
+gate $(r+R)-\|\bq-\bt\| < -50\varepsilon$, but with $R=0$ that gate
+collapses; the alignment gate is the v2 replacement.  Letting
+$\alpha_{ij} \equiv -\,\bnf_{\!j}\!\cdot\!\bnp_i$ ($+1$ at perfect
+face-on, $-1$ at back-to-back), the smooth gate is
+\begin{equation}
+  a_{ij}
+  \;=\;
+  \begin{cases}
+    1, & \alpha_{ij} \ge +\varepsilon_{\mathrm{align}},\\
+    t^{2}(3-2t),\ \ t = \mathrm{clip}\!\left(\dfrac{\alpha_{ij}+\varepsilon_{\mathrm{align}}}{2\varepsilon_{\mathrm{align}}},0,1\right),
+       & |\alpha_{ij}| < \varepsilon_{\mathrm{align}},\\
+    0, & \alpha_{ij} \le -\varepsilon_{\mathrm{align}}.
+  \end{cases}
+  \label{eq:align-gate}
+\end{equation}
+This is a $C^{1}$ cubic smoothstep, exactly $1$ on face-on, exactly
+$0$ on back-to-back, with compact support and \emph{no polynomial
+tail} -- back-side pairs contribute mathematically zero.  $a_{ij}$ is
+$\bdelta$-independent (both normals are rest body-local), so the
+gradient picks up no extra $\partial a_{ij}/\partial\bdelta$ term;
+$a_{ij}$ enters every force/energy expression as a constant
+multiplier.
+
+\paragraph{Cull-product magnitude check.}  At the depth threshold
+$\mathrm{raw} = -50\,\varepsilon$,
+$\phi^{\mathrm{eff}} \approx 0.005\,\varepsilon$ and
+$\mathrm{gate} \approx 1.0\times 10^{-4}$ \emph{individually}; neither is
+small on its own.  What justifies the cull is the \emph{product} that
+enters every force / energy term:
+\begin{equation}
+  \sigma_{\varepsilon}(-50\varepsilon)\;\cdot\;\Sigma_{\varepsilon}(-50\varepsilon)
+  \;\approx\; 5\times 10^{-7}\,\varepsilon.
+  \label{eq:cull-product}
+\end{equation}
+At production $\varepsilon = 5\times 10^{-4}\,$m this product is
+$2.5\times 10^{-10}\,$m.  Multiplied by typical
+$k_c\,A_j\,w^{t} \sim 10^{-2}\,$N$/$m at production sampling density,
+the per-pair force contribution from a culled pair is
+$\sim 10^{-11}\,$N -- well below the $1$--$100\,$N range of total
+contact wrench, so the cull is numerically harmless.
+
+\paragraph{Phase 4b amendment notice.}  For closed convex targets
+whose side faces are flat extensions of the contact face (canonical
+example: an axis-aligned box pressing one face against a pad), corner
+samples on the perpendicular side faces sit at $\alpha_{ij} = 0$, hit
+the middle of the smooth band, and contribute at $a_{ij} = 0.5$.  This
+is not zero -- the pad receives asymmetric in-plane forces from
+geometric configurations the contract intends to cull.  Phase 4b will
+shift the smooth band from $[-\varepsilon_{\mathrm{align}},
++\varepsilon_{\mathrm{align}}]$ to
+$[0, +\varepsilon_{\mathrm{align}}]$ (perpendicular hard-culled with a
+small smoothing band near face-on for angular jitter).  Phase 4a's
+T-K scene H uses a single-face point set to side-step this until the
+amendment lands.
+
+\subsection{Verification (T-A, T-B)}
+
+\textbf{T-A} (\texttt{test\_half\_space\_monotonicity.py}) sweeps a
+single pad sphere from $\bq_i$ at $+10 r_i$ outside a flat face to
+$-10 r_i$ inside the body and verifies (a) $\mathrm{raw}(\bq_i)$
+strictly increasing; (b) $\phi^{\mathrm{eff}}(\bq_i)$ non-decreasing;
+(c) $\mathrm{gate}(\bq_i)$ non-decreasing; (d) no sign flip.
+\textbf{T-B} (\texttt{test\_half\_space\_deep\_penetration.py}) drives
+$\bq_i$ to $-10 r_i$ \emph{inside} the body and verifies the force is
+finite, monotone, has $\mathrm{gate}=1$ (saturated), and contains no
+NaN -- v1's $(r+R)-\|\cdot\|$ form would drop to zero past the $r+R$
+cliff and reverse sign beyond it.  Both pass to fp precision;
+\textbf{Fig.~\ref{fig:tatb}}.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.49\textwidth]{figures/ta_half_space_monotonicity.png}\hfill
+\includegraphics[width=0.49\textwidth]{figures/tb_half_space_deep_penetration.png}
+\caption{Half-space primitives.  Left (T-A): raw, $\phi^{\mathrm{eff}}$,
+gate as the pad sphere sweeps from outside to inside; all three are
+monotone and there is no sign flip at face crossing.  Right (T-B):
+deep-penetration force is finite and monotone in depth, with the gate
+saturated at $1.0$ for $\mathrm{raw}\ge 50\varepsilon$; the v1 form
+(in dashed) drops to zero past the $r+R$ cliff and goes negative.}
+\label{fig:tatb}
+\end{figure}
+
+% ---------------------------------------------------------------------
+\section{Single-pair contact}
+\label{sec:single-pair}
+
+For one (pad sphere $i$, target sample $j$) pair, the contact energy
+contribution is
+\begin{equation}
+  E_{ij}(\bdelta_i)
+  \;=\; \tfrac{1}{2}\,k_c\,A_j\,w^{t}_{ij}\,a_{ij}\,
+        \bigl[\phi^{\mathrm{eff}}_{ij}\bigr]^{2}.
+  \label{eq:E-ij}
+\end{equation}
+The chain-rule gradient with respect to $\bdelta_i$ uses
+$\partial\bq_i/\partial\bdelta_i = -\bI$ and
+$\partial\,\mathrm{raw}_{ij}/\partial\bdelta_i = +\bnf_{\!j}$:
+\begin{equation}
+  \frac{\partial E_{ij}}{\partial\bdelta_i}
+  \;=\; k_c\,A_j\,w^{t}_{ij}\,a_{ij}\,
+        \phi^{\mathrm{eff}}_{ij}\,\mathrm{gate}_{ij}\,\bnf_{\!j}
+  \quad\Bigl(\!= +\,\bef^{\mathrm{phys}}_{ij}\Bigr).
+  \label{eq:contact-grad}
+\end{equation}
+The corresponding \emph{kernel-side load} is
+$\bef^{\mathrm{load}}_{ij} = -\partial E_{ij}/\partial\bdelta_i$, i.e.\
+the same magnitude in the opposite direction; the kernel writes
+$\mathbf{n}_{\mathrm{eff}} = -\bnf_{\!j}$ (kernel L1516) so its
+contact-load formula
+$k_c\,A_j\,w^{t}\,a\,\phi^{\mathrm{eff}}\,\mathrm{gate}\,\mathbf{n}_{\mathrm{eff}}$
+matches the gradient form when both signs are accounted for.
+
+\paragraph{Why $\mathrm{gate}_{ij}$ must appear in the gradient.}
+Because $\phi^{\mathrm{eff}} = \sigma_{\varepsilon}(\mathrm{raw})$, the
+chain rule gives
+$\partial[\tfrac{1}{2}(\phi^{\mathrm{eff}})^2]/\partial\bdelta
+= \phi^{\mathrm{eff}}\,\sigma_{\varepsilon}^{\prime}(\mathrm{raw})\,\bnf
+= \phi^{\mathrm{eff}}\,\Sigma_{\varepsilon}(\mathrm{raw})\,\bnf$.
+Forgetting $\Sigma_{\varepsilon}$ -- the v1 silent-gradient bug -- is
+invisible at deep saturated contact
+($\mathrm{raw}\gg\varepsilon$, $\Sigma_{\varepsilon}\approx 1$) but is
+up to a factor of $2$ wrong at contact onset
+($\mathrm{raw}\sim\varepsilon$), and on non-contact pairs
+($\mathrm{raw}\ll -\varepsilon$) it leaks a spurious
+$k_c\,\varepsilon/2$ load because $\sigma_{\varepsilon}$ has an
+irreducible $\varepsilon/2$ floor while $\Sigma_{\varepsilon}\to 0$
+kills the leak.
+
+\paragraph{$w^{t}$-derivative status (Phase 4a commit).}  Strictly,
+$w^{t}_{ij}$ is also $\bdelta$-dependent through $d^{t}_{ij}$, so the
+chain rule has an extra term
+$\tfrac{1}{2}k_c A_j a_{ij}(\phi^{\mathrm{eff}}_{ij})^{2}\,
+\Sigma_{\varepsilon}^{\prime}(3r_i - d^{t}_{ij})\,
+\hat{\mathbf{z}}_{ij}$, with
+$\hat{\mathbf{z}}_{ij} = \mathbf{d}^{t}_{ij}/d^{t}_{ij}$.  Both the
+production Warp kernel \emph{and} the theory's
+\texttt{solve\_lattice\_contact} drop this term: the contribution
+scales as $O(\varepsilon^{2}/r_{i}^{3})$ -- about $1.4\,$m$^{-1}$ at
+production $\varepsilon=5\times 10^{-4}\,$m, $r_i = 1.5\times 10^{-3}\,$m
+-- well below L-BFGS-B's converged gradient floor of $\sim 5\times
+10^{-8}$ (\cref{sec:lessons} \#1).  Theory $=$ kernel ``never both
+ways''; this commit was made in Phase 4a as part of building the
+bridge harness against a consistent operator on both sides.
+
+% ---------------------------------------------------------------------
+\section{Total contact on a pad sphere}
+\label{sec:contact}
+
+Per pad sphere $i$, sum the per-pair gradient over all target samples:
+\begin{equation}
+  \frac{\partial}{\partial\bdelta_i}\!\sum_{j} E_{ij}
+  \;=\; \sum_{j}
+        k_c\,A_j\,w^{t}_{ij}\,a_{ij}\,
+        \phi^{\mathrm{eff}}_{ij}\,\mathrm{gate}_{ij}\,\bnf_{\!j}.
+  \label{eq:F-contact-i}
+\end{equation}
+Active-set culling \eqref{eq:inactive}-\eqref{eq:align-cull} restricts
+the sum to nearby, opposing-face pairs.
+
+\paragraph{Per-sphere normal force read-out.}  The friction model
+(\cref{sec:friction}) and the grip aggregation T-J both need the
+scalar normal force at each pad sphere, defined as the magnitude of
+the projection of \eqref{eq:F-contact-i} on the pad's own outward
+normal:
+\begin{equation}
+  f^{n}_{i}
+  \;=\;
+  \left|\,
+    \biggl(\sum_{j}
+        k_c\,A_j\,w^{t}_{ij}\,a_{ij}\,
+        \phi^{\mathrm{eff}}_{ij}\,\mathrm{gate}_{ij}\,\bnf_{\!j}\biggr)
+    \!\cdot\!\bnp_i
+  \,\right|.
+  \label{eq:fn-i}
+\end{equation}
+Implementation: \texttt{lattice\_contact\_normal\_forces}
+(\texttt{cslc\_lattice.py}), which evaluates the same expression as
+\eqref{eq:F-contact-i} at a given equilibrium $\bdelta$.
+
+% ---------------------------------------------------------------------
+\section{Single pad sphere: equilibrium against a flat face}
 \label{sec:single}
 
-\subsection{Geometry}
+\subsection{Closed form, face-on}
 
-Let one lattice sphere face a rigid target sphere of centre $\bt$ and
-radius $R$.  The \emph{rest} overlap is
+Take a single pad sphere with isotropic anchor $k_a$ and a single
+target sample $(\bt, \bnf_{\!})$ with $\bnf_{\!} = -\bnp$ (face-on).
+The rest overlap \eqref{eq:raw-rest} reduces to
+$d = r - \bnf_{\!}\!\cdot\!(\bp-\bt)$.  Symmetry forces
+$\bdelta = \delta_n \bnp$, and the scalar equilibrium
+$\partial E_{\mathrm{tot}}/\partial\delta_n = 0$ collapses to
 \begin{equation}
-  \phi^{\mathrm{rest}}
-  \;=\; (r+R) \;-\; \|\bp-\bt\|,
-  \label{eq:phi-rest}
-\end{equation}
-which is positive precisely when the two rest spheres geometrically
-overlap.  The \emph{raw} overlap at finite displacement is obtained from
-the deformed centre~\eqref{eq:def-centre}:
-\begin{equation}
-  \mathrm{raw}(\bdelta)
-  \;=\; (r+R)\;-\;\|\bt-\bq\|
-  \;=\; (r+R)\;-\;\|\bt-\bp+\bdelta\|.
-  \label{eq:raw}
-\end{equation}
-The clamped-positive (\emph{effective}) overlap is
-\begin{equation}
-  \phi^{\mathrm{eff}}(\bdelta)
-  \;=\; [\mathrm{raw}(\bdelta)]_+
-  \;=\; \max\!\bigl(0,\;\mathrm{raw}(\bdelta)\bigr),
-  \label{eq:phi-eff}
-\end{equation}
-and the contact direction is the unit vector from the target to the
-deformed sphere centre,
-\begin{equation}
-  \hatu_c(\bdelta)
-  \;=\; \frac{\bq-\bt}{\|\bq-\bt\|}
-  \;=\; \frac{\bp-\bdelta-\bt}{\|\bp-\bdelta-\bt\|}.
-  \label{eq:n-eff-def}
-\end{equation}
-
-Code references: \texttt{rest\_overlap}, \texttt{effective\_penetration},
-\texttt{contact\_raw\_overlap}, \texttt{contact\_direction}
-(\texttt{cslc\_main/theory/cslc\_theory.py}).
-
-\subsection{Forces and energies}
-
-The anchor is a 3-D Hookean spring whose stored energy and gradient
-with respect to $\bdelta$ are
-\begin{equation}
-  E_{\mathrm{anchor}}(\bdelta) \;=\; \tfrac{1}{2}\,k_a\,\|\bdelta\|^2,
-  \qquad
-  \frac{\partial E_{\mathrm{anchor}}}{\partial \bdelta} \;=\; k_a\,\bdelta.
-  \label{eq:anchor-iso}
-\end{equation}
-This is Hooke's law on the centre's offset from rest.  $k_a>0$ ensures
-coercivity of the total energy.  Code: \texttt{anchor\_force}
-(\texttt{cslc\_theory.py}\,L206--221, returns the gradient).
-
-The contact is a Hookean spring on the contact-layer compression
-$\phi^{\mathrm{eff}}$:
-\begin{equation}
-  E_{\mathrm{contact}}(\bdelta) \;=\; \tfrac{1}{2}\,k_c\,
-       \bigl[\phi^{\mathrm{eff}}(\bdelta)\bigr]^{2}.
-  \label{eq:contact-energy}
-\end{equation}
-The chain rule for the gradient picks up an extra $\Sigma_\varepsilon$
-factor through $\phi^{\mathrm{eff}}=\sigma_\varepsilon(\mathrm{raw})$;
-the full expression is~\eqref{eq:contact-grad} in
-\cref{sec:smoothing}.
-
-The total energy
-\begin{equation}
-  E_{\mathrm{tot}}(\bdelta) \;=\; E_{\mathrm{anchor}} \;+\;
-                                  E_{\mathrm{contact}}
-  \label{eq:E-tot-1sphere}
-\end{equation}
-is convex on the half-space $\mathrm{raw}>0$ and is bounded below by
-zero, so it has a unique minimiser when $k_a>0$.
-
-\subsection{Face-on equilibrium (closed form)}
-\label{sec:face-on}
-
-When the target sits exactly on the rest normal,
-$\bt-\bp = \|\bt-\bp\|\,\bn$, symmetry forces $\bdelta=\delta_n\bn$ with
-$\delta_n\ge 0$, and $\hatu_c=-\bn$.  Writing the scalar equilibrium
-$\partial E_{\mathrm{tot}}/\partial\delta_n = 0$,
-\begin{equation}
-  k_a\,\delta_n \;-\; k_c\,
-       \bigl(\phi^{\mathrm{rest}}-\delta_n\bigr)
-     \;=\; 0
+  k_a\,\delta_n \;-\; k_c\,(d - \delta_n) \;=\; 0
   \quad\Longrightarrow\quad
   \delta_n^{*}
   \;=\;
-  \frac{k_c\,\phi^{\mathrm{rest}}}{k_a+k_c},
-  \label{eq:1sphere-delta}
+  \frac{k_c\,d}{k_a + k_c},
+  \qquad
+  F^{*} \;=\; \frac{k_a\,k_c}{k_a+k_c}\,d
+        \;=\; k_{\mathrm{eff}}\,d.
+  \label{eq:series-2}
 \end{equation}
-and the magnitude of the resulting contact force is
+This is the textbook two-spring series law (anchor in series with
+contact), and is the v2 successor of v1 \texttt{equilibrium\_face\_on}-
+\texttt{\_analytical}.  Code:
+\texttt{equilibrium\_half\_space\_face\_on\_analytical}.
+
+\subsection{Off-axis tilt with anisotropic anchor}
+\label{sec:off-axis}
+
+Tilt the target's face by angle $\theta$ relative to the pad's normal,
+so $\bnf_{\!} \cdot \bnp = -\cos\theta$.  With anisotropic anchor
+\eqref{eq:anchor-aniso} (tangent ratio $\rho$), the equilibrium splits
+into normal/tangent components.  Because $\partial\,\mathrm{raw}/\partial\bdelta
+= +\bnf$ is \emph{constant} in $\bdelta$ (v2 face normal is $\bdelta$-
+independent), the tangent ratio simplifies to the exact closed form
 \begin{equation}
-  F^{*} \;=\; \frac{k_a\,k_c}{k_a+k_c}\,\phi^{\mathrm{rest}}
-        \;=\; k_{\mathrm{eff}}\,\phi^{\mathrm{rest}},
-  \quad
-  \frac{1}{k_{\mathrm{eff}}}=\frac{1}{k_a}+\frac{1}{k_c}.
-  \label{eq:1sphere-series}
+  \left|\frac{\delta_t^{*}}{\delta_n^{*}}\right|
+  \;=\; \frac{1}{\rho}\,\tan\theta.
+  \label{eq:aniso-tilt}
 \end{equation}
-The combination law~\eqref{eq:1sphere-series} is the classical
-\emph{series-spring composition}: the same force flows through the
-anchor and the contact spring, while their two compressions add up to
-$\phi^{\mathrm{rest}}$.  The rigid-target limit recovers $F^*\to
-k_a\,\phi^{\mathrm{rest}}$ as $k_c\to\infty$, and the no-contact limit
-gives $F^*\to 0$ as $k_c\to 0$.  Code:
-\texttt{equilibrium\_face\_on\_analytical}.
+The v1 form
+$|{\delta_t}/{\delta_n}| = \frac{k_a - A}{k_a\rho - A}\,\tan\theta$
+with $A = k_c\phi^{\mathrm{eff}}/L$ was wrong by up to $21\%$ at
+$\rho = 0.1$ -- the v1 line-of-centres direction rotated with
+$\bdelta$, producing the $A$ correction; in v2 that rotation does not
+occur and the correction vanishes.
 
-\subsection{Three-body composition}
-\label{sec:three-body}
+\subsection{Verification (T-C, T-D)}
 
-The same logic with a third spring---a compliant target of effective
-modulus $k_e$---gives the three-spring series law
-\begin{equation}
-  \frac{1}{k_{\mathrm{eff}}}
-  \;=\; \frac{1}{k_a} \;+\; \frac{1}{k_c} \;+\; \frac{1}{k_e},
-  \label{eq:series-3}
-\end{equation}
-recovering~\eqref{eq:1sphere-series} when $k_e\to\infty$ (rigid
-target).  In the kernel the two right-most springs are combined into
-$k_{\mathrm{series}}$ by a harmonic-mean composition with a smoothing
-regulariser (cf.~\cref{sec:smoothing}):
-\begin{equation}
-  k_{\mathrm{series}}
-  \;=\; \frac{k_c\,k_e}{k_c+k_e+\varepsilon^{2}},
-  \label{eq:series-kernel}
-\end{equation}
-and the calibration helper
-\texttt{calibrate\_kc}\,(\texttt{cslc\_data.py}) inverts~\eqref{eq:series-3}
-to obtain $k_c$ from a user-supplied bulk stiffness.
+\textbf{T-C} (\texttt{test\_face\_on\_series\_spring.py}) verifies
+\eqref{eq:series-2} on a 15-cell $(d, k_c/k_a)$ grid: numerical
+L-BFGS-B on $E_{\mathrm{tot}}$ matches the closed form to
+$1.1\times 10^{-19}\,$m absolute / $1.4\times 10^{-14}\,$N at
+$\varepsilon = 1\times 10^{-9}\,$m (theory grade).  Part D
+quantifies the \emph{production-eps precision floor}: at production
+$\varepsilon = 5\times 10^{-4}\,$m the smooth-surrogate force matches
+analytical to $<1\%$ when $\mathrm{raw}_{\mathrm{eq}} \ge 10\,\varepsilon$,
+and the rel-err scales $\sim 1/(\mathrm{raw}_{\mathrm{eq}}/\varepsilon)^{4}$
+in the leading correction.  This is the precision budget every
+production-eps test inherits.  \textbf{Fig.~\ref{fig:tc}}.
 
-\subsection{Verification (Step 1)}
-
-\texttt{test\_01\_single\_sphere.py} drives four checks.  Numerical
-L-BFGS-B on $E_{\mathrm{tot}}(\bdelta)$ matches the closed
-form~\eqref{eq:1sphere-delta}--\eqref{eq:1sphere-series} to
-$2\times10^{-10}$ relative error across 15 $(\phi,k_c)$ pairs (Part A).
-$F^*$ saturates at $k_a\,\phi^{\mathrm{rest}}$ as $k_c\to\infty$ and
-vanishes as $k_c\to 0$ (Part B,
-\textbf{Fig.~\ref{fig:01b}}).  $F^*$ is linear in $\phi^{\mathrm{rest}}$
-with slope $k_{\mathrm{eff}}$ (Part C,
-\textbf{Fig.~\ref{fig:01c}}).  For an off-axis target, $\bdelta$ tilts
-to follow the contact line while $\|\bdelta\|=750\,\mu$m is conserved
-(Part D, \textbf{Fig.~\ref{fig:01d}}).
+\textbf{T-D} (\texttt{test\_tilted\_face.py}) verifies the tilt
+formula \eqref{eq:aniso-tilt} on a $\rho \times \theta$ grid with
+$\rho \in \{1, 1/2, 1/3, 0.1\}$ and $\theta \in \{5^{\circ}, 15^{\circ},
+30^{\circ}, 45^{\circ}\}$; worst rel err $2.2\times 10^{-8}$.  Side panel
+plots the v1 formula's residual: up to $13\%$ at $\rho = 0.1$,
+$\theta = 45^{\circ}$.  \textbf{Fig.~\ref{fig:td}}.
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.49\textwidth]{figures/01b_series_spring_kc.png}\hfill
-\includegraphics[width=0.49\textwidth]{figures/01c_force_vs_phi.png}
-\caption{Single-sphere series spring.  Left: $F^{*}$ vs $k_c$ saturates
-at $k_a\,\phi^{\mathrm{rest}}$ (rigid-contact limit) and vanishes as
-$k_c\to 0$, the textbook series-spring response of
-\eqref{eq:1sphere-series}.  Right: $F^{*}$ is exactly linear in
-$\phi^{\mathrm{rest}}$ with slope $k_{\mathrm{eff}}$, residual at the
-$10^{-13}\,\mathrm{N}$ level.}
-\label{fig:01b}\label{fig:01c}
+\includegraphics[width=0.49\textwidth]{figures/tc_series_spring_kc.png}\hfill
+\includegraphics[width=0.49\textwidth]{figures/tc_production_eps_floor.png}
+\caption{Single pad face-on series spring.  Left: $F^{*}$ vs $k_c/k_a$
+at $\varepsilon = 10^{-9}\,$m; saturates at $k_a\,d$ as $k_c\to\infty$
+(rigid contact) and vanishes as $k_c\to 0$, matching
+\eqref{eq:series-2} to fp precision.  Right: production-eps precision
+floor -- rel-err on the equilibrium force scales as
+$(\mathrm{raw}_{\mathrm{eq}}/\varepsilon)^{-4}$ once
+$\mathrm{raw}_{\mathrm{eq}}$ drops below $10\,\varepsilon$.}
+\label{fig:tc}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.7\textwidth]{figures/01d_off_axis_geometry.png}
-\caption{Off-axis target.  The deformed centre $\bq^*$ tilts to lie on
-the line of centres with the target; $\bdelta^*$ points along the
-\emph{contact} direction, not the rest normal.  The vector
-formulation~\eqref{eq:def-centre} is what enables this
-generalisation.}
-\label{fig:01d}
+\includegraphics[width=0.55\textwidth]{figures/td_tilt_vs_theta.png}
+\includegraphics[width=0.42\textwidth]{figures/td_v1_vs_v2.png}
+\caption{Off-axis tilt (T-D).  Left: $|\delta_t/\delta_n|$ vs $\theta$
+for $\rho \in \{1, 1/2, 1/3, 0.1\}$, comparing numerical solver to
+the exact closed form \eqref{eq:aniso-tilt}; rel err $\le 2.2\times
+10^{-8}$.  Right: v1 vs v2 formula residual -- v1's $A$ correction is
+wrong by up to $13\%$ at $\rho = 0.1$ because the v1 contact
+direction rotated with $\bdelta$ and v2's does not.}
+\label{fig:td}
 \end{figure}
 
-\section{Lateral coupling between lattice spheres}
+% ---------------------------------------------------------------------
+\section{Lattice equilibrium}
+\label{sec:lattice}
+
+The total energy on a lattice of $n$ pad spheres is
+\begin{equation}
+  E_{\mathrm{tot}}(\bdelta_{1\!:\!n})
+  \;=\;
+  \sum_{i}\!E_{\mathrm{anchor},i}
+  \;+\; E_{\mathrm{lat}}
+  \;+\;
+  \sum_{i\in\mathcal{S}}\!\sum_{j}\!
+       \tfrac{1}{2}\,k_c\,A_j\,w^{t}_{ij}\,a_{ij}\,
+       \bigl[\phi^{\mathrm{eff}}_{ij}\bigr]^{2}
+  \;+\;
+  \sum_{i\in\mathcal{S}}\!E^{(i)}_{\mathrm{fric}},
+  \label{eq:E-tot}
+\end{equation}
+where $\mathcal{S}$ is the set of surface pad spheres (those that
+participate in contact).  The quasistatic equilibrium is
+\begin{equation}
+  \frac{\partial E_{\mathrm{tot}}}{\partial\bdelta_i}\bigg|_{i} = 0,
+  \qquad \forall i.
+  \label{eq:eq-cond}
+\end{equation}
+
+\subsection{Anchor (anisotropic)}
+\label{sec:anchor}
+
+In each pad sphere's local $\{\bnp_i,\bnp_i^{\perp}\}$ frame, with
+$\delta_{n,i} = \bdelta_i\!\cdot\!\bnp_i$ and
+$\bdelta_{t,i} = \bdelta_i - \delta_{n,i}\bnp_i$,
+\begin{align}
+  E_{\mathrm{anchor},i}
+  &\;=\; \tfrac{1}{2}\,k_a\,\delta_{n,i}^{\,2}
+       \;+\; \tfrac{1}{2}\,(k_a\,\rho)\,\|\bdelta_{t,i}\|^{2},
+  \label{eq:anchor-aniso}\\
+  \frac{\partial E_{\mathrm{anchor},i}}{\partial\bdelta_i}
+  &\;=\; k_a\,\delta_{n,i}\,\bnp_i \;+\; (k_a\,\rho)\,\bdelta_{t,i}.
+  \label{eq:anchor-grad}
+\end{align}
+$\rho = k_{a,t}/k_a$ is the \emph{tangent ratio}; $\rho = 1$ recovers
+the isotropic Hookean spring, and the incompressible flesh limit
+$\nu \to 1/2$ gives $\rho = 1/(2(1+\nu)) \to 1/3$.
+
+Because $\bnp_i$ is $\bdelta$-independent (it is the pad sphere's
+\emph{rest} outward normal), the gradient picks up no extra
+$\partial\bnp_i/\partial\bdelta$ term -- the local frame is fixed by
+the rest geometry, not by the current displacement.  Phase 4a's
+\texttt{solve\_lattice\_contact} accepts the anisotropic ratio as a
+scalar kwarg \texttt{ka\_t\_ratio} so bridge scenes can sweep $\rho$
+without rebuilding the \texttt{Lattice} dataclass; the kernel takes
+\texttt{ka\_tangent\_ratio} via the same convention.
+
+\subsection{Lateral (graph-Laplacian only, v2)}
 \label{sec:lateral}
 
-We now connect spheres into a lattice.  Two laws are implemented side
-by side in \texttt{cslc\_lattice.py}; we keep both so the suite can
-expose the geometry-blindness of the linear law.
-
-\subsection{Graph-Laplacian law (paper baseline)}
-
-The conference paper writes the lateral force on $\bq_i$ as the
-negative discrete Laplacian of the displacement field,
+The conference paper~\cite{v1conf} wrote a distance-preserving
+lateral law on edge length; v2 \emph{removes} that law and keeps the
+graph-Laplacian form only:
 \begin{equation}
   E_{\mathrm{lat}}^{\mathrm{GL}}
-  \;=\; \tfrac{1}{2}\,k_{\ell}\!\!\!\sum_{(i,j)\in E}\!
-        \bigl\|\bdelta_i-\bdelta_j\bigr\|^{2},
+  \;=\; \tfrac{1}{2}\,k_{\ell}\!\!\sum_{(i,j)\in E}\!
+        \bigl\|\bdelta_i - \bdelta_j\bigr\|^{2},
   \qquad
   \frac{\partial E_{\mathrm{lat}}^{\mathrm{GL}}}{\partial\bdelta_i}
-  \;=\; k_{\ell}\!\sum_{j\in\mathcal{N}(i)}
-        \bigl(\bdelta_i - \bdelta_j\bigr).
+  \;=\; k_{\ell}\!\sum_{j\in\mathcal{N}(i)}\!(\bdelta_i - \bdelta_j).
   \label{eq:lat-GL}
 \end{equation}
-(The kernel's load form
-$\bef_i^{\mathrm{lat,GL,load}}=-k_{\ell}\sum_j(\bdelta_i-\bdelta_j)$
-is the negative gradient; cf.\
-\texttt{lateral\_force\_graph\_laplacian} in
-\texttt{cslc\_lattice.py}\,L289--306.)  The Hessian
-$\partial^2 E^{\mathrm{GL}}_{\mathrm{lat+anchor}}/\partial\bdelta^2$ is
-the scalar lattice stiffness matrix
+\paragraph{Consequence: no Poisson bulge.}  The distance-preserving
+law had a curvature-driven \emph{bulge window} in which a perimeter
+neighbour of the apex on a curved patch developed $\delta_n < 0$
+(outward bulge along its own normal) over a window of apex compressions
+$0 < \delta_{\mathrm{apex}} < R_{\mathrm{pad}}\,\alpha^{2}$, where
+$\alpha$ is the angular spacing.  The graph-Laplacian law has no such
+window: it sees only $\bdelta_i - \bdelta_j$, with no awareness of
+edge geometry, and always spreads load with the \emph{same} sign as
+the loaded sphere.  Curved pad lattices still flatten against a target
+(this is a kinematic consequence of the anchor + contact balance), but
+no perimeter sphere develops $\delta_n < 0$ under static contact.
+The \emph{no-bulge} property is regression-guarded by T-G; see
+\cref{sec:T-G}.
+
+\paragraph{Linearised stiffness matrix.}  Linearising
+\eqref{eq:E-tot} about $\bdelta = 0$ on the normal axis (face-on
+contact) gives the scalar lattice stiffness matrix
 \begin{equation}
   K_{ii} \;=\; k_{a} + k_{\ell}\,|\mathcal{N}(i)|,
   \qquad
-  K_{ij} \;=\; -k_{\ell}\;\text{if } j\in\mathcal{N}(i),
+  K_{ij} \;=\; -k_{\ell}\ \text{if } j\in\mathcal{N}(i),
   \label{eq:Kmatrix}
 \end{equation}
-with $\bK\in\real^{n\times n}$ symmetric positive-definite for $k_a>0$.
-Code: \texttt{build\_K\_matrix}\,(\texttt{cslc\_lattice.py}\,L185--208).
-The full vector system is $(\bK\otimes\bI_3)\bdelta=\bef^{\mathrm{ext}}$,
-which decouples per Cartesian axis.
+SPD for $k_a > 0$; full vector system $(\bK\otimes\bI_3)\,\bdelta =
+\bef^{\mathrm{ext}}$ decouples per Cartesian axis.  Code:
+\texttt{build\_K\_matrix}.
 
-\subsection{Distance-preserving law (ideal)}
+\subsection{Chain spectrum and Green's function}
 
-The \emph{ideal} lateral law is a Hookean spring on the physical
-deformed-centre distance.  The stored energy on edge $(i,j)$ and the
-gradient contributions to spheres $i,j$ are
-\begin{align}
-  E_{\mathrm{lat}}^{\mathrm{DP}}
-  &\;=\; \tfrac{1}{2}\,k_{\ell}\!\!\!\sum_{(i,j)\in E}\!
-        \bigl(\|\bq_j-\bq_i\|-L_{ij}\bigr)^{2},
-  \qquad L_{ij}\;=\;\|\bp_j-\bp_i\|,
-  \label{eq:lat-DP-energy}
-  \\
-  \frac{\partial E_{\mathrm{lat}}^{\mathrm{DP}}}{\partial\bdelta_i}\bigg|_{\mathrm{edge}\,(i,j)}
-  &\;=\; +k_{\ell}\,\bigl(\|\bq_j-\bq_i\|-L_{ij}\bigr)\,
-        \hatu_{ij}(\bdelta),
-  \quad
-  \hatu_{ij}(\bdelta)\;=\;\frac{\bq_j-\bq_i}{\|\bq_j-\bq_i\|},
-  \label{eq:lat-DP}
-\end{align}
-with the opposite sign at sphere $j$ (because
-$\partial(\bq_j-\bq_i)/\partial\bdelta_j=-\bI$, the discrete analogue of
-Newton's third law for the spring tension).  Code:
-\texttt{lateral\_energy\_distance\_preserving},
-\texttt{lateral\_force\_distance\_preserving}\\
-(\texttt{cslc\_lattice.py}\,L318--363).\footnote{The
-\texttt{lateral\_force\_distance\_preserving} helper returns the
-\emph{gradient} (not the load), while its sibling
-\texttt{lateral\_force\_graph\_laplacian} returns the load
-($-$gradient).  These two helpers therefore disagree on sign by a
-factor of $-1$; this was the gradient-sign bug listed in
-\texttt{notes.md} (lesson \#2), fixed in
-\texttt{solve\_lattice\_contact\_numerical} by writing the gradient
-inline rather than re-using the helpers.}
-
-Linearising~\eqref{eq:lat-DP} about $\bdelta=0$, the distance-preserving
-gradient on edge $(i,j)$ collapses to the rank-1 projector
-$\hatu_{ij}^{\mathrm{rest}}\otimes\hatu_{ij}^{\mathrm{rest}}$ acting on
-$(\bdelta_i-\bdelta_j)$, so it agrees with the graph
-Laplacian~\eqref{eq:lat-GL} only on the rest-edge direction; it does
-\emph{not} resist transverse load.  The two laws therefore diverge as
-soon as the displacement has a component perpendicular to a rest edge,
-as we make precise in Steps 2--5.
-
-\subsection{Chain spectrum and Green's function (Step 2)}
-
-Specialising~\eqref{eq:Kmatrix} to an $N$-sphere chain (degree 1 at the
-ends, degree 2 in the interior), $\bK$ is tridiagonal and its
-eigenvalues are the discrete-Neumann spectrum
+For an $N$-sphere chain (degree $1$ at the endpoints, degree $2$
+interior), $\bK$ is tridiagonal with closed-form eigenvalues
 \begin{equation}
-  \lambda_k \;=\; k_a \;+\; 2k_{\ell}
-                  \bigl(1-\cos(k\pi/N)\bigr),
-  \qquad k=0,1,\ldots,N-1.
+  \lambda_k \;=\; k_a \;+\; 2 k_{\ell}\bigl(1-\cos(k\pi/N)\bigr),
+  \qquad k = 0,1,\ldots,N-1,
   \label{eq:chain-spectrum}
 \end{equation}
-The mode $k=0$ has eigenvalue $\lambda_0=k_a$: uniform translation, the
-only mode the lateral spring cannot resist.  The chain's discrete
-Green's function $g_i$ for a point source at $i=0$ decays as
-$g_i\propto z_-^{|i|}$ with
+mode $k = 0$ being uniform translation with eigenvalue $\lambda_0 = k_a$
+-- the only mode the lateral spring cannot resist.  The discrete
+Green's function for a point source at sphere $0$ decays as
+$g_i \propto z_{-}^{|i|}$ with
 \begin{equation}
-  z_- \;=\; (1+\alpha) \;-\;
-            \sqrt{\alpha(\alpha+2)},
+  z_{-} \;=\; (1+\alpha) - \sqrt{\alpha(\alpha+2)},
   \qquad
-  \alpha = \frac{k_a}{2k_\ell},
+  \alpha \;=\; \frac{k_a}{2 k_{\ell}},
   \qquad
-  \ell_c^{\mathrm{disc}} = -\,\frac{1}{\ln z_-}.
+  \ell_{c}^{\mathrm{disc}} \;=\; -\,\frac{1}{\ln z_{-}}.
   \label{eq:chain-decay}
 \end{equation}
-The continuum approximation $\ell_c=\sqrt{k_\ell/k_a}$ is exact only in
-the $k_\ell\gg k_a$ limit; at the production default $k_\ell/k_a=0.2$,
-the discrete decay length is $0.520$ spacings, not the continuum
-$0.447$ (\textbf{Fig.~\ref{fig:02c}}).  Code:
-\texttt{chain\_discrete\_decay\_length},
-\texttt{chain\_analytical\_eigenvalues}.
+The continuum approximation $\ell_c = \sqrt{k_{\ell}/k_a}$ is only
+accurate at $k_{\ell} \gg k_a$; at the production default
+$k_{\ell}/k_a = 0.2$ the discrete decay is $0.520$ spacings (continuum
+$0.447$).  Verified by T-E (\texttt{test\_02\_chain.py}):
+\textbf{Fig.~\ref{fig:te}}.
 
 \begin{figure}[h]
 \centering
 \includegraphics[width=0.49\textwidth]{figures/02b_eigenvalue_spectrum.png}\hfill
 \includegraphics[width=0.49\textwidth]{figures/02c_greens_function_axial.png}
-\caption{Lattice stiffness on a chain.  Left: all $N=20$ eigenvalues
-match~\eqref{eq:chain-spectrum} to machine precision (rel. err
-$4\times10^{-16}$).  Right: Green's function decay fits the
-\emph{discrete} formula~\eqref{eq:chain-decay} to $\le 1\%$ across
-$k_\ell/k_a\in\{0.2,1,10\}$ -- using the continuum $\sqrt{k_\ell/k_a}$
-gives a 16\% mismatch at the production setting.}
-\label{fig:02c}
+\caption{T-E.  Chain spectrum and Green's function.  Left:
+$N = 20$ eigenvalues match \eqref{eq:chain-spectrum} to machine
+precision (rel.\ err.\ $4\times 10^{-16}$).  Right: Green's function
+decay fits the \emph{discrete} formula \eqref{eq:chain-decay} to
+$\le 1\%$ across $k_{\ell}/k_a \in \{0.2, 1, 10\}$.  v1's
+distance-preserving sections are deleted in v2 (the only lateral law
+is graph-Laplacian); a new Part D' verifies GL axes decouple exactly
+at the same three ratios.}
+\label{fig:te}
 \end{figure}
 
-\begin{figure}[h]
-\centering
-\includegraphics[width=0.8\textwidth]{figures/02d_perpendicular_diagnostic.png}
-\caption{Perpendicular load on the chain exposes the two
-laws.  Graph-Laplacian spreads $\delta_y$ into the neighbours
-isotropically; distance-preserving leaves it localised at the loaded
-sphere ($\delta_y=F/k_a$, neighbours zero to leading order) because no
-rest edge has a $y$-component.  This is the first qualitative
-disagreement and is what motivates~\eqref{eq:lat-DP}.}
-\label{fig:02d}
-\end{figure}
+\subsection{Chain $+$ flat-face contact (T-F)}
 
-\subsection{Chain $+$ contact (Step 3)}
-
-Adding a single contact target above sphere $k$ inserts a
-$+k_c\,e_k e_k^\top$ rank-1 update on the normal axis.
+A single flat-face sample placed face-on above sphere $k$ of the chain
+inserts a $+k_c\,e_k e_k^{\top}$ rank-1 update on the normal axis.
 Sherman--Morrison gives the closed form
 \begin{equation}
-  \delta_{n,k} \;=\; \frac{k_c\,\phi^{\mathrm{rest}}\,g_{kk}}
-                          {1+k_c\,g_{kk}},
+  \delta_{n,k} \;=\; \frac{k_c\,d\,g_{kk}}{1 + k_c\,g_{kk}},
   \qquad g_{kk} = (\bK^{-1})_{kk},
-  \label{eq:chain-contact}
+  \label{eq:chain-SM}
 \end{equation}
-i.e. the single-sphere series-spring formula~\eqref{eq:1sphere-delta}
-with $k_a$ replaced by the lattice-effective $k_a^{\mathrm{eff}}=
-1/g_{kk}$.  Lateral coupling \emph{stiffens} the centre's response
-because neighbours share the load
-(\textbf{Fig.~\ref{fig:03a}--\ref{fig:03b}}).  Force balance and the
-chain decay follow the Green's function~\eqref{eq:chain-decay}, and the
-total reaction $\sum_i F_i=k_c(\phi^{\mathrm{rest}}-\delta_{n,k})$
-recovers the contact force (Newton III).
-
-On a 1-D chain with distance-preserving lateral the
-\emph{perpendicular} bulge is third-order in $\delta$ (each lateral
-spring is stretched by $\sim\delta^2/(2h)$, with a transverse
-projection $\sim\delta/h$, giving a transverse force
-$\sim k_\ell\,\delta^{3}/(2h^{2})$): the chain is too flat to bulge
-outward.  Outward bulging requires curvature; see~\cref{sec:arc}.
+i.e.\ the single-sphere series-spring law \eqref{eq:series-2} with
+$k_a$ replaced by the lattice-effective $1/g_{kk}$ at the contact
+sphere.  Lateral coupling stiffens the centre's response because
+neighbours share the load.  Force balance: $\sum_{i} k_a\,|\delta_i|
+= k_c\,(d - \delta_{n,k})$ (Newton III, expressed through the
+equilibrium state).  Code:
+\texttt{solve\_lattice\_contact} on a chain lattice with a one-sample
+\texttt{PointSetTargetV2}, $\mathrm{kernel\_half\_width} < h$ to
+restrict contact to the centre pad sphere.  T-F
+(\texttt{test\_chain\_contact\_flat.py}) verifies at three
+$k_{\ell}/k_a$ and three $k_c/k_a$ ratios with worst rel-err
+$5.2\times 10^{-8}$ (the L-BFGS-B floor at this scene scale; the
+direct-linear reference inside the same test agrees with S--M to fp
+precision).  \textbf{Fig.~\ref{fig:tf}}.
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.49\textwidth]{figures/03a_chain_contact_profile.png}\hfill
-\includegraphics[width=0.49\textwidth]{figures/03b_kl_sweep_patch.png}
-\caption{Chain + contact at the centre sphere.  Left: $\delta$ profile
-follows the Green's function decay~\eqref{eq:chain-decay}.  Right:
-$k_\ell$ sweep -- the peak $\delta_k$ falls monotonically as $k_\ell$
-grows (load is shared with neighbours), the FWHM of the
-``contact patch'' broadens, and the total reaction tends to the rigid
-limit $k_c\,\phi^{\mathrm{rest}}$.}
-\label{fig:03a}\label{fig:03b}
+\includegraphics[width=0.49\textwidth]{figures/tf_sherman_morrison.png}\hfill
+\includegraphics[width=0.49\textwidth]{figures/tf_kl_sweep.png}
+\caption{T-F.  Chain on a flat face.  Left: v2 numerical equilibrium
+matches the Sherman--Morrison closed form \eqref{eq:chain-SM}; the
+direct-linear reference (red squares) reaches fp precision while the
+L-BFGS-B path (red circles) floors at $\sim 5\times 10^{-8}$.  Right:
+$k_{\ell}$ sweep -- as $k_{\ell}$ grows the centre sphere yields
+less (load shared with neighbours) and the contact reaction
+saturates at $k_c\,d\,(N k_a)/(N k_a + k_c)$ in the rigid-pad
+limit (not at $k_c\,d$: the chain has finite anchors).}
+\label{fig:tf}
 \end{figure}
 
-\section{Curvature unlocks outward bulging (Step 5)}
-\label{sec:arc}
+\subsection{Dome lattice + flat face: no-bulge regression (T-G)}
+\label{sec:T-G}
 
-A curved lattice is what lets neighbours bulge \emph{outward} (away
-from the body) when a central sphere is pressed inward.  Consider an
-arc of $N$ spheres on a circle of radius $R_{\mathrm{pad}}$ with
-arc-length spacing $h$.  The angular spacing is $\alpha=h/R_{\mathrm{pad}}$,
-each sphere's outward normal is radial, and the right-neighbour edge
-vector at the apex is, to second order in $\alpha$,
-$\bp_{r}-\bp_{0}=(R_{\mathrm{pad}}\alpha,\,-R_{\mathrm{pad}}\alpha^{2}/2,\,0)$.
-Compressing the apex by $\delta_y$ along $+y$ (so $\bq_0$ moves
-inward by $\delta_y$) gives a deformed edge
-\begin{equation}
-  \bq_{r}-\bq_{0}
-  \;=\;
-  \bigl(R_{\mathrm{pad}}\alpha,\;
-        \delta_y - R_{\mathrm{pad}}\alpha^{2}/2,\;0\bigr),
-  \label{eq:arc-edge}
-\end{equation}
-whose squared length satisfies
-\begin{equation}
-  L_{\mathrm{def}}^{2} - L_{\mathrm{rest}}^{2}
-   \;=\;
-   \delta_y\,\bigl(\delta_y - R_{\mathrm{pad}}\alpha^{2}\bigr).
-  \label{eq:arc-window}
-\end{equation}
-The lateral spring is therefore \emph{compressed}
-($L_{\mathrm{def}}<L_{\mathrm{rest}}$) precisely in the window
-$0<\delta_y<R_{\mathrm{pad}}\alpha^{2}$, and a compressed spring pushes
-its endpoints apart---which means the perimeter neighbour is pushed
-\emph{outward} along its own radial normal: local $\delta_n<0$, i.e.\
-an \emph{outward bulge}.  Beyond
-$\delta_y=R_{\mathrm{pad}}\alpha^{2}$ the spring is stretched again,
-and the chain story (same-sign neighbours) returns.  The graph-Laplacian
-law~\eqref{eq:lat-GL} cannot reproduce this window: it sees only
-$\bdelta_i-\bdelta_j$, with no awareness of the edge direction
-geometry, and therefore always spreads load with the same sign.
-
-\textbf{Fig.~\ref{fig:05bcd}} shows the verification.
+The centrepiece v2 regression.  A dome lattice (Fibonacci spiral on a
+spherical cap, production geometry $R_{\mathrm{pad}} = 10\,$mm,
+half-angle $72^{\circ}$, $N = 150$ pad spheres) is pressed against a
+flat face at four penetration depths $\{0.1, 0.5, 1.0, 2.0\}\,$mm.  At
+each depth, the v2 equilibrium satisfies all four assertions:
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+\item Apex sphere has $\delta_n > 0$ (compressed inward).
+\item \emph{No sphere anywhere on the lattice has $\delta_n < -1\,$nm}
+-- the regression target.  v1's distance-preserving law gave
+perimeter $\delta_n \approx -33\,$nm to $-1\,\mu$m at production
+geometry; v2 graph-Laplacian gives effectively zero everywhere.
+\item Cross-section monotonically conforms (inner-quarter
+$\delta_n$ exceeds outer-quarter $\delta_n$).
+\item $N_{\mathrm{active}}$ pairs monotone in depth.
+\end{enumerate}
+Worst measured: $0$ bulge spheres at all $4$ depths; apex sinks
+$956\,\mu$m at depth $1\,$mm; inner-quarter mean $\delta_n =
+304\,\mu$m vs outer-quarter $0.25\,\mu$m ($3$-decade conformity
+ratio); $N_{\mathrm{active}}$ monotone $1352\to 42471$.
+\textbf{Fig.~\ref{fig:tg}}.
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.49\textwidth]{figures/05a_arc_geometry.png}\hfill
-\includegraphics[width=0.49\textwidth]{figures/05b_face_on_local_delta.png}\\
-\includegraphics[width=0.49\textwidth]{figures/05c_bulge_window_phi_sweep.png}\hfill
-\includegraphics[width=0.49\textwidth]{figures/05d_curvature_sweep.png}
-\caption{Arc + face-on contact at the apex.  (a) Arc geometry with
-radial normals.  (b) Local $\delta_n$ profile across the arc: the
-distance-preserving law goes negative at the perimeter
-($-33\,\mathrm{nm}$ at $\pm 1$ from apex), the graph-Laplacian stays
-positive ($+3.52\,\mu\mathrm{m}$).  (c) $\phi$ sweep across the bulge
-window~\eqref{eq:arc-window}: the DP perimeter $\delta_n$ crosses zero
-near $\delta_{\mathrm{apex}}=R_{\mathrm{pad}}\alpha^{2}$ (measured
-$\phi_{\mathrm{cross}}=199.5\,\mu\mathrm{m}$ vs expected $200\,\mu$m at
-$k_c=k_a$).  (d) Curvature sweep: bulge magnitude scales as
-$1/R_{\mathrm{pad}}$ -- $0.47\,\mu$m at $R=2.5\,$mm, sub-nanometre at
-$R=100\,$mm.}
-\label{fig:05bcd}
+\includegraphics[width=0.49\textwidth]{figures/tg_delta_n_histogram.png}\hfill
+\includegraphics[width=0.49\textwidth]{figures/tg_cross_section.png}\\
+\includegraphics[width=0.49\textwidth]{figures/tg_active_pairs.png}\hfill
+\includegraphics[width=0.49\textwidth]{figures/tg_geometry.png}
+\caption{T-G.  Dome flattens on a flat face -- no bulge anywhere.
+Histogram of $\delta_n$ at depth $1\,$mm shows zero spheres below
+the $-1\,$nm bulge bound (the regression target).  Cross-section
+profile across the dome shows monotone conformity to the face plane.
+Active-pair count grows with depth.  Geometry panel confirms the
+dome's apex is at index $0$.  v1's DP law produced the perimeter
+bulge documented in v1 test\_05; v2's GL law eliminates it as a
+\emph{mathematical} property of the lateral coupling, not a numerical
+tolerance.}
+\label{fig:tg}
 \end{figure}
 
-\section{Anisotropic anchor (Step 6)}
-\label{sec:anisotropic}
+\subsection{Dome lattice + curved sphere target (T-H)}
+\label{sec:T-H}
 
-Real skin is closer to an incompressible solid than to an isotropic
-spring.  We replace the isotropic anchor~\eqref{eq:anchor-iso} by a
-per-axis decomposition in the sphere's local
-$\{\bn,\bn^{\perp}\}$ frame:
-\begin{align}
-  E_{\mathrm{anchor}}
-  &\;=\; \tfrac{1}{2}\,k_a\,\delta_n^{2}
-       + \tfrac{1}{2}\,(k_a\,\rho)\,\|\bdelta_t\|^{2},
-  \label{eq:anchor-aniso}\\
-  \bef_a^{(\mathrm{load})}
-  &\;=\; k_a\,\delta_n\,\bn + (k_a\rho)\,\bdelta_t,
-  \quad
-  \delta_n=\bdelta\!\cdot\!\bn,
-  \quad
-  \bdelta_t=\bdelta-\delta_n\bn,
-  \label{eq:anchor-aniso-force}
-\end{align}
-with the tangent ratio $\rho=k_{a,t}/k_a$.  An isotropic linear-elastic
-medium with Poisson ratio $\nu$ satisfies
-$\rho=1/(2(1+\nu))$, so the incompressible limit $\nu\to 1/2$ gives
-$\rho\to 1/3$.  $\rho=1$ recovers the isotropic Step-1
-formulation.
+The same dome lattice (production geometry) is pressed against a
+sphere target of radius $R = 33.5\,$mm sampled by a $1500$-point
+Fibonacci spiral with radial normals.  At depths $\{0.1, 0.5, 1.0,
+2.0\}\,$mm the equilibrium converges in $11$--$26$ L-BFGS-B
+iterations with $\|\nabla E\| < 10^{-3}\,$N (relaxed from $10^{-9}$ --
+the L-BFGS-B floor at the $225\,000$-pair scale of this scene is
+$\sim 10^{-4}\,$N).  $F_{\mathrm{total}}$ grows $5\,$N$\to 549\,$N
+across the depth sweep; $\delta_{n,\mathrm{apex}}$ grows
+$95\,\mu$m$\to 1425\,\mu$m; the no-bulge property carries over (zero
+bulge spheres on the curved target).
 
-The off-axis equilibrium at small target offset angle $\theta$ from the
-normal direction yields the exact tilt ratio
-\begin{equation}
-  \frac{\delta_t}{\delta_n}
-  \;=\; \frac{k_a - A}{k_a\rho - A}\,\tan\theta,
-  \qquad
-  A \;=\; \frac{k_c\,\phi^{\mathrm{eff}}}{L},
-  \label{eq:aniso-tilt}
-\end{equation}
-where $L=\|\bq-\bt\|$ at equilibrium and $A$ is the effective contact
-spring's tangent-plane coupling.  The naive linear form
-$(k_a/k_{a,t})\tan\theta$ drops $A$; at $\rho=1/3$ that error is
-$\sim 3\%$, at $\rho=0.1$ it is $\sim 14\%$.  The test driver
-\texttt{test\_06\_anisotropic\_anchor.py} verifies the exact
-formula~\eqref{eq:aniso-tilt} to $6\times 10^{-8}$ relative error.
+\emph{This is the test that motivated the alignment gate}: at the
+first attempt the bridge harness reported $\min \delta_n \approx
+-7\,$mm on the back hemisphere of the sphere target (samples whose
+radial normals point \emph{away} from the pad were being treated as
+deeply in contact by the half-space form, because the pad's deformed
+centre is inside their half-plane).  Adding \eqref{eq:align-cull} +
+\eqref{eq:align-gate} cleared this and pinned the no-bulge property.
+\textbf{Fig.~\ref{fig:th}}.
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.49\textwidth]{figures/06a_off_axis_tilt.png}\hfill
-\includegraphics[width=0.49\textwidth]{figures/06d_poisson_sweep.png}
-\caption{Anisotropic anchor.  Left: off-axis tilt
-ratio~\eqref{eq:aniso-tilt} for $\rho\in\{1,1/2,1/3,0.1\}$ at
-$\theta=1^{\circ}$, agreeing with the EXACT formula (residual
-$6\times10^{-8}$).  Right: sweep over Poisson ratio
-$\nu\in\{0,0.25,0.4,0.5\}$, visually confirming the incompressible-flesh
-limit $\rho=1/3$.}
-\label{fig:06ad}
+\includegraphics[width=0.49\textwidth]{figures/th_geometry.png}\hfill
+\includegraphics[width=0.49\textwidth]{figures/th_force_vs_depth.png}\\
+\includegraphics[width=0.7\textwidth]{figures/th_alignment_gate_continuity.png}
+\caption{T-H.  Dome lattice vs sphere target.  Geometry: dome cap
+(blue) over a sphere target (gray) at depth $1\,$mm.  Force vs depth
+panel: $F_{\mathrm{total}}$ monotone $5\to 549\,$N across $0.1\to
+2.0\,$mm depth.  Alignment-gate continuity panel: sweeping a single
+pad sphere's normal across the perpendicular-to-target boundary in
+$1^{\circ}$ steps gives a smooth, monotone-non-increasing force; the
+legacy binary cull (dashed) has a $\sim 100\%$ jump at
+$\theta = 90^{\circ}$, the v2 smooth cubic gives $< 30\%$ per-step
+$\Delta F$ across the whole sweep.}
+\label{fig:th}
 \end{figure}
 
-\section{Stick--slip friction (Step 4 \& 6)}
-\label{sec:friction}
+\subsection{Solver algorithm}
 
-Friction is added as a fourth force acting purely in the contact
-plane.  In \emph{stick} mode the contact patch is treated as bonded to
-the target, with a tangent spring of stiffness $k_{\mathrm{stick}}$
-restoring $\bq$ toward the bonded point.  In \emph{slip} mode the force
-saturates at the Coulomb cone $\mu\,f_n$.  In the local tangent frame
-let $s=\|\bdelta_t\|$ and $F=\|\bef_t^{\mathrm{ext}}\|$ be the applied
-tangential load magnitudes; $f_n$ is the equilibrium normal force from
-\eqref{eq:1sphere-series}.
-
-\subsection{Hard (piecewise) law}
-
-The hard piecewise stick--slip law is two parallel springs
-($k_{a,t}=k_a\rho$ from~\eqref{eq:anchor-aniso} and $k_{\mathrm{stick}}$)
-clamped at the cone:
-\begin{align}
-  \text{stick: }\quad s
-  &= \frac{F}{k_{a,t}+k_{\mathrm{stick}}},
-  & F_{\mathrm{fric}} &= k_{\mathrm{stick}}\,s,
-  & \text{if}\ k_{\mathrm{stick}}\,s \le \mu f_n,
-  \label{eq:stick}\\
-  \text{slip: }\quad s
-  &= \frac{F - \mu f_n}{k_{a,t}},
-  & F_{\mathrm{fric}} &= \mu f_n,
-  & \text{otherwise,}
-  \label{eq:slip}\\
-  F_{\mathrm{thresh}}
-  &= \mu f_n\,
-     \frac{k_{a,t}+k_{\mathrm{stick}}}{k_{\mathrm{stick}}}.
-  & & &
-  \label{eq:Fthresh}
-\end{align}
-Limits: $k_{\mathrm{stick}}\to\infty$ recovers bare Coulomb
-($F_{\mathrm{thresh}}\to\mu f_n$); $k_{\mathrm{stick}}\to 0$ gives an
-infinite threshold (no stick, no slip).  The dimensionless ratio
-$\rho$ enters via $k_{a,t}=k_a\rho$.
-
-\subsection{Smooth (kernel) law}
-
-Inside the GPU kernel a $C^{\infty}$ surrogate replaces the hard
-piecewise law.  Letting $K=k_{\mathrm{stick}}$ and $M=\mu f_n$,
-\begin{equation}
-  F_{\mathrm{fric}}^{\mathrm{smooth}}(s)
-  \;=\; \frac{K\,M\,s}{K\,s + M}
-  \;=\; \frac{1}{1/K + 1/(M/s)}
-  \quad(\text{harmonic mean of } K\,s\ \text{and}\ M),
-  \label{eq:friction-smooth}
-\end{equation}
-whose exact antiderivative is
-\begin{equation}
-  E_{\mathrm{fric}}^{\mathrm{smooth}}(s)
-  \;=\; M\,s \;-\;
-        \frac{M^{2}}{K}\,
-        \ln\!\Bigl(1+\tfrac{K\,s}{M}\Bigr).
-  \label{eq:friction-energy}
-\end{equation}
-The smoothing zone has half-width $\mu f_n / k_{\mathrm{stick}}$ -- by
-construction the entire stick range.  Deep stick ($s\to 0$) recovers
-$F\sim K\,s$, deep slip ($s\to\infty$) recovers the Coulomb plateau
-$F\to M$ (\textbf{Fig.~\ref{fig:04c}--\ref{fig:04d}}).  Code:
-\texttt{friction\_force\_smooth},\\\texttt{friction\_energy\_smooth},
-\texttt{equilibrium\_with\_friction\_*}.
-
-\begin{figure}[h]
-\centering
-\includegraphics[width=0.49\textwidth]{figures/04c_full_stick_slip.png}\hfill
-\includegraphics[width=0.49\textwidth]{figures/04d_k_stick_sweep.png}
-\caption{Stick--slip friction.  Left: hard
-piecewise~\eqref{eq:stick}--\eqref{eq:slip} (kink at $F_{\mathrm{thresh}}$)
-vs smooth surrogate~\eqref{eq:friction-smooth}.  The transition zone is
-the entire stick range, and deep stick / deep slip recover the hard law
-exactly.  Right: $k_{\mathrm{stick}}$ sweep, $F_{\mathrm{thresh}}\to\mu
-f_n$ as $k_{\mathrm{stick}}\to\infty$, recovering the bare Coulomb
-limit.}
-\label{fig:04c}\label{fig:04d}
-\end{figure}
-
-\section{Smoothing for differentiability}
-\label{sec:smoothing}
-
-All hard gates in the model -- the positive-part clamp in
-$\phi^{\mathrm{eff}}$~\eqref{eq:phi-eff}, the contact-active gate, the
-Coulomb kink in the friction law, and the harmonic-mean composition
-\eqref{eq:series-kernel} -- are replaced by $C^{\infty}$ surrogates so
-that gradients of the contact wrench with respect to rigid-body pose
-exist and can be propagated by reverse-mode autodiff.  Define
-\begin{align}
-  \sigma_{\varepsilon}(x)
-  &\;=\; \tfrac{1}{2}\bigl(x + \sqrt{x^{2}+\varepsilon^{2}}\bigr),
-  \quad &\text{(smooth ReLU)},
-  \label{eq:sigma}\\
-  \Sigma_{\varepsilon}(x)
-  &\;=\; \tfrac{1}{2}\!\left(1 + \frac{x}{\sqrt{x^{2}+\varepsilon^{2}}}\right),
-  \quad &\text{(smooth step / Heaviside)}.
-  \label{eq:Sigma}
-\end{align}
-Both are infinitely differentiable for $\varepsilon>0$, recover their
-hard counterparts as $\varepsilon\to 0$ with pointwise error bounded by
-$\varepsilon/2$, and satisfy the chain-rule identity
-$\sigma_{\varepsilon}^{\prime}=\Sigma_{\varepsilon}$.  The effective
-overlap and active-gate are
-\begin{equation}
-  \phi^{\mathrm{eff}}(\bdelta)
-  \;=\; \sigma_{\varepsilon}\!\bigl(\mathrm{raw}(\bdelta)\bigr),
-  \qquad
-  \text{gate}(\bdelta)
-  \;=\; \Sigma_{\varepsilon}\!\bigl(\mathrm{raw}(\bdelta)\bigr).
-  \label{eq:phi-smooth}
-\end{equation}
-
-\paragraph{The silent gradient bug.}  Because $\phi^{\mathrm{eff}}=
-\sigma_{\varepsilon}(\mathrm{raw})$, the gradient of the contact
-energy~\eqref{eq:contact-energy} picks up a chain-rule factor:
-\begin{equation}
-  \frac{\partial E_{\mathrm{contact}}}{\partial\bdelta}
-  \;=\; k_c\,\phi^{\mathrm{eff}}\,
-        \Sigma_{\varepsilon}(\mathrm{raw})\,
-        \hatu_c,
-  \label{eq:contact-grad}
-\end{equation}
-not $k_c\,\phi^{\mathrm{eff}}\,\hatu_c$ on its own.  Forgetting
-$\Sigma_{\varepsilon}$ is invisible in deep saturated contact
-($\mathrm{raw}\gg\varepsilon$, $\Sigma_{\varepsilon}\approx 1$) but is
-up to a factor of 2 wrong at contact onset
-($\mathrm{raw}\sim\varepsilon$), and on non-contact spheres
-($\mathrm{raw}\ll-\varepsilon$) it leaks a spurious
-$k_c\,\varepsilon/2$ load because $\sigma_{\varepsilon}$ has an
-irreducible $\varepsilon/2$ floor while $\Sigma_{\varepsilon}\to 0$ kills
-the leak.  This is the kernel's Step-7 fix
-(\texttt{jacobi\_step}, \texttt{cslc\_kernels.py}\,L555--568): the
-contact load is written
-$k_c\,\phi^{\mathrm{eff}}\,\Sigma_{\varepsilon}(\mathrm{raw})\,
-\hatu_c$, with the gate factor explicit.
-
-\paragraph{Default smoothing width.}  $\varepsilon=10^{-5}\,$m makes
-the gate effectively binary above $0.1\,$mm of penetration
-($|\Sigma_{\varepsilon}-1|<10^{-9}$) while preserving $C^{\infty}$
-through the threshold, and the steady-state equilibrium shifts by less
-than $\varepsilon/2$ -- below the rigid-body solver's precision.
-
-\section{Lattice quasistatic equilibrium}
-\label{sec:lattice-eq}
-
-The total energy on the lattice is
-\begin{equation}
-  E_{\mathrm{tot}}(\bdelta_{1\!:\!N})
-  \;=\; \sum_{i} E_{\mathrm{anchor}}(\bdelta_i)
-  \;+\; E_{\mathrm{lat}}(\bdelta_{1\!:\!N})
-  \;+\; \sum_{i\in\mathcal{S}} E_{\mathrm{contact}}^{(i)}(\bdelta_i)
-  \;+\; \sum_{i\in\mathcal{S}} E_{\mathrm{fric}}^{(i)}(\bdelta_i),
-  \label{eq:E-tot}
-\end{equation}
-where $\mathcal{S}$ is the set of surface spheres in contact and
-$E_{\mathrm{lat}}$ is the lateral energy
-\eqref{eq:lat-DP-energy}.  The quasistatic equilibrium is
-\begin{equation}
-  \frac{\partial E_{\mathrm{tot}}}{\partial \bdelta_i}\bigg|_{i}
-  \;=\; 0,
-  \qquad \forall i,
-  \label{eq:eq-cond}
-\end{equation}
-which expands per sphere to the gradient-sum balance
-\begin{equation}
-  \underbrace{k_a\,\bdelta_i^{(\mathrm{aniso})}}_{\partial E_a/\partial\bdelta_i}
-  \;+\; \underbrace{\sum_{j\in\mathcal{N}(i)}
-        k_{\ell}\bigl(\|\bq_j-\bq_i\|-L_{ij}\bigr)\hatu_{ij}}_{\partial E_{\mathrm{lat}}^{\mathrm{DP}}/\partial\bdelta_i}
-  \;+\; \underbrace{k_c\,\phi^{\mathrm{eff}}_i\,
-          \Sigma_{\varepsilon}(\mathrm{raw}_i)\,\hatu_{c,i}}_{\partial E_c/\partial\bdelta_i}
-  \;+\; \underbrace{\partial E_{\mathrm{fric}}^{(i)}/\partial\bdelta_i}_{\text{see~\eqref{eq:friction-smooth}}}
-  \;=\; 0,
-  \label{eq:eq-perspheres}
-\end{equation}
-with $\bdelta_i^{(\mathrm{aniso})} = \delta_{n,i}\bn_i +
-\rho\,\bdelta_{t,i}$ for the anisotropic anchor of
-\cref{sec:anisotropic} ($\rho=1$ recovers the isotropic case).  Every
-term carries a $+$ sign because we have written the equilibrium as
-``sum of gradients $=0$''; the kernel implements the algebraically
-equivalent form
-$k_a\,\bdelta = \bef_{\mathrm{lat}}^{\mathrm{load}} +
-\bef_c^{\mathrm{load}} + \bef_{\mathrm{fric}}^{\mathrm{load}}$
-with each $\bef^{\mathrm{load}}_X = -\partial E_X/\partial\bdelta$, which
-is why the kernel's $\mathbf{n}_{\mathrm{eff}}=-\hatu_c$ and its
-\texttt{f\_lateral} carries the opposite sign of~\eqref{eq:lat-DP}.
-
-\subsection{Lattice stiffness matrix}
-
-Linearising the system about $\bdelta=0$ gives the scalar lattice
-stiffness matrix $\bK$~\eqref{eq:Kmatrix}.  For the closed-form
-warm-start, the kernel actually assembles two per-axis variants of $\bK$
-in the sphere's local $\{\bn,\bn^\perp\}$ frame (\texttt{cslc\_data.py}\,L437--465):
-\begin{equation}
-  \bK_n \;=\; \bK \;+\; k_c\bI
-  \quad\bigl(\text{normal axis, contact spring on every diagonal}\bigr),
-  \qquad
-  \bK_t \;=\; (k_a\rho)\,\bI \;+\; k_\ell\,L_{\mathrm{graph}}
-  \quad\bigl(\text{tangent axis, no contact spring}\bigr),
-  \label{eq:Kn-Kt}
-\end{equation}
-where $L_{\mathrm{graph}}=\mathrm{diag}(|\mathcal{N}(i)|)-A$ is the
-unweighted graph Laplacian (degree minus adjacency).  Both $\bK_n$ and
-$\bK_t$ are SPD for $k_a>0$ and $\rho>0$, and are inverted once at
-construction.  In the saturated face-on limit all per-sphere outward
-normals are parallel and the kernel's contact-load vector projects
-entirely on the normal axis, so the only non-trivial axis is the
-normal one; in the curved / off-axis case the tangent axis carries the
-shear deflection.
-
-\subsection{Solver: warm-start $+$ damped Jacobi}
-
-The kernel solves~\eqref{eq:eq-perspheres} in two stages.
-\paragraph{Linear warm-start.}  At $\bdelta=0$ the contact load on
-sphere $j$ is $k_c\,\phi^{\mathrm{rest}}_j\,\mathbf{n}_{\mathrm{eff},j}^{\mathrm{rest}}$
-(in the kernel's load form, with
-$\mathbf{n}_{\mathrm{eff}}^{\mathrm{rest}}=(\bt-\bp)/\|\bt-\bp\|$).  The
-kernel \texttt{lattice\_solve\_equilibrium}
-(\texttt{cslc\_kernels.py}\,L188--276) projects this load onto each
-sphere's local $\{\bn_j,\bn_j^\perp\}$ frame and solves the per-axis
-linear systems
-\begin{align}
-  \bK_n\,\delta_n
-  &\;=\; k_c\,\bm{f}_n
-  \qquad
-  \text{with}\quad
-  f_{n,j}\;=\;\phi^{\mathrm{rest}}_j\,\bigl(\mathbf{n}_{\mathrm{eff},j}^{\mathrm{rest}}\!\cdot\!\bn_j\bigr),
-  \label{eq:warmstart-n}
-  \\
-  \bK_t\,\bdelta_t
-  &\;=\; k_c\,\mathbf{f}_t
-  \qquad
-  \text{with}\quad
-  \mathbf{f}_{t,j}\;=\;\phi^{\mathrm{rest}}_j\,\bigl(\mathbf{n}_{\mathrm{eff},j}^{\mathrm{rest}}-(\mathbf{n}_{\mathrm{eff},j}^{\mathrm{rest}}\!\cdot\!\bn_j)\bn_j\bigr),
-  \label{eq:warmstart-t}
-\end{align}
-in closed form via the precomputed dense inverses $\bK_n^{-1},
-\bK_t^{-1}$.  For face-on contact
-$\mathbf{n}_{\mathrm{eff},j}^{\mathrm{rest}}\parallel\bn_j$ so
-$\mathbf{f}_t=0$ and~\eqref{eq:warmstart-n} reduces to the scalar
-$(\bK + k_c\bI)\delta_n=k_c\,\bm{\phi}^{\mathrm{rest}}$ -- the
-Sherman--Morrison form used in
-\cref{sec:lateral}'s chain analysis.  The $O(n^2)$ matvec is exact in
-the small-$\bdelta$ limit, absorbs 10--20 Jacobi iterations of
-refinement in production scenes, and preserves \texttt{wp.Tape}
-backward through the lattice solve for gradient-based downstream uses
-(MPC, RL).
-
-\paragraph{Damped Jacobi refinement.}  The nonlinear residual of
-\eqref{eq:eq-perspheres} is removed by a Picard iteration with implicit
-diagonal stabilisation.  Splitting $\bdelta$ into local normal and
-tangent components $(\delta_n,\bdelta_t)$ in each sphere's rest frame,
-\begin{align}
+The kernel solves \eqref{eq:eq-cond} by damped Jacobi with implicit
+diagonal stabilisation.  Per-sphere split into local
+$(\delta_{n,i}, \bdelta_{t,i})$ in the pad's rest frame, with
+\begin{align*}
   (k_a + S_n)\,\delta_{n,i}^{(k+1)}
-  &\;=\; \mathrm{rhs}_{n,i}
-       \;+\; S_n\,\delta_{n,i}^{(k)},
+  &\;=\; \mathrm{rhs}_{n,i} \;+\; S_n\,\delta_{n,i}^{(k)},
   \\
   (k_a\rho + S_t)\,\bdelta_{t,i}^{(k+1)}
-  &\;=\; \mathrm{rhs}_{t,i}
-       \;+\; S_t\,\bdelta_{t,i}^{(k)},
-\end{align}
-where $S_n=k_\ell|\mathcal{N}(i)|+k_c\,\mathrm{gate}_i$ and
-$S_t=k_\ell|\mathcal{N}(i)|$ are diagonal contraction bounds on
-the linearised lateral $+$ contact operators, and
-$\mathrm{rhs}$ is the explicit per-iteration residual (lateral $+$
-contact $+$ friction $+$ external load).  The update is damped by
-$\alpha\in(0,1)$:
+  &\;=\; \mathrm{rhs}_{t,i} \;+\; S_t\,\bdelta_{t,i}^{(k)},
+\end{align*}
+where $S_n = k_{\ell}|\mathcal{N}(i)| + k_c\sum_{j} A_j w^{t}_{ij}
+a_{ij}\,\mathrm{gate}_{ij}$ and $S_t = k_{\ell}|\mathcal{N}(i)|$ are
+diagonal contraction bounds, and $\mathrm{rhs}$ is the explicit
+per-iteration residual (lateral + contact + friction + external
+load).  The update is damped by $\alpha \in (0, 1)$:
 \begin{equation}
   \bdelta_i^{(k+1)}
   \;\leftarrow\;
-   (1-\alpha)\,\bdelta_i^{(k)}
-   + \alpha\,\bdelta_i^{\mathrm{Jacobi}}.
+  (1-\alpha)\,\bdelta_i^{(k)} + \alpha\,\bdelta_i^{\mathrm{Jacobi}}.
   \label{eq:jacobi-damp}
 \end{equation}
-$\alpha=0.3$ converges in 40--100 sweeps on production grasp scenes;
-sharp contacts and near-slip friction take up to $\sim 2000$.
+$\alpha = 0.3$ converges in $40$--$100$ sweeps on production grasp
+scenes; sharp contacts and near-slip friction take up to $\sim
+2000$.  The theory-side reference, \texttt{solve\_lattice\_contact},
+runs L-BFGS-B on the same energy \eqref{eq:E-tot} and converges to
+the same fixed point up to the documented gradient floor (see
+\cref{sec:lessons} \#1).
 
+% ---------------------------------------------------------------------
+\section{Targets and samplers}
+\label{sec:targets}
+
+A target is a \texttt{PointSetTargetV2} dataclass in
+\texttt{cslc\_main/theory/cslc\_targets.py}.  Four concrete samplers
+populate the abstract \eqref{eq:target}:
+\begin{description}[leftmargin=*]
+\item[\texttt{make\_flat\_face\_target(centre, normal, span\_u,
+span\_v, pitch)}.]  Regular grid on a flat face;
+$M = (\lceil\mathrm{span\_u}/\mathrm{pitch}\rceil + 1)\times
+(\lceil\mathrm{span\_v}/\mathrm{pitch}\rceil + 1)$ samples; all carry
+the same face normal; $A_j = (\mathrm{span\_u}\,
+\mathrm{span\_v})/M$ uniformly.
+
+\item[\texttt{make\_sphere\_target(t, R, n\_samples)}.]
+Fibonacci-spiral on the sphere $S^{2}_{R}(\bt)$; each sample's normal
+is the radial outward direction at the sample point; $A_j = 4\pi
+R^{2}/n_{\mathrm{samples}}$.  The half-space form locally replaces the
+sphere with its tangent plane at each sample; the resulting
+geometric error in $\mathrm{raw}_{ij}$ is bounded by the sagitta
+$\varepsilon_{\mathrm{geom}}(d^{t}) = (d^{t})^{2}/(2R)$; the
+worst-case relative error per pair is $\sim r_{\mathrm{pad}}^{2}/(R\,d)
+\approx 13\%$ at the kernel's lateral edge and much smaller for
+nearer samples (the area-weighted sum suppresses the edge-pair
+contribution).  Fit-for-purpose at $R \gg r_{\mathrm{pad}}^{2}/d$;
+verified on the tennis-ball target ($R = 33.5\,$mm) by T-H.
+
+\item[\texttt{make\_box\_target(extents, n\_samples, *, center, seed)}.]
+Per-face area-weighted random sampling of an axis-aligned box via
+\texttt{trimesh}; each sample carries its source face's outward
+normal; $A_j = \mathrm{total\_box\_surface\_area}/n_{\mathrm{samples}}$
+uniformly.
+
+\item[\texttt{make\_mesh\_target(mesh, n\_samples, *, seed)}.]  Generic
+\texttt{trimesh} sampler; each sample's normal is the source
+triangle's outward normal; $A_j = \mathrm{mesh.area}/n_{\mathrm{samples}}$
+(uniform-density approximation).
+\end{description}
+There is \emph{no per-sample radius} on any target -- the v1
+\texttt{radii} field of \texttt{PointSetTarget} is dropped in v2 and
+the kernel signature will lose \texttt{target\_radii} in Phase 5.
+
+% ---------------------------------------------------------------------
+\section{Stick--slip friction}
+\label{sec:friction}
+
+Friction is added as a fourth gradient term, acting in the tangent
+plane of the \emph{pad's} outward normal $\bnp_i$ (contract \S6.4).
+In the local tangent frame let $s_i = \|\bdelta_{t,i}\|$.  The
+\emph{normal force} entering the cone is the magnitude of the
+projection of the per-sphere contact-force sum \eqref{eq:F-contact-i}
+on $\bnp_i$:
+\begin{equation}
+  f^{n}_{i}
+  \;=\;
+  \left|\,\biggl(\sum_{j} k_c A_j w^{t}_{ij} a_{ij}
+              \phi^{\mathrm{eff}}_{ij} \mathrm{gate}_{ij} \bnf_{\!j}\biggr)
+  \!\cdot\! \bnp_i\,\right|.
+  \label{eq:fn-i-bis}
+\end{equation}
+
+\subsection{Hard piecewise law}
+
+Letting $k_{a,t} = k_a\rho$, the hard piecewise stick--slip law writes
+\begin{align}
+  \text{stick }(|F| \le F_{\mathrm{thresh}}):\
+  s_i &= \frac{|F|}{k_{a,t} + k_{\mathrm{stick}}},
+  & F^{i}_{\mathrm{fric}} &= k_{\mathrm{stick}}\,s_i,
+  \label{eq:stick}\\
+  \text{slip }(|F| > F_{\mathrm{thresh}}):\
+  s_i &= \frac{|F| - \mu\,f^{n}_{i}}{k_{a,t}},
+  & F^{i}_{\mathrm{fric}} &= \mu\,f^{n}_{i},
+  \label{eq:slip}\\
+  F_{\mathrm{thresh}}
+  &= \mu\,f^{n}_{i}\,\frac{k_{a,t} + k_{\mathrm{stick}}}{k_{\mathrm{stick}}},
+  & & &
+  \label{eq:Fthresh}
+\end{align}
+where $|F| = \|\bef^{\mathrm{ext}}_{t,i}\|$ is the magnitude of the
+applied tangential load.  Limits: $k_{\mathrm{stick}}\to\infty$
+recovers bare Coulomb ($F_{\mathrm{thresh}}\to\mu f_n$);
+$k_{\mathrm{stick}}\to 0$ gives an infinite threshold (no stick, no
+slip).
+
+\subsection{Smooth surrogate}
+
+The GPU kernel and theory both use a $C^{\infty}$ harmonic-mean
+surrogate.  Let $K = k_{\mathrm{stick}}$ and $M = \mu\,f^{n}_{i}$.
+The smooth friction \emph{force magnitude} as a function of
+$s = s_i$ is
+\begin{equation}
+  F^{\mathrm{smooth}}_{\mathrm{fric}}(s)
+  \;=\;
+  \frac{K\,M\,s}{K\,s + M}
+  \;=\;
+  \frac{1}{1/K + 1/(M/s)}
+  \quad
+  (\text{harmonic mean of }K s\text{ and }M),
+  \label{eq:friction-smooth}
+\end{equation}
+and the exact antiderivative is
+\begin{equation}
+  E^{\mathrm{smooth}}_{\mathrm{fric}}(s)
+  \;=\; M\,s \;-\; \frac{M^{2}}{K}\,
+        \ln\!\Bigl(1 + \frac{K\,s}{M}\Bigr).
+  \label{eq:friction-energy}
+\end{equation}
+The smoothing zone has half-width $\mu f^{n}/K$ -- by construction the
+entire stick range.  Deep stick ($s\to 0$) gives $F\sim K s$; deep
+slip ($s\to\infty$) gives the Coulomb plateau $F\to M$.
+
+\paragraph{Kernel implementation form (Phase 4a rewrite).}  The
+production Warp kernel implements \eqref{eq:friction-smooth} in the
+algebraically equivalent form that avoids $1/s$ entirely:
+\begin{equation}
+  \mathrm{scale}_{i}
+  \;=\;
+  \frac{K\,M}{K\,s_{i} + M + \varepsilon_{\mathrm{denorm}}},
+  \qquad
+  \bef^{i}_{\mathrm{fric}}
+  \;=\; -\,\mathrm{scale}_{i}\,\bdelta_{t,i},
+  \label{eq:friction-kernel}
+\end{equation}
+with $\varepsilon_{\mathrm{denorm}} = 1\times 10^{-30}$ a fp
+denormalise-floor that protects the $(K = 0,\ M = 0)$ no-friction
+corner.  In any active friction regime $K s + M \gg
+\varepsilon_{\mathrm{denorm}}$, so the floor is numerically
+invisible.
+
+This form was committed in Phase 4a after the bridge harness
+exposed a hidden bias in the legacy kernel form
+$\mathrm{inv\_dt\_mag} = s/(s^{2}+\varepsilon^{2})$,
+$\mathrm{cone\_scale} = M\cdot\mathrm{inv\_dt\_mag}$,
+$\mathrm{scale} = K\,\mathrm{cone\_scale}/(K + \mathrm{cone\_scale} +
+\ldots)$.  At production $\varepsilon = 5\times 10^{-4}\,$m and
+stick-mode $s \sim \mu$m, $\varepsilon^{2}$ dominated and
+$\mathrm{inv\_dt\_mag} \approx s/\varepsilon^{2}$ was $3$--$4$ orders of
+magnitude too small -- friction effectively vanished and the kernel
+converged to $s = F/k_a$ instead of $s = F/(k_a + k_{\mathrm{stick}})$.
+The Phase 4a fix (this rewrite) is algebraically identical to the
+contract \eqref{eq:friction-smooth} form everywhere and corrects the
+production-scale bias.  \cref{sec:lessons} \#3.
+
+\subsection{Equilibrium with friction (single pad)}
+
+For a single pad face-on flat with anisotropic anchor + external
+tangential load $\bef^{\mathrm{ext}}_t$, the normal and tangent axes
+decouple and the closed form is the textbook stick/slip law:
+\begin{equation}
+  \bdelta_t^{*}
+  \;=\;
+  -\,s^{*}\,\hat{\mathbf{f}}_{t},
+  \quad
+  \hat{\mathbf{f}}_{t} = \bef^{\mathrm{ext}}_t/\|\bef^{\mathrm{ext}}_t\|,
+  \quad
+  s^{*}\text{ given by \eqref{eq:stick}--\eqref{eq:slip}}.
+  \label{eq:friction-1sphere}
+\end{equation}
+(The minus sign on $s^{*}\hat{\mathbf{f}}_{t}$ comes from
+$\bq = \bp - \bdelta$: with $\bef^{\mathrm{ext}}_t$ in $+\hat{f}_t$,
+$\bq$ moves to $+\hat{f}_t$, so $\bdelta_t$ goes to $-s\hat{f}_t$.)
+Code: \texttt{equilibrium\_half\_space\_friction\_analytical},
+\texttt{...\_hard\_numerical}, \texttt{...\_smooth\_numerical}.
+\textbf{Fig.~\ref{fig:ti}}, verified to $1.5\times 10^{-8}$ rel-err
+by T-I.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.49\textwidth]{figures/ti_full_transition.png}\hfill
+\includegraphics[width=0.49\textwidth]{figures/ti_k_stick_sweep.png}
+\caption{T-I.  Stick--slip on a single pad face-on flat (v2 with
+half-space contact).  Left: hard piecewise
+\eqref{eq:stick}--\eqref{eq:slip} (kink at $F_{\mathrm{thresh}}$),
+$C^{\infty}$ smooth surrogate \eqref{eq:friction-smooth},
+independent scipy \texttt{minimize\_scalar} reference.  v2 analytical
+vs hard-piecewise agree to $\sim 9\,$pm; slope ratio
+slip$/$stick$= (k_a + k_{\mathrm{stick}})/k_a$ exactly.  Right:
+$k_{\mathrm{stick}}$ sweep -- $F_{\mathrm{thresh}}\to\mu f_n$ as
+$k_{\mathrm{stick}}\to\infty$ (bare Coulomb limit).}
+\label{fig:ti}
+\end{figure}
+
+\subsection{Dome grip aggregation (T-J)}
+\label{sec:T-J}
+
+For a lattice + flat-face under a uniform applied tangential
+displacement $s$ at every active sphere (the indenter-bonded-to-skin
+model), the total tangential reaction aggregates the per-sphere
+stick--slip law:
+\begin{equation}
+  F_{\mathrm{grip}}(s)
+  \;=\;
+  \sum_{i\in\mathcal{S}}
+  \min\!\bigl(\,K\,s,\ \mu\,f^{n}_{i}\bigr),
+  \qquad
+  F_{\mathrm{grip}}^{\mathrm{max}}
+  \;=\;
+  \mu\sum_{i\in\mathcal{S}} f^{n}_{i}.
+  \label{eq:Fgrip}
+\end{equation}
+This is a \emph{displacement-driven} aggregation, not a force-driven
+equilibrium: it needs no new solver.  Per-sphere $f^{n}_{i}$ is
+extracted via \texttt{lattice\_contact\_normal\_forces} from the
+normal-only equilibrium $\bdelta^{*}$ produced by
+\texttt{solve\_lattice\_contact}, and \eqref{eq:Fgrip} is a closed-form
+post-processing step.  The grip plateau matches $\mu\,F^{n,
+\mathrm{total}}$ to exact fp precision (the aggregation is
+algebraically the spec); the only error budget is the per-sphere
+$f^{n}_{i}$ precision inherited from the L-BFGS-B floor of
+$\sim 5\times 10^{-8}$.  T-J (\texttt{test\_dome\_grip\_flat.py})
+verifies all four parts (baseline, grip-curve invariants,
+self-consistency, depth sweep).  \textbf{Fig.~\ref{fig:tj}}.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.49\textwidth]{figures/tj_normal_distribution.png}\hfill
+\includegraphics[width=0.49\textwidth]{figures/tj_grip_curve.png}\\
+\includegraphics[width=0.7\textwidth]{figures/tj_grip_vs_depth.png}
+\caption{T-J.  Dome grip aggregation against a flat face.  Top-left:
+per-sphere $f^{n}_{i}$ distribution at depth $1\,$mm (the engaged set
+spans a $\sim$50$\times$ ratio between apex and slowest-slipping rim).
+Top-right: grip curve $F_{\mathrm{grip}}(s)$ shows the all-stick
+linear regime giving way to per-sphere slip transitions, plateauing
+exactly at $\mu\,F^{n,\mathrm{total}}$ (rel err = 0).  Bottom: grip
+budget vs depth, log-log slope $1.70$ (between the Hertzian $1.5$
+and parallel-anchors $2.0$).}
+\label{fig:tj}
+\end{figure}
+
+% ---------------------------------------------------------------------
 \section{Emission to the rigid-body solver}
 \label{sec:emit}
 
-Once $\bdelta$ has converged, \texttt{write\_cslc\_contacts} writes
-one rigid contact per surface sphere with the following data, in
-world frame:
+Once $\bdelta$ has converged, \texttt{write\_cslc\_contacts\_point\_set}
+emits one MuJoCo contact per active $(i, j)$ pair, in world frame:
 \begin{align}
-  \text{point}_0 &\;=\; \bq^{\mathrm{def}}\;=\;\bp - \bdelta,
+  \text{point}_0 &\;=\; \bq^{\mathrm{def}}_{i} \;=\; \bp_i - \bdelta_i,
    \label{eq:emit-p0}\\
-  \text{point}_1 &\;=\; \bt,
+  \text{point}_1 &\;=\; \bt_j,
    \\
-  \text{normal}  &\;=\; \frac{\bt - \bq^{\mathrm{def}}}
-                              {\|\bt - \bq^{\mathrm{def}}\|},
-                              \label{eq:emit-normal}\\
-  \text{margin}_0 &\;=\; r,
+  \text{normal}  &\;=\; -\,\bnf_{\!j}
+                 \qquad
+                 (\text{from target outward to pad}),
+                 \label{eq:emit-normal}\\
+  \text{margin}_0 &\;=\; r_i,
    \qquad
-   \text{margin}_1 \;=\; R,
+   \text{margin}_1 \;=\; 0
+   \qquad
+   (\text{v2: was }R_j\text{, now zero}),
    \label{eq:emit-margin}\\
-  \text{stiffness} &\;=\; k_{\mathrm{series}}\,\Sigma_{\varepsilon}(\mathrm{raw}),
+  \text{stiffness} &\;=\; k_{\mathrm{series}}\,A_j\,w^{t}_{ij}\,a_{ij}\,
+                          \mathrm{gate}_{ij},
    \qquad
-   \text{friction}\;=\;1.
+   \text{friction}\;=\;\mu.
    \label{eq:emit-stiff}
 \end{align}
-The downstream solver (MuJoCo) reconstructs
+The downstream solver (MuJoCo) reconstructs the penetration as
 \begin{equation}
   \text{solver\_pen}
   \;=\; \text{margin}_0 + \text{margin}_1
         - (\text{point}_1 - \text{point}_0)\!\cdot\!\text{normal}
-  \;=\; (r+R) - \|\bt-\bq^{\mathrm{def}}\|
-  \;=\; \mathrm{raw},
+  \;=\; r_i + 0 - (\bt_j - \bq^{\mathrm{def}}_{i})\!\cdot\!(-\bnf_{\!j})
+  \;=\; r_i - \bnf_{\!j}\!\cdot\!(\bq^{\mathrm{def}}_{i} - \bt_j)
+  \;=\; \mathrm{raw}_{ij},
   \label{eq:solver-pen}
 \end{equation}
-i.e. exactly the deformed overlap that \texttt{jacobi\_step} converges
-on.  The per-contact force MuJoCo applies is therefore
-$\text{stiffness}\cdot\text{solver\_pen}=
-k_{\mathrm{series}}\cdot\Sigma_{\varepsilon}(\mathrm{raw})\cdot
-\mathrm{raw}$ -- the same series-spring law the kernel solved.
+i.e.\ exactly the half-space overlap \eqref{eq:raw} the lattice solver
+converged on.  The per-contact force MuJoCo applies is therefore
+$\text{stiffness}\cdot\text{solver\_pen}
+= k_{\mathrm{series}}\,A_j\,w^{t}_{ij}\,a_{ij}\,\mathrm{gate}_{ij}\,
+\mathrm{raw}_{ij}$, algebraically the same as
+$k_c\,A_j\,w^{t}\,a\,\phi^{\mathrm{eff}}\,\mathrm{gate}$ in the deep
+saturated limit (where $\phi^{\mathrm{eff}} \approx \mathrm{raw}$).
 
-\section{Verification: kernel--theory bridge (Step 7)}
-\label{sec:bridge}
+\paragraph{Wedge force.}  Because the emitted normal in
+\eqref{eq:emit-normal} is the target's outward face normal (a
+\emph{rest-target} property), any body-frame pose perturbation that
+shifts $\bq^{\mathrm{def}}_i$ relative to $\bt_j$ couples directly
+into out-of-plane contact-force components when the face is locally
+flat but the pad is curved.  This was a known v1 phenomenon
+($\mathrm{notes.md}$ Step 11); v2 inherits it unchanged because the
+v1 emitted normal was the deformed line of centres and the v2 normal
+is the target face normal -- both are perpendicular to the tangent
+plane at the contact patch in the limit of small deformation, and the
+wedge interaction is a property of the macroscopic geometry, not the
+contact-direction emission.  Resisting the wedge requires friction at
+the macroscopic contact (\cref{sec:friction}).
 
-The verification harness \texttt{test\_07\_kernel\_bridge.py} drives
-both the Warp kernels and the gold-reference numpy/scipy solvers on
-identical scenes, then compares per-sphere $\bdelta$ vectors --
-magnitude \emph{and} sign.  Seven scenes are run at three contact
-stiffness ratios $k_c/k_a\in\{0.1,1,10\}$, for a total of 21 cases.
-\Cref{tab:bridge} summarises the result.
-
-\begin{table}[h]
-\centering\small
-\begin{tabular}{clccc}
-\toprule
-Scene & Physics tested & Tol & Worst rel. err\\
-\midrule
-A & single sphere face-on (series spring~\eqref{eq:1sphere-series}) & $10^{-3}$ & $2\times 10^{-6}$\\
-B & single sphere off-axis $30^\circ$ (deformed direction~\eqref{eq:n-eff-def}) & $10^{-3}$ & $4\times 10^{-7}$\\
-C & chain face-on at centre (lateral $+$ contact~\eqref{eq:chain-contact}) & $10^{-3}$ & $2\times 10^{-5}$\\
-D & arc face-on at apex (Poisson bulge window~\eqref{eq:arc-window}) & $10^{-3}$ & $5\times 10^{-4}$\\
-E & anisotropic anchor $\rho=1/3$ (off-axis tilt~\eqref{eq:aniso-tilt}) & $10^{-3}$ & $3\times 10^{-6}$\\
-F & friction stick (\eqref{eq:stick}) & $10^{-3}$ & $2\times 10^{-4}$\\
-G & friction slip (\eqref{eq:slip}, Coulomb plateau) & $2\times 10^{-2}$ & $2\times 10^{-2}$\\
-\bottomrule
-\end{tabular}
-\caption{Step-7 kernel-vs-theory bridge.  Result: 21/21 PASS.  Scene G
-takes a relaxed tolerance to absorb the known divergence between the
-kernel's deformed-direction contact normal~\eqref{eq:n-eff-def} and the
-theory's analytical slip solver, which uses the rest direction (slip at
-production scales requires $\delta_t>F_{\mathrm{thresh}}/k_{a,t}\approx
-0.3\,$mm, where the rest assumption breaks at the 1--2\% level).}
-\label{tab:bridge}
-\end{table}
-
+% ---------------------------------------------------------------------
 \section{Calibration}
 \label{sec:calibration}
 
-The user specifies a target bulk stiffness $k_e^{\mathrm{bulk}}$ (the
-aggregate normal stiffness of the contact patch under face-on
+The user specifies a target bulk stiffness $k_{e}^{\mathrm{bulk}}$
+(the aggregate normal stiffness of the contact patch under face-on
 loading).  Under face-on, near-uniform compression with a contact
 fraction $\eta\in(0,1)$, the patch supports
-$N_{\mathrm{contact}}=\eta\,N_{\mathrm{surface}}$ active spheres in
-parallel; each sphere is itself a series spring with effective
-stiffness $1/k_{\mathrm{eff}}=1/k_a+1/k_c+1/k_e$
-(\cref{sec:three-body}).  The calibration identity is therefore
+$N_{\mathrm{contact}} = \eta\,N_{\mathrm{surface}}$ active pad spheres
+in parallel; each sphere is itself a series spring with effective
+stiffness $1/k_{\mathrm{eff}} = 1/k_a + 1/k_c + 1/k_{e}$.  The
+calibration identity is
 \begin{equation}
   N_{\mathrm{contact}}\,k_{\mathrm{eff}}
-  \;=\; k_e^{\mathrm{bulk}}
+  \;=\; k_{e}^{\mathrm{bulk}}
   \;\Rightarrow\;
   \frac{1}{k_c}
   \;=\;
-  \frac{N_{\mathrm{contact}}}{k_e^{\mathrm{bulk}}}
+  \frac{N_{\mathrm{contact}}}{k_{e}^{\mathrm{bulk}}}
   \;-\; \frac{1}{k_a}
-  \;-\; \frac{1}{k_e},
+  \;-\; \frac{1}{k_{e}},
   \label{eq:calibration}
 \end{equation}
-which is inverted at construction by
-\texttt{calibrate\_kc}\,(\texttt{cslc\_data.py}).  In the rigid-target
-limit ($k_e\to\infty$) the third term drops, recovering the two-spring
-identity.  Negative $1/k_c$ (anchor or target too soft to reach
-$k_e^{\mathrm{bulk}}$) triggers the conservative fallback
-$k_c=k_e^{\mathrm{bulk}}/N_{\mathrm{contact}}$.
+inverted at construction by \texttt{calibrate\_kc}
+(\texttt{cslc\_data.py}).  The half-space contact swap does not alter
+\eqref{eq:calibration}: $k_c$ is a per-pair stiffness and
+$N_{\mathrm{contact}}$ is the count of pad spheres engaged, neither
+of which depends on the target radius $R$.
 
-\section{Numerical observations and lessons}
-\label{sec:lessons}
+In the kernel, the right-most two springs are composed by a
+harmonic-mean with a smoothing regulariser
+\begin{equation}
+  k_{\mathrm{series}}
+  \;=\; \frac{k_c\,k_{e}}{k_c + k_{e} + \varepsilon^{2}},
+  \label{eq:series-kernel}
+\end{equation}
+preserved verbatim from v1 for backward kernel-output compatibility,
+with the documented dimensional caveat: $\varepsilon^{2}$ in [m$^{2}$]
+is added to $(k_c + k_e)$ in [N$/$m] -- numerically negligible at
+production parameters but waiting for a follow-up to give it an
+explicitly-typed regulariser.
 
-Six issues were uncovered while writing the gold-reference suite; each
-is now a regression guard.  Listed for completeness because they
-informed several of the equations above.
+% ---------------------------------------------------------------------
+\section{Verification: bridge harness (T-K, T-L)}
+\label{sec:bridge}
 
+The Phase 4a bridge harness
+\texttt{test\_07\_kernel\_bridge.py} drives the production Warp
+kernel \texttt{jacobi\_step\_point\_set} against
+\texttt{solve\_lattice\_contact} / Phase 3 friction primitives on
+identical scenes, then compares per-sphere $\bdelta$ vectors.  Both
+sides run at production $\varepsilon = 5\times 10^{-4}\,$m and
+\texttt{areas = None} (per-pair Hookean $k_c$, matching the
+Phase 2--3 convention).  The vertical-slice scope is $4$ scenes
+$\times\,3$ ratios $k_c/k_a \in \{0.1, 1, 10\}$ plus the dual T-L
+parity check, for $12 + 2 = 14$ cases.  Result: \emph{14$/$14 PASS},
+worst rel-err $6.6\times 10^{-4}$ (scene D, dome max across $N=150$
+spheres at $k_c/k_a = 0.1$).
+\cref{tab:bridge} summarises.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{clccl}
+\toprule
+ID & Scene & Tol & Worst rel.\ err & Notes \\
+\midrule
+T-L & active-set parity (depth + alignment sweeps) & exact / $10^{-3}$ & 0 & 4 raw-cull and 3 align-gate kernel sites pass discipline.\\
+T-K A & single pad face-on flat & $10^{-3}$ & $1.7\times 10^{-6}$ & series spring \eqref{eq:series-2}\\
+T-K D & dome lattice vs flat (no bulge) & $10^{-3}$ & $6.6\times 10^{-4}$ & T-G regression carried into kernel parity\\
+T-K F & single pad $+$ stick friction & $10^{-3}$ & $3.8\times 10^{-6}$ & live $f_n$ (see \cref{sec:lessons} \#5)\\
+T-K H & single pad vs multi-sample flat face & $10^{-3}$ & $1.7\times 10^{-6}$ & Phase 4a reduction; full box deferred (\cref{sec:lessons} \#4)\\
+\bottomrule
+\end{tabular}
+\caption{Phase 4a bridge result.  Phase 4b will fill in scenes B
+(tilted flat), C (chain vs flat), E (anisotropic anchor $+$ tilted),
+G (slip friction, tol $2\times 10^{-2}$), I (chain vs box), J (pad
+vs sphere-as-point-set) once the \S\ref{sec:active-set} alignment-
+gate amendment lands.}
+\label{tab:bridge}
+\end{table}
+
+\paragraph{The five Phase 4 ground rules.}  For every bridge scene:
 \begin{enumerate}[leftmargin=*,itemsep=2pt]
-\item Discrete vs continuum decay length: the continuum
-$\ell_c=\sqrt{k_\ell/k_a}$ is wrong at sub-grid coupling.  Use the
-discrete formula~\eqref{eq:chain-decay} below $k_\ell\gg k_a$.
-
-\item Gradient sign drift: any time two helpers can disagree on whether
-they return $\partial E/\partial\bdelta$ or $-\partial E/\partial\bdelta$,
-write the gradient inline; add FD vs analytical agreement as a unit
-test.
-
-\item Linear approximation at non-contact spheres:
-$\mathrm{raw}\approx\phi^{\mathrm{rest}}-\bdelta\!\cdot\!\bn$ collapses
-to 0 (because kernel 1 already clipped $\phi^{\mathrm{rest}}$), and the
-smooth-ReLU floor $\varepsilon/2$ leaks a $k_c\varepsilon/2$ contact
-force.  Fix: compute $\mathrm{raw}$ from the exact deformed
-overlap~\eqref{eq:raw}, which is strongly negative away from contact.
-
-\item The smooth-step chain-rule factor
-$\Sigma_{\varepsilon}(\mathrm{raw})$ in~\eqref{eq:contact-grad} is
-invisible at deep saturated contact, up to 2$\times$ wrong at contact
-onset, and sign-flips the arc bulge in test\_07 scene D when omitted.
-
-\item External-load sign: with $\bq=\bp-\bdelta$, an external force
-$\bef^{\mathrm{ext}}$ applied to $\bq$ has potential
-$V=+\bef^{\mathrm{ext}}\!\cdot\!\bdelta$, so its load on $\bdelta$ is
-$-\bef^{\mathrm{ext}}$.  Magnitude-only test criteria mask this; assert
-on the vector.
-
-\item Anisotropic anchor on tangent dynamics: any line in a friction
-solver that writes $k_a$ on a tangent axis is a latent bug that fires
-the first time $\rho\ne 1$.  The fix in all three solvers
-(analytical, hard, smooth) is to use $k_{a,t}=k_a\rho$ uniformly.
+\item $\varepsilon = 5\times 10^{-4}\,$m both sides (production, not
+theory-grade $10^{-9}$).  Phase 4 is the first point in the rewrite
+where theory runs at production $\varepsilon$.
+\item $\mathrm{areas} = \texttt{None}$ on both sides (per-pair Hookean
+$k_c$).  Area-weighted hydroelastic calibration is Phase 6+.
+\item Theory is the spec.  If a scene fails at the contract bound,
+fix the kernel; do not loosen the tolerance.
+\item Live $f^{n}$ on both sides.  Phase 3's analytical-decoupled
+$f^{n}$ has a $\sim 15$--$20\%$ drift from the smooth equilibrium
+$f^{n}$ at production $\varepsilon$; bridge theory uses the
+$f^{n}_{i}$ from \texttt{lattice\_contact\_normal\_forces} at the
+\emph{smooth} normal equilibrium (\cref{sec:lessons} \#5).
+\item Kernel and theory must compute the same gradient.  Phase 4a
+dropped $\partial w^{t}/\partial\bdelta$ from \texttt{solve\_lattice\_contact}
+(\cref{sec:single-pair}) to match the kernel's truncated
+gradient.
 \end{enumerate}
 
-\section{File map}
+% ---------------------------------------------------------------------
+\section{Numerical observations and corner cases}
+\label{sec:lessons}
+
+The v2 rewrite surfaced 12 findings; each is captured in the contract
+\S17 and is a regression guard going forward.  The seven that
+materially shape the equations and the harness are summarised below.
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+\item \emph{L-BFGS-B floor on multi-sphere problems.}  Convergence
+floors at $\sim 5\times 10^{-8}$ rel-err on chain / dome scenes even
+with \texttt{eps = 1e-12, gtol = 1e-16}; fp roundoff in the
+\texttt{np.add.at} lateral assembly propagates through scipy's
+stopping criteria.  Phase 2 and later tolerances are set against this
+floor.
+
+\item \emph{Production-eps precision floor.}  At production
+$\varepsilon = 5\times 10^{-4}\,$m the smooth-surrogate correction
+scales as $\sim 1/(\mathrm{raw}_{\mathrm{eq}}/\varepsilon)^{4}$ in
+leading order.  Force matches analytical to $<1\%$ when
+$\mathrm{raw}_{\mathrm{eq}} \ge 10\,\varepsilon$.  Below that, the
+smoothing dominates and any test must compare against the smooth
+fixed point, not the hard-law analytical.
+
+\item \emph{Kernel friction had a hidden bias at production
+$\varepsilon$.}  The legacy form
+$\mathrm{inv\_dt\_mag} = s/(s^{2}+\varepsilon^{2})$ as a regularised
+$1/s$ was only correct at $s \gg \varepsilon$; at production
+$\varepsilon$ and stick-mode $s \sim \mu$m, $\varepsilon^{2}$
+dominated and friction effectively vanished.  Phase 4a rewrote both
+\texttt{jacobi\_step} (v1) and \texttt{jacobi\_step\_point\_set} (v2)
+to the contract form \eqref{eq:friction-kernel}, which avoids $1/s$
+entirely.  Discovery: T-K scene F kernel gave $s = F/k_a$ while theory
+gave $s = F/(k_a + k_{\mathrm{stick}})$ -- a clean $2\times$ ratio that
+pinpointed the bug.
+
+\item \emph{Alignment gate insufficient for closed convex side faces.}
+The current \eqref{eq:align-gate} smooth band at perpendicular
+$\alpha = 0$ gives $a = 0.5$.  Box-shaped targets have flat side faces
+that extend perpendicular to the contact-face normal; corner samples
+on these side faces sit \emph{inside} the locality kernel and at
+$\alpha = 0$, contributing half-strength asymmetric in-plane forces
+that prevent L-BFGS-B convergence at production $\varepsilon$.
+Phase 4b will shift the band to $[0, +\varepsilon_{\mathrm{align}}]$
+(perpendicular hard-culled).  Phase 4a defers the full box target;
+scene H is reduced to a single-face multi-sample point set as a
+work-around.
+
+\item \emph{Live $f^{n}$ required for bridge parity.}  Contract \S6.4
+defines $f^{n}_{i}$ at the iterate's current $\bdelta$ (\emph{live});
+Phase 3's \texttt{equilibrium\_half\_space\_friction\_smooth\_numerical}
+defaulted to the analytical face-on $f^{n}$ for hard-law decoupling --
+exact at $\varepsilon = 10^{-9}\,$m but at production $\varepsilon =
+5\times 10^{-4}\,$m the smooth equilibrium $\delta_n$ drifts
+$\sim 15$--$20\%$ from analytical (finding \#2 above), and
+$f^{n}_{\mathrm{smooth}} \ne f^{n}_{\mathrm{analytical}}$.  This
+shifted T-K scene F by $\sim 6\times 10^{-3}$ relative -- kernel and
+theory each consistent with themselves but inconsistent with each
+other.  Phase 4a added an \texttt{f\_n\_override} kwarg; bridge
+harness pre-computes
+$f^{n}_{i} = k_a\,|\delta_{n,i,\mathrm{smooth}}|$ from a normal-only
+\texttt{solve\_lattice\_contact} and passes it in.  Scene F rel-err
+dropped from $6\times 10^{-3}$ to $4\times 10^{-6}$.
+
+\item \emph{$\partial w^{t}/\partial\bdelta$ dropped from theory
+solver.}  Phase 2 finding \#4 documented that the theory solver
+included this term while the kernel did not.  Phase 4a's
+``theory $=$ kernel, never both ways'' rule forced a commit: dropped
+from theory.  The term is $O(\varepsilon^{2}/r_i^{3})$, well inside
+L-BFGS-B's gradient floor at production scale; all $10$ prior-phase
+theory tests pass unchanged after the drop.
+
+\item \emph{T-I $k_{\mathrm{stick}}$ sweep needs $F$-grid spanning
+past $\max F_{\mathrm{thresh}}$.}  At $k_{\mathrm{stick}}/k_a = 0.1$,
+$F_{\mathrm{thresh}} = 11\,\mu f_n$ -- far past the $6\,\mu f_n$
+range that the legacy v1 test\_04 used.  T-I Part D sizes the grid as
+$1.5\times F_{\mathrm{thresh}}(\min k_{\mathrm{stick}})$.  Trap to
+remember when extending the sweep.
+\end{enumerate}
+
+\section*{Appendix A: v1 $\to$ v2 glossary}
+\label{sec:v1-v2-glossary}
+
+One-line summary of every v1 concept that changed in v2:
+
+\begin{center}\small
+\begin{tabular}{lll}
+\toprule
+Concept & v1 & v2 \\
+\midrule
+Overlap formula        & $(r+R) - \|\bq - \bt\|$       & $r - \bnf\!\cdot\!(\bq - \bt)$\\
+Target sample          & $(\bt, R, \bnf, A)$ (with radius) & $(\bt, \bnf, A)$ (no radius)\\
+Contact direction      & line of centres $(\bq-\bt)/\|\cdot\|$ & face normal $\bnf$\\
+Lateral law            & DP or graph-Laplacian (choice) & graph-Laplacian only\\
+Poisson bulge          & physical phenomenon            & deleted; flatness is the regression\\
+Sphere target          & first-class \texttt{RigidTarget}& sampled as \texttt{PointSetTargetV2}\\
+Kernel paths           & sphere $+$ point-set (two)     & point-set only (one)\\
+MuJoCo $\text{margin}_1$ & $R_{\mathrm{target}}$         & $0$\\
+\texttt{target\_radii} array & per-sample              & deleted\\
+\midrule
+Default $\varepsilon$  & $10^{-5}\,$m                   & $5\times 10^{-4}\,$m (production)\\
+$f^{n}$ source         & series-spring analytical $f_n$ & $|F_{\mathrm{contact}}\!\cdot\!\bnp|$ live\\
+Friction smooth form (kernel) & $K\,\mathrm{cone}/(K+\mathrm{cone})$ with $1/s$ regularised by $\varepsilon^{2}$ & $K\,M/(K\,s + M + 10^{-30})$ (avoids $1/s$)\\
+Tilt formula           & $|\delta_t/\delta_n| = (k_a-A)/(k_a\rho-A)\tan\theta$ & $(1/\rho)\tan\theta$ (exact, no $A$)\\
+Active-set gates       & depth ($-50\varepsilon$) only & depth $+$ alignment ($\varepsilon_{\mathrm{align}} = 0.05$)\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ---------------------------------------------------------------------
+\section*{File map}
 
 \begin{center}\small
 \begin{tabular}{ll}
 \toprule
-File & Role\\
+File & Role \\
 \midrule
-\texttt{cslc\_main/theory/cslc\_theory.py}      & single-sphere primitives + friction\\
-\texttt{cslc\_main/theory/cslc\_lattice.py}     & lattice + chain + arc + contact\\
-\texttt{cslc\_main/theory/kernel\_bridge.py}    & gold-reference shim for the kernel\\
-\texttt{cslc\_main/theory/test\_01\_*.py--test\_06\_*.py} & step-by-step verifications\\
-\texttt{cslc\_main/theory/test\_07\_kernel\_bridge.py}    & 21/21 kernel-vs-theory bridge\\
-\texttt{newton/\_src/geometry/cslc\_kernels.py} & Warp GPU kernels\\
-\texttt{newton/\_src/geometry/cslc\_data.py}    & GPU data + calibration~\eqref{eq:calibration}\\
+\texttt{cslc\_main/theory/cslc\_theory.py}      & half-space primitives, single-sphere $+$ friction (v2)\\
+\texttt{cslc\_main/theory/cslc\_lattice.py}     & lattice, chain, dome, \texttt{solve\_lattice\_contact}, normal-force read-out\\
+\texttt{cslc\_main/theory/cslc\_targets.py}     & \texttt{PointSetTargetV2} dataclass $+$ 4 samplers (flat, sphere, box, mesh)\\
+\texttt{cslc\_main/theory/test\_half\_space\_*.py} & T-A, T-B (Phase 1 monotonicity / deep-penetration)\\
+\texttt{cslc\_main/theory/test\_face\_on\_series\_spring.py} & T-C (Phase 1)\\
+\texttt{cslc\_main/theory/test\_tilted\_face.py} & T-D (Phase 1)\\
+\texttt{cslc\_main/theory/test\_02\_chain.py}   & T-E (Phase 2 in-place edit)\\
+\texttt{cslc\_main/theory/test\_chain\_contact\_flat.py} & T-F (Phase 2)\\
+\texttt{cslc\_main/theory/test\_dome\_flattens.py} & T-G (Phase 2 -- centrepiece no-bulge regression)\\
+\texttt{cslc\_main/theory/test\_dome\_vs\_sphere.py} & T-H (Phase 2 -- sphere target)\\
+\texttt{cslc\_main/theory/test\_friction\_flat.py} & T-I (Phase 3 single-pad friction)\\
+\texttt{cslc\_main/theory/test\_dome\_grip\_flat.py} & T-J (Phase 3 grip aggregation)\\
+\texttt{cslc\_main/theory/test\_07\_kernel\_bridge.py} & T-K $+$ T-L (Phase 4a vertical-slice bridge)\\
+\texttt{newton/\_src/geometry/cslc\_kernels.py} & Warp GPU kernels (jacobi\_step\_point\_set, write\_cslc\_contacts\_point\_set)\\
+\texttt{newton/\_src/geometry/cslc\_data.py}    & GPU data $+$ calibration \eqref{eq:calibration}\\
 \texttt{newton/\_src/geometry/cslc\_handler.py} & per-step pipeline\\
+\texttt{cslc\_main/theory/contract\_v2.md}      & the contract this document is built against\\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \section*{Pointers to the figures}
 
-The figures referenced throughout the document live in
-\texttt{cslc\_main/theory/figures/}.  All PNGs are produced
-deterministically by \texttt{uv run -m cslc\_main.theory.test\_NN\_*}
-for $NN\in\{01,\ldots,06\}$, and the text-mode table
-\texttt{01a\_face\_on\_table.txt} contains the closed-form vs numerical
-data underlying~\cref{sec:single}.
+All v2 figures live in \texttt{cslc\_main/theory/figures/} with names
+\texttt{t[a-j]\_*.png}, produced deterministically by the test driver
+of the same letter (e.g.\ \texttt{ta\_*} by
+\texttt{test\_half\_space\_monotonicity.py}).  Run any driver via
+\texttt{uv run -m cslc\_main.theory.test\_<name>} to regenerate.
+
+\begin{thebibliography}{9}
+\bibitem{v1conf} CSLC v1 conference draft,
+\texttt{cslc\_mujoco/docs/overleaf\_theory\_cslc\_icra.txt}.  Retained
+for historical reference; v2 supersedes its sphere-vs-sphere
+formulation and the distance-preserving lateral law.
+\end{thebibliography}
 
 \end{document}

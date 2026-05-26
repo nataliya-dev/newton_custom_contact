@@ -1653,3 +1653,334 @@ without re-tuning per scene).
    Source of the §1 "Disturbance magnitude sweep — failure curves"
    tables (three identified cliffs: point τ_z @ 3 N·m, point τ_y @
    20 N·m, hydro τ_x @ 15 N·m).  Expected runtime ~5 min on RTX 3070.
+
+
+## 6. Hydroelastic SDF sensitivity floor on small curved pads — v0.9b finding (2026-05-23)
+
+While preparing the v0.9 contact-model benchmark
+([cslc_main/theory/benchmark_spec.md](../../cslc_main/theory/benchmark_spec.md))
+we hit a comparative-physics finding worth reporting in its own
+right: **Newton's hydroelastic SDF pressure integration has a
+sensitivity floor on small curved pad geometries that prevents
+it from producing contact force at silicone-soft stiffness, in
+a regime where CSLC produces finite force by construction.**
+
+### 6.1 Discovery path
+
+The v0.9 benchmark scene uses a R_pad = 10 mm spherical-cap pad
+(parametric `dome_param` from [pads.py](../../cslc_main/grasp/pads.py))
+pressed against a 25 mm steel cube at silicone-target stiffness
+(E ≈ 500 kPa → CSLC `ke_pad_physical = 5×10⁵ N/m`, hydro
+`kh = 1.8×10⁹ Pa/m`).  Pilot data from
+[exp_fd_pilot.py](../../cslc_main/grasp/scripts/exp_fd_pilot.py)
+showed CSLC F_per_pad ≈ 1.5 N (held the cube marginally) but
+hydro F_per_pad ≈ 0 N and point F_per_pad ≈ 0 N — both dropped
+the cube despite n_contacts > 0 per frame.
+
+### 6.2 Root cause: open-cap SDF (FIXED)
+
+[pads._build_dome_param_trimesh](../../cslc_main/grasp/pads.py)
+originally constructed the dome as an OPEN spherical cap surface
+concatenated (not booleaned) with a separate closed back
+cylinder.  Mesh inspection:
+- `is_volume = False`, `is_watertight = False`, `euler_number = 3`
+  (open boundary).
+- Volume reading meaningless (~2 mm³ but trimesh shouldn't have
+  produced a volume at all for an open mesh).
+
+Newton's SDF builder produces a sign-degenerate "interior" for an
+open mesh, so the hydroelastic pressure-integration field is zero
+across the cap.  CSLC was unaffected because CSLC uses its own
+lattice-vs-target-point-set contact path (sphere lattice samples
+the cap SURFACE, never touches the SDF).
+
+**Fix landed (v0.9b)**: rewrote `_build_dome_param_trimesh` to
+build a single watertight mesh — cap surface + cylindrical sidewall
+that SHARES the cap's base ring vertices + bottom triangle fan,
+all assembled in one Trimesh constructor call (not concatenation).
+Falls back to the legacy open mesh with a `RuntimeWarning` for
+half_angle > 90° (wrap-around caps need different closure topology
+and aren't a v0.9b priority).  Post-fix mesh:
+- `is_volume = True`, `is_watertight = True`, `euler_number = 2`
+  (closed surface).
+- Real volume 2.0×10⁻⁶ m³ matching cap + cylinder analytic sum.
+
+CSLC regression at the v0.9 anchors on the new closed dome:
+F = 1.57 N (vs exp_anchors' 1.58 N at same nominal config) —
+no CSLC behavior change.
+
+### 6.3 But mesh closure is necessary, not sufficient
+
+Hydro on the closed dome at silicone kh still returns F ≈ 0 N.
+Closed mesh = valid SDF, but hydro pressure integration STILL
+fails to emit force.  Three follow-up sweeps characterised
+the remaining gap.
+
+**kh sweep** at fixed R_pad = 10 mm, 7 cells over six decades:
+
+| kh (Pa/m) | F_per_pad | Newton-III | n_contacts | grip |
+|---|---|---|---|---|
+| 1×10⁶ | 0 N | 8.6% | 40 | dropped |
+| 1×10⁷ | 0 N | 2.4% | 40 | dropped |
+| 1×10⁸ | 0 N | 20.5% | 40 | dropped |
+| 1×10⁹ | 0 N | 4.4% | 40 | dropped |
+| 1×10¹⁰ | 0 N | 12.5% | 40 | dropped |
+| **1×10¹¹** | **39.0 N** | **0.00%** | **76** | partial |
+| 1×10¹² | 44.0 N | 0.00% | 72 | partial |
+
+Sharp regime boundary at `kh ≈ 1×10¹¹ Pa/m` ≈ **E ≈ 28 MPa**.
+That's polyurethane / hard rubber, NOT silicone (E ≈ 500 kPa).
+Silicone kh sits 50× below the floor.
+
+**Back-height sweep** at fixed kh = 1.8×10⁹ on the closed dome,
+to test whether more interior depth lowers the threshold:
+
+| back_height | F_per_pad | n_contacts | held |
+|---|---|---|---|
+| 3 mm (default) | 0 N | 40 | NO |
+| 10 mm | 0 N | 34 | NO |
+| 30 mm | 0 N | 28 | NO |
+
+Thicker pad does NOT help.  In fact n_contacts decreases (larger
+pad bounding box at fixed `sdf_resolution=64` → coarser voxels →
+fewer intersection-voxel cells).  The sensitivity floor is NOT
+about absolute interior depth.
+
+**R_pad (curvature) sweep** at fixed kh = 1.8×10⁹, half_angle = 72°:
+
+| R_pad | F_per_pad | n_contacts | N3_resid | xy_slip | regime |
+|---|---|---|---|---|---|
+| 5 mm | 0 N | 44 | 0.93% | 28.9 mm | sensitivity floor |
+| 10 mm | 0 N | 40 | 0.65% | 19.0 mm | sensitivity floor |
+| **20 mm** | **18.1 N** | **108** | **0.00%** | **0.3 mm** | **Goldilocks** |
+| 40 mm | 0 N | 90 | 49.2% | 286 mm | solver instability |
+| 80 mm | 0.001 N | 70 | 158.5% | 0 mm | solver totally broken |
+
+**Three-regime structure.**  R_pad = 20 mm is a sweet spot where
+hydro produces real force at silicone kh; below it the
+sensitivity floor kicks in, above it the solver loses
+Newton-III balance entirely (residuals 49% and 158% mean the
+contact constraint isn't satisfied — the cube xy slips
+286 mm at R = 40 mm).
+
+### 6.4 Physical interpretation (from
+[11_GPU_Accelerated_Hydroelasti.pdf](../papers/11_GPU_Accelerated_Hydroelasti.pdf))
+
+The paper's per-contact force formula (eq. 4, after marching-cubes
+on `g(x) = k_A φ_A − k_B φ_B`):
+
+```
+f_n = k_eff · |φ_0|
+k_eff = (k_A k_B / (k_A + k_B)) · a            [a = triangle area]
+φ_0   = φ_A(x_c) + φ_B(x_c)                    [sum of inside-depths at centroid]
+```
+
+For our symmetric case k_A = k_B = kh: `f_n = (kh/2)·a·(|φ_A| + |φ_B|)`.
+
+The `|φ_A|` term — distance from the contact-surface centroid INTO
+the pad measured by the pad's SDF — is what fails on a curved cap
+at shallow penetration:
+
+- **Flat pad face**: `|φ_pad(x)|` grows linearly with distance
+  from the face — at 0.3 mm penetration `|φ_pad| ≈ 0.3 mm`.
+  Plenty.
+- **Curved cap (radius R)**: at points "just inside" the cap, the
+  SDF measures distance to the NEAREST surface, which is the
+  curved cap itself.  For shallow penetration depth `d` in a cap
+  of radius R, the deepest-point reaches `|φ| ≈ d − d²/(2R)` —
+  but marching-cubes samples points throughout the intersection
+  lens, and many of those points lie close to the curved cap
+  surface where `|φ| ≈ 0`.  The triangle-area-weighted sum stays
+  small.
+
+So the per-contact force scales geometrically as ~ kh × area ×
+(near-surface |φ| floor), where the floor depends on local
+curvature.  At silicone kh and R = 10 mm, the product is below
+the cube's gravity (1.2 N).  At R = 20 mm the cap is flat enough
+near the apex that |φ| accumulates substantially.  At R ≥ 40 mm
+the pad's bounding box grows so much that the fixed-resolution
+SDF voxels (`sdf_resolution = 64`) become coarse, and the
+contact-surface marching-cubes resolution degrades to where the
+solver constraint can no longer be satisfied — hence the Newton-
+III blow-up.
+
+### 6.5 Practical implications
+
+1. **Hydro can't represent silicone-soft on small curved pads.**
+   On a R = 10 mm dome (the v0.9-corrected benchmark geometry —
+   chosen because the R = 20 mm v0.7 geometry overflows the 25 mm
+   box face per the geometric constraint), hydroelastic
+   pressure-integration produces F ≈ 0 N at silicone kh
+   regardless of mesh closure, back-height, or solver iterations.
+   At the v0.7 R = 20 mm geometry hydro DOES work, but that
+   geometry overflows the box face by ~19 mm and reintroduces the
+   wedge-instability concerns.
+
+2. **CSLC works on the same geometry by construction.**  The
+   distributed-lattice three-spring series computes per-sphere
+   force directly from anchor + contact + target stiffnesses; no
+   SDF pressure integration step, no near-surface |φ| floor.
+   This is a clean comparative advantage for CSLC on
+   tactile-sensor-scale fingertip pads.
+
+3. **For the v0.9b benchmark**, the dome scene becomes
+   CSLC-only.  The cross-model comparison runs on the box pad
+   (closed-by-construction, large interior volume → no
+   sensitivity floor) — see
+   [benchmark_spec.md](../../cslc_main/theory/benchmark_spec.md)
+   §7 Block B for the two-scene plan.
+
+### 6.6 Open follow-up
+
+- **Generic vs geometry-specific?**  Run the same kh sweep on
+  the box pad to confirm the floor is geometry-specific (small
+  curved SDF) and not a generic Newton-hydro limitation.
+  Expected outcome: box pad produces force at all kh ≥ 1×10⁶ —
+  if true, the finding is "small curved SDF only".
+- **Voxel-vs-curvature analytic relation.**  The empirical
+  Goldilocks at R ≈ 20 mm suggests a `R_min ≈ k · pad_bbox_z`
+  rule with `k` around `(2 × dome_height / sdf_resolution)`.
+  Could be derived from first principles in the paper's
+  marching-cubes step.  Out of v0.9b scope.
+- **R = 40 mm solver instability.**  At R = 40 mm the bounding
+  box exceeds the box-cube face by 4× and the SDF voxels get
+  coarse (`bbox_z / 64 ≈ 0.6 mm`).  Whether this is fixable by
+  raising `sdf_resolution` on large pads, or whether it's an
+  intrinsic large-curvature limit, is an open question.
+
+### 6.7 Reproducibility
+
+Mesh inspection:
+```bash
+uv run --extra importers python -c "
+import warp as wp; wp.init()
+from cslc_main.grasp import pads
+from cslc_main.grasp.params import PadParams
+import math
+p = PadParams(); p.kind='dome_param'; p.dome_param_R_pad=0.010
+p.dome_param_half_angle=72*math.pi/180.0
+m,_ = pads.build_pad_trimesh(p)
+print('is_volume', m.is_volume, 'euler', m.euler_number, 'vol', m.volume)
+"
+```
+
+kh sweep (7 cells × ~90 s = ~10 min):
+```bash
+for kh in 1e6 1e7 1e8 1e9 1e10 1e11 1e12; do
+  uv run --extra importers -m cslc_main.grasp.scripts.exp_fd_pilot \
+    --contact-model hydro --pad-close-offset 0.001 \
+    --pad-r-pad 0.010 --pad-half-angle 72 \
+    --kh ${kh} --ke-constraint 5e5 \
+    --solver-iterations 100 --solver-ls-iterations 10 \
+    --output /tmp/fd_hydro_dome_kh${kh}.json --quiet
+done
+```
+
+R_pad sweep (inline via Python wrapper; see this section's history
+in git for the loop body).
+
+
+## 7. Viewer tooling + CSLC perf knobs (v0.9b, 2026-05-23)
+
+Three additions to the grasp pipeline to support the v0.9b
+diagnostic / characterization work.
+
+### 7.1 In-sim timing instrumentation
+
+`run_headless` in
+[runner.py](../../cslc_main/grasp/runner.py) now prints rolling
+ms/step every 200 steps (with `wp.synchronize()` once per print so
+the number reflects actual GPU work, not lazy queueing).
+
+### 7.2 Box-target sample-point visualisation
+
+`TargetPointsRenderer` in
+[visualization.py](../../cslc_main/grasp/visualization.py) walks
+the CSLC handler's `shape_pairs` for any pair with
+`is_point_set = True` (the cube-as-held-object scene), and logs
+the per-pair target sphere positions to the viewer at
+`/cslc_target_points` each frame.  Renders as small grey spheres
+at radius `box_face_pitch / 4` — visible alongside the existing
+red/grey lattice spheres from `LatticeRenderer` so the user can
+see exactly what point set the CSLC kernels are iterating over.
+Wired into `Example.render` in
+[runner.py](../../cslc_main/grasp/runner.py); no-op in headless
+mode and for sphere-target scenes.
+
+### 7.3 Hydroelastic contact-surface visualisation
+
+[scene.py](../../cslc_main/grasp/scene.py) `build_scene` now
+pre-constructs `CollisionPipeline` with
+`HydroelasticSDF.Config(output_contact_surface=True)` for
+`contact_model == "hydro"`.  The kernels' surface-output path is
+only compiled in when this flag is set at pipeline construction
+time, so doing it lazily afterward is a no-op.  `Example.__init__`
+in [runner.py](../../cslc_main/grasp/runner.py) then sets
+`viewer.show_hydro_contact_surface = True`.  Pattern follows
+`example_robot_panda_hydro.py`.
+
+### 7.4 CSLC point-count CLI knobs
+
+[main.py](../../cslc_main/grasp/main.py) gained two flags for
+benchmark / perf iteration:
+- `--pad-n-samples <N>`  — overrides `PadParams.n_samples`
+  (number of CSLC lattice spheres per pad; default 150).
+- `--object-density <kg/m³>`  — overrides `ObjectParams.density`
+  (default 368 → 5.75 g cube at box_side = 25 mm; pass 7800 for
+  the v0.7/v0.9 benchmark steel cube at 122 g).
+
+### 7.5 Perf delta (CSLC + box-target on the v0.9 silicone scene)
+
+Per-step wall time at HOLD measured via the §7.1 instrumentation:
+
+| Config | N_pad | box_face_pitch | wall (s) | HOLD ms/step | RT× | held | xy_slip |
+|---|---|---|---|---|---|---|---|
+| baseline | 150 | 1 mm | 94.6 | ~29-30 | 0.07 | YES | 1.14 mm |
+| reduced | 50 | 2 mm | 30-48 | ~10-15 | 0.13-0.20 | YES | 1.6-18 mm |
+
+Reduced config gives 2-3× wall-clock speedup at the cost of
+coarser grip (higher xy_slip).  Grip still holds at silicone-target
+calibration.  The theoretical kernel-op reduction (N_pad × N_target
+= 150·1250 → 50·313 ≈ 12× fewer ops) translates to only 2-3× wall
+because the per-pair CSLC inner-loop fixed cost (Jacobi sweeps,
+MuJoCo step) dominates at low N_pad × N_target.  Future
+optimisation should target the inner-loop overhead (spatial-hash
+target culling, fewer Jacobi iterations) rather than just lowering
+N_pad further.
+
+### 7.6 Visualisation command reference
+
+CSLC + cube (lattice spheres + target points):
+```bash
+uv run --extra importers -m cslc_main.grasp.main --viewer gl \
+    --pad-kind dome_param --pad-r-pad 0.010 --pad-half-angle 72 \
+    --object-kind box --box-side 0.025 \
+    --ke-physical 5e5 --ke-constraint 5e5
+```
+
+CSLC reduced for fast iteration:
+```bash
+uv run --extra importers -m cslc_main.grasp.main --viewer gl \
+    --pad-kind dome_param --pad-r-pad 0.010 --pad-half-angle 72 \
+    --object-kind box --box-side 0.025 \
+    --pad-n-samples 50 --box-face-pitch 0.002 \
+    --ke-physical 5e5 --ke-constraint 5e5
+```
+
+Hydro + box pad (hydro contact surface):
+```bash
+uv run --extra importers -m cslc_main.grasp.main --viewer gl \
+    --contact-model hydro --pad-kind box \
+    --object-kind box --box-side 0.025 \
+    --kh 1.8e9 --ke-constraint 5e5
+```
+
+Hydro + closed dome (will show 40 boundary contacts, F≈0 at
+silicone kh per §6 finding):
+```bash
+uv run --extra importers -m cslc_main.grasp.main --viewer gl \
+    --contact-model hydro \
+    --pad-kind dome_param --pad-r-pad 0.010 --pad-half-angle 72 \
+    --object-kind box --box-side 0.025 \
+    --kh 1.8e9 --ke-constraint 5e5
+```

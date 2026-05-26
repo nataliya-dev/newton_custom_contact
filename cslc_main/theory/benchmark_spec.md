@@ -24,114 +24,6 @@ The benchmark also produces two secondary results:
   CSLC's intended advantage for MPC/RL applications stands or falls
   on this.
 
-## Quick orientation for a fresh reader
-
-- **Calibration philosophy**: match the physical material, not observable
-  behavior.  §0 explains why F(d)-matching would defeat the comparison.
-- **Three models**: point (MuJoCo default), CSLC (this codebase's
-  distributed-lattice model), hydroelastic (Newton's SDF-volumetric
-  model).  §2 explains parameter surfaces.
-- **The scene** is a fixed dome-pad gripper closing on a 25mm steel cube;
-  the sweep axis is pad penetration depth (`--pad-close-offset`).  §1.
-- **Calibration values** are empirically anchored from §7.1 measurements;
-  §3.3 has the locked numbers.
-- **What's done**: anchors measured, mass locked, wrench readout working,
-  one pilot run on CSLC alone.
-- **What's next**: pilot the same range on hydro and point, then run the
-  headline sweep.  §7 has the ordered to-do list.
-
-## Changelog
-
-* **v0.9** (THIS REVISION): first measurements at the v0.8-corrected
-  R_pad = 10 mm geometry using the new
-  [exp_anchors.py](../grasp/scripts/exp_anchors.py) instrument.
-  Three substantive findings:
-  (a) **F_per_pad collapsed 43× from v0.7** (1.58 N at v0.9 silicone
-  target vs 67.9 N at v0.7).  Grip headroom dropped from ~60× cube
-  weight (122 g) to ~1.3×.  The v0.7 number was inflated by the
-  retracted R_pad = 20 mm geometry's patch overflow, AND by a
-  different ad-hoc L-measurement protocol — v0.9 uses the documented
-  delta_n-with-three-spring-correction protocol.  v0.9 vs v0.7 are
-  NOT bit-comparable.  See §3.3 and §7.1.
-  (b) **contact_fraction ≈ 0.7 ± 0.1**, not 1.0.  The v0.7 finding
-  was inflated by spheres engaging onto adjacent box faces past the
-  cap overflow.  At corrected R_pad = 10 mm only the apex region
-  (~70%) actually engages.  Per-pad asymmetry up to ~25% per run.
-  See §3.5.
-  (c) **F(d) non-monotonicity SURVIVES the geometry fix**, but the
-  peak shifted from ~1 mm (v0.7) to ~2 mm (v0.9), AND the cube DROPS
-  at 5 mm depth at v0.9 (F → 0, Newton-III breaks).  v0.7 held
-  throughout the {0.2, 0.5, 1, 2, 5} mm range.  Keep §5.3(a) as a
-  paper-grade CSLC characteristic, but document the shape change
-  and the drop-at-deep-squeeze finding.  See §5.3 and §7.4.
-  Two methodology notes:
-  (i) **GPU non-determinism dominates calibration scatter.** Three
-  re-anchor iterations at the same input ke gave derived ke values
-  spanning {4.4e5, 5.0e5, 5.3e5} — 10-20% scatter at the same
-  config, consistent with the C2-closure bounded-non-determinism
-  finding.  v0.9 calibration values are central estimates; treat
-  trailing significant figures with skepticism.
-  (ii) **Self-consistency requires contact_fraction iteration.**
-  The exp_anchors script measures empirical contact_fraction but the
-  scene's `calibrate_kc` uses `CSLCParams.contact_fraction` (default
-  0.025), so the running kc doesn't match the measurement-implied
-  kc.  For a tight self-consistent v0.9 calibration, run
-  exp_anchors with `--cslc-contact-fraction 0.7` and iterate.
-  This was not done for the v0.9 measurements (single-pass at
-  default cf=0.025); the §3.3 numbers are first-order valid but
-  carry an additional self-consistency caveat documented in §7.1.
-* **v0.8**: retract R_pad = 20 mm geometry (violated
-  the spec's own dome-vs-box constraint by ~19 mm at the 25 mm box —
-  the contact patch overflowed the approach face).  Restore the
-  original Step 8 / 9 / 10 production geometry R_pad = 10 mm at
-  half_angle = 72°.  Three downstream consequences:
-  (a) §3.3 calibration table v0.7 numbers carry forward but are
-  flagged "RE-VALIDATION REQUIRED" — A_patch = 330 mm² is
-  geometrically impossible at the smaller cap, so re-measurement is
-  not optional;
-  (b) §5.3 a non-monotonic F(d) finding is preserved as a hypothesis
-  but reopened pending re-validation — the drop from 69 N → 6.6 N
-  could be patch-overflow rather than the attributed anchor-pull-back
-  mechanism;
-  (c) §3.5 calibration loop closure used 2-spring `kc_series` instead
-  of 3-spring `keff` and over-predicted force by ~60% (264 N instead
-  of the correct E·A = 165 N).  Corrected; residual restated as 2.4×
-  not 4×.
-  §7 Block A reopened for re-anchoring at R_pad = 10 mm.
-* **v0.7**: document restructured for fresh-reader
-  comprehension.  v0.6 empirical findings promoted from changelog into
-  the body (§3.3 calibration table, §3.4 coupling analysis, §3.5
-  contact_fraction = 1.0, §5 non-monotonic F(d) characterization).
-  §7 reorganized as actionable to-do list with completion status per
-  item.  Two findings clarified: (a) at v0.6 empirical anchors, the
-  series-spring coupling §3.4 warned about is NOT tripped (per-sphere
-  kc ≈ 15,000 << target_ke = 500,000, so kc_series ≈ kc); (b) F(d)
-  non-monotonicity is likely an anchor-spring pull-back mechanism,
-  not gate saturation alone — added to §5 as a CSLC-characteristic
-  finding worth reporting.
-* v0.6: §7.1 empirical anchors measured.  Three findings: (a) wrench
-  readout works via `state.mujoco.qfrc_actuator` after pre-allocation;
-  proxy `Σ stiffness × L` was off by ~3-100×; (b) at 5.75 g cube the
-  cube settles +2-3 mm off-center; at 122 g cube the system is
-  symmetric and Newton-III balanced; (c) F(squeeze_depth) is
-  non-monotonic.  Mass locked at 122 g (steel density 7800 kg/m³).
-  Pad construction documented: pads are rotated, not mirrored.
-* v0.5: math + methodology corrections.  Fixed: "harmonic-mean" →
-  "series-spring composition"; "20% above" → "17% below" (correct
-  sign); added `ka_tangent_ratio = 0.336` (Poisson-derived) to CSLC
-  calibration table.  Sweep axis switched from "squeeze force" to
-  `pad_close_offset`.  Headline metric reframed to continuous
-  `offset_50`.
-* v0.4: added point contact as third model; calibration reframed from
-  F(d) behavioral matching to material-property matching + outcome
-  sweep.  Validation experiments (F(d), slip-onset, patch radius)
-  moved to §4.
-* v0.3.1: tightened language after n=3 std-of-std caveat.
-* v0.3: first n=3 seed sweep showed seed-variance dominated
-  single-seed claims.  Required (mean, std) reporting added.
-* v0.2: operating point updated post-Bug B post-mortem.  Approach-face-
-  only sampling restored default `alpha=0.3, n_iter=40` viability.
-* v0.1: initial draft, operating point `alpha=0.1, n_iter=120`.
 
 ## 0. Calibration philosophy
 
@@ -942,14 +834,62 @@ threshold):
 regardless of back depth, and n_contacts actually decreases (the
 larger pad geometrically intersects the cube less).
 
-**Interpretation.**  The sensitivity floor is intrinsic to
-Newton's hydroelastic SDF pressure-integration on small curved
-geometries — not a function of mesh thickness or interior volume.
-For silicone-equivalent stiffness (E ≈ 500 kPa → kh ≈ 1.8×10⁹ Pa/m)
-on a 10-mm radius dome cap, hydroelastic produces zero contact
-force regardless of pad thickness; it only emits force above
-kh ≈ 1×10¹¹ Pa/m (equivalent to E ≈ 28 MPa, i.e. polyurethane or
-hard rubber, NOT silicone).
+Sweep 3 (R_pad / curvature sweep at fixed kh = 1.8×10⁹,
+half_angle = 72°, to test the curvature-vs-`|φ|`-floor
+hypothesis from the paper's per-contact force formula):
+
+| R_pad | F_per_pad | n_contacts | N3_resid | xy_slip | regime |
+|---|---|---|---|---|---|
+| 5 mm | 0 N | 44 | 0.93% | 28.9 mm | sensitivity floor |
+| 10 mm | 0 N | 40 | 0.65% | 19.0 mm | sensitivity floor |
+| **20 mm** | **18.1 N** | **108** | **0.00%** | **0.3 mm** | **GOLDILOCKS — hydro works** |
+| 40 mm | 0 N | 90 | 49.2% | 286 mm | solver instability |
+| 80 mm | 0.001 N | 70 | 158.5% | 0 mm | solver totally broken |
+
+**Three-regime structure** at silicone kh:
+- **R ≤ 15 mm (sensitivity floor)**: curvature too tight, near-
+  surface `|φ_pad|` saturates as `d − d²/(2R)` and many marching-
+  cubes sample points have `|φ_pad| ≈ 0` → `f_n ≈ 0`.
+- **R = 20 mm (sweet spot)**: cap is flat enough near the apex
+  that `|φ_pad|` accumulates substantially.  Hydro grips (F=18 N,
+  Newton-III 0.00%, xy slip 0.3 mm).
+- **R ≥ 30 mm (solver instability)**: pad bounding box exceeds
+  the SDF's fixed-resolution voxel budget at `sdf_resolution=64`,
+  contact-surface marching-cubes resolution degrades, MuJoCo
+  constraint solver can't satisfy Newton-III balance — residuals
+  blow up to 49% (R=40mm) / 158% (R=80mm), cube xy-slips by
+  286 mm.
+
+**Critical:** The R=20mm Goldilocks point IS the v0.7-retracted
+geometry that violates the v0.8 dome-vs-box constraint (patch
+radius 19 mm vs box half-extent 12.5 mm — overflows the cube
+face by 19 mm).  At silicone kh + 25 mm cube there is **NO
+R_pad value** that satisfies BOTH the hydro pressure-integration
+threshold AND the patch-fits-in-cube constraint.  Three
+resolutions:
+- **R3.A — bigger cube.**  Increase box_side from 25 mm to
+  ≥ 50 mm so R=20 mm cap fits with margin.  Changes the
+  benchmark scene scale (mass goes from 122 g steel to ~975 g
+  steel for the larger cube; need to revisit object-density
+  decision).
+- **R3.B — different held-object kind.**  Use a sphere held
+  object instead of cube.  Sphere has no "face overflow"
+  constraint; R=20 mm cap pressed onto a sphere surface gives
+  Hertzian contact patch within the sphere's curvature limit.
+  Closer to the production CSLC regression baseline anyway.
+- **R3.C — accept the hydro limitation as a finding.**  Keep
+  R=10mm + 25mm cube + 122g.  Report "hydro can't represent
+  silicone-soft on this small-curved-pad scene; CSLC can."
+  Headline cross-model comparison runs on box pad (per the
+  previous Block B recommendation).
+
+**Interpretation.**  The hydroelastic sensitivity floor is
+intrinsic to Newton's SDF pressure-integration on small curved
+geometries — not a function of mesh thickness, interior volume,
+or solver iteration count.  Mesh CLOSURE is necessary (Newton
+SDF needs a sign-consistent interior); CURVATURE then determines
+whether the near-surface `|φ_pad|` accumulates fast enough at
+the equilibrium penetration to drive force.
 
 **This IS a paper-grade comparative finding for the CSLC story.**
 CSLC, by construction, computes per-sphere contact force as the
@@ -957,11 +897,19 @@ direct three-spring series at every active lattice sphere — there
 is no SDF pressure-integration step and no sensitivity floor.
 The benchmark's headline argument can include "CSLC produces
 finite contact force in the silicone-soft regime where Newton's
-hydroelastic implementation produces none" as a CSLC advantage on
-small-curved-pad geometries.  Worth running the same kh sweep on
-the box pad (closed by construction, large interior) to confirm
-the sensitivity floor is geometry-specific (small curved SDF) and
+hydroelastic implementation produces none, on small-curved-pad
+geometries (tactile-sensor fingertip scale)" as a CSLC advantage.
+The R=20 mm Goldilocks finding QUANTIFIES the boundary: hydro
+needs the pad geometry's local radius of curvature ≥ ~20 mm at
+silicone-soft stiffness to emit force.  Worth running the same
+kh sweep on the box pad (flat surfaces, large interior) to
+confirm the floor is geometry-specific (small curved SDF) and
 not a generic hydro limitation.
+
+**Full discussion** including the physical interpretation against
+the paper's algorithm (eq. 4, marching-cubes per-triangle force)
+is in
+[cslc_mujoco/docs/summary.md §6](../../cslc_mujoco/docs/summary.md).
 
 ---
 

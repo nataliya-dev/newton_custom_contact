@@ -76,6 +76,11 @@ class CSVLogger:
                     "n_active", "n_surface",
                     "max_delta_mm", "max_pen_mm",
                     "mean_delta_mm", "mean_pen_active_mm",
+                    # Repro-A diagnostics (H2: per-pad active count;
+                    # H3: apex sphere normal/tangential delta split).
+                    "n_active_left", "n_active_right",
+                    "apex_left_delta_n_mm", "apex_left_delta_t_mm",
+                    "apex_right_delta_n_mm", "apex_right_delta_t_mm",
                 ],
             )
             self._cslc_writer.writeheader()
@@ -147,6 +152,16 @@ class CSVLogger:
                     "max_pen_mm": f"{cslc_state.get('max_pen_mm', 0.0):.4f}",
                     "mean_delta_mm": f"{cslc_state.get('mean_delta', 0.0) * 1e3:.4f}",
                     "mean_pen_active_mm": f"{cslc_state.get('mean_pen_active', 0.0) * 1e3:.4f}",
+                    "n_active_left": cslc_state.get("n_active_left", 0),
+                    "n_active_right": cslc_state.get("n_active_right", 0),
+                    "apex_left_delta_n_mm":
+                        f"{cslc_state.get('apex_left_delta_n_mm', 0.0):.4f}",
+                    "apex_left_delta_t_mm":
+                        f"{cslc_state.get('apex_left_delta_t_mm', 0.0):.4f}",
+                    "apex_right_delta_n_mm":
+                        f"{cslc_state.get('apex_right_delta_n_mm', 0.0):.4f}",
+                    "apex_right_delta_t_mm":
+                        f"{cslc_state.get('apex_right_delta_t_mm', 0.0):.4f}",
                 }
             )
 
@@ -167,29 +182,115 @@ def read_cslc_state(model) -> dict | None:
     Returns a dict the logger can consume directly, or ``None`` if no
     CSLC handler is attached.  Same shape as
     ``cslc_mujoco/common.read_cslc_state``.
+
+    Extended (2026-05-24) with per-pad active counts and per-pad
+    apex-sphere delta decomposition (``apex_*_delta_n_mm`` /
+    ``apex_*_delta_t_mm`` for the per-pad most-compressed surface
+    sphere).  These exist to discriminate H2 (contact-fraction
+    mismatch — too few spheres engaged) and H3 (lateral springs
+    popping the loaded sphere off-axis) in Repro A; see
+    plans/i-need-you-to-jolly-beacon.md.
     """
     pipeline = getattr(model, "_collision_pipeline", None)
     handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
     if handler is None:
         return None
     d = handler.cslc_data
-    is_surf = d.is_surface.numpy() == 1
-    deltas_vec = d.sphere_delta.numpy()[is_surf]
+    is_surf_full = d.is_surface.numpy() == 1
+    deltas_full = d.sphere_delta.numpy()
+    pen_full = handler.raw_penetration.numpy()
+    shape_full = d.sphere_shape.numpy()
+    normals_full = d.outward_normals.numpy()
+
+    is_surf = is_surf_full
+    deltas_vec = deltas_full[is_surf]
     delta_mags = (
         np.linalg.norm(deltas_vec, axis=-1)
         if deltas_vec.ndim == 2
         else deltas_vec
     )
-    pen = handler.raw_penetration.numpy()[is_surf]
+    pen = pen_full[is_surf]
     active = pen > 0
     n_active = int(active.sum())
     n_surface = int(is_surf.sum())
+
+    # Stricter "real contact" count for kc auto-tune: thresh at the
+    # smoothing width eps so the smooth_relu tail doesn't inflate the
+    # count.  smooth_relu(0, eps) = eps/2, so any sphere with pen > eps
+    # has raw > 0 confidently (force contribution > smoothing leak).
+    # Used by :func:`cslc_main.grasp.contact_models.auto_tune_kc_per_step`
+    # as the active fraction signal -- ``n_active`` (pen > 0) over-counts
+    # by ~10x during APPROACH because every near-contact pad sphere has
+    # a smoothing-tail pen > 0.
+    eps = float(getattr(handler.cslc_data, "smoothing_eps", 5.0e-4))
+    n_active_strict = int((pen > eps).sum())
     max_delta = float(delta_mags.max()) if len(delta_mags) else 0.0
     max_pen = float(pen.max()) if len(pen) else 0.0
     mean_delta = float(delta_mags.mean()) if len(delta_mags) else 0.0
     mean_pen_active = float(pen[active].mean()) if n_active else 0.0
+
+    # Per-pad split.  Assumes 2 pads (the grasp pipeline always does);
+    # smaller shape_id = "left", larger = "right".  This matches the
+    # left-before-right insertion order in scene.py.
+    #
+    # Active-count signal: ``handler.raw_penetration`` is overwritten by
+    # each pair's compute_cslc_penetration launch, so by the time we read
+    # it only the LAST pair's surface spheres have meaningful values
+    # (others get zeroed).  Use the per-sphere displacement projected
+    # onto the OUTWARD normal instead: negative values = sphere pushed
+    # inward = contact compression.  ``sphere_delta`` is per-sphere
+    # persistent and reflects both pads correctly.
+    unique_shapes = sorted(int(s) for s in np.unique(shape_full[is_surf_full]))
+    # |δ·n̂_outward| > 5 µm threshold ≈ pen > 10 µm (since δ_n ≈ phi·kc/(ka+kc)),
+    # well above noise floor and below any meaningful contact compression.
+    DELTA_INWARD_THRESH_M = 5.0e-6
+    pad_state = {}
+    for label, shape_id in zip(
+        ("left", "right"), (unique_shapes + [-1, -1])[:2]
+    ):
+        if shape_id < 0:
+            pad_state[f"n_active_{label}"] = 0
+            pad_state[f"apex_{label}_delta_n_mm"] = 0.0
+            pad_state[f"apex_{label}_delta_t_mm"] = 0.0
+            continue
+        mask = is_surf_full & (shape_full == shape_id)
+        pad_deltas = deltas_full[mask]
+        pad_normals = normals_full[mask]
+        # Signed delta along outward normal: negative = compressed inward.
+        n_mags = np.linalg.norm(pad_normals, axis=-1)
+        # Guard against zero-magnitude normals (degenerate; shouldn't happen
+        # for surface spheres, but be defensive).
+        safe = n_mags > 1e-12
+        d_dot_n = np.zeros(len(pad_deltas), dtype=np.float32)
+        if safe.any():
+            n_hat = pad_normals[safe] / n_mags[safe, None]
+            d_dot_n[safe] = np.einsum("ij,ij->i", pad_deltas[safe], n_hat)
+        # Active = pushed inward beyond noise floor.
+        active_mask = d_dot_n < -DELTA_INWARD_THRESH_M
+        pad_state[f"n_active_{label}"] = int(active_mask.sum())
+        if active_mask.any():
+            # Apex = most-compressed sphere (most negative δ·n̂).
+            local_idx = int(np.argmin(d_dot_n))
+            d_vec = pad_deltas[local_idx]
+            n_vec = pad_normals[local_idx]
+            n_mag = float(np.linalg.norm(n_vec))
+            if n_mag > 1e-12:
+                n_hat = n_vec / n_mag
+                d_n = float(np.dot(d_vec, n_hat))
+                d_t_vec = d_vec - d_n * n_hat
+                d_t = float(np.linalg.norm(d_t_vec))
+            else:
+                d_n = float(np.linalg.norm(d_vec))
+                d_t = 0.0
+            pad_state[f"apex_{label}_delta_n_mm"] = d_n * 1e3
+            pad_state[f"apex_{label}_delta_t_mm"] = d_t * 1e3
+        else:
+            pad_state[f"apex_{label}_delta_n_mm"] = 0.0
+            pad_state[f"apex_{label}_delta_t_mm"] = 0.0
+
     return {
         "n_active": n_active,
+        "n_active_strict": n_active_strict,
         "n_surface": n_surface,
         "max_delta_mm": max_delta * 1e3,
         "max_pen_mm": max_pen * 1e3,
@@ -197,6 +298,7 @@ def read_cslc_state(model) -> dict | None:
         "max_pen": max_pen,
         "mean_delta": mean_delta,
         "mean_pen_active": mean_pen_active,
+        **pad_state,
     }
 
 

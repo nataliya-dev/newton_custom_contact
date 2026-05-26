@@ -65,10 +65,10 @@ def _add_grasp_args(parser: argparse.ArgumentParser) -> None:
     # C2e: held-object kind + box-target sampling.
     g.add_argument(
         "--object-kind", choices=["sphere", "box"], default=None,
-        help="Held-object kind (default: sphere).  'box' (C2e) uses the "
-             "CSLC point-set contact path -- each box face is uniformly "
-             "sampled at --box-face-pitch and routed to "
-             "_launch_vs_point_set.",
+        help="Held-object kind (default: sphere).  'box' uses the v2 "
+             "unified CSLC contact path -- each box face is uniformly "
+             "sampled at --box-face-pitch and routed through the single "
+             "CSLCHandler._launch.",
     )
     g.add_argument(
         "--box-side", type=float, default=None,
@@ -88,6 +88,20 @@ def _add_grasp_args(parser: argparse.ArgumentParser) -> None:
         help="Lateral spawn jitter [m] along Y.  Used to drive multi-"
              "seed statistics for the C2 ke-sweep falsification "
              "(3 seeds at {-1mm, 0, +1mm}).  Default 0 = centred.",
+    )
+    g.add_argument(
+        "--object-density", type=float, default=None,
+        help="Held-object material density [kg/m³].  Default 368 = "
+             "tennis-ball mass on a sphere; pass 7800 for steel cube "
+             "(matches benchmark §7.1 silicone-target scene).",
+    )
+    g.add_argument(
+        "--pad-n-samples", type=int, default=None,
+        help="Number of CSLC lattice spheres per pad (PadParams.n_samples).  "
+             "Default 100 (see PadParams.n_samples).  Per-step cost is "
+             "O(N_pad × N_target) for box-target scenes; reducing N_pad "
+             "gives proportional speedup at the cost of coarser lattice "
+             "resolution.",
     )
 
     g.add_argument(
@@ -112,10 +126,14 @@ def _add_grasp_args(parser: argparse.ArgumentParser) -> None:
                    help="Override CSLC anchor stiffness ka [N/m].")
     g.add_argument("--cslc-alpha", type=float, default=None,
                    help="Override damped-Jacobi damping factor alpha [-]. "
-                        "Default 0.3.  Lower = more damped (more stable, "
-                        "slower convergence); higher = more aggressive.")
+                        "Default 0.6 (see CSLCParams.alpha).  Lower = more "
+                        "damped (more stable, slower convergence); higher = "
+                        "more aggressive.")
     g.add_argument("--cslc-n-iter", type=int, default=None,
-                   help="Override damped-Jacobi iteration count.  Default 40.")
+                   help="Override damped-Jacobi iteration count.  "
+                        "Default 20 (see CSLCParams.n_iter).  n_iter "
+                        "below 20 risks divergence on stiff scenes; "
+                        "40 gives paper-grade convergence margin.")
     g.add_argument("--material-ke", type=float, default=None,
                    help="LEGACY alias: sets BOTH --ke-physical and "
                         "--ke-constraint to the same value.  Preserves "
@@ -127,13 +145,15 @@ def _add_grasp_args(parser: argparse.ArgumentParser) -> None:
                         "Drives calibrate_kc on the pad lattice.  Unused "
                         "under --contact-model hydro (hydro uses --kh "
                         "instead).  See MaterialParams.ke_pad_physical.")
-    g.add_argument("--ke-constraint", type=float, default=None,
-                   help="Object's harmonic-mean composition partner [N/m]. "
-                        "Drives kc_series target_ke in the CSLC emission "
-                        "kernel, and the MuJoCo rigid-contact stiffness "
-                        "(regularisation timeconst).  Under hydro, also "
-                        "the MuJoCo constraint stiffness.  See "
-                        "MaterialParams.ke_target_constraint.")
+    g.add_argument("--ke-constraint", "--ke-target", type=float, default=None,
+                   dest="ke_constraint",
+                   help="Object's physical contact stiffness [N/m].  Enters "
+                        "the CSLC series-spring composition "
+                        "1/kc_eff = 1/kc + 1/ke_target; also flows to MuJoCo "
+                        "as the rigid-contact stiffness (and thus the "
+                        "regularisation timeconst -- intrinsic to MuJoCo's "
+                        "API, see MaterialParams docstring).  See "
+                        "MaterialParams.ke_target_physical.")
     g.add_argument("--kh", type=float, default=None,
                    help="Hydroelastic physical-compliance modulus [Pa/m]. "
                         "Used only under --contact-model hydro; ignored "
@@ -141,6 +161,14 @@ def _add_grasp_args(parser: argparse.ArgumentParser) -> None:
     g.add_argument(
         "--cslc-contact-fraction", type=float, default=None,
         help="Override CSLC contact-fraction prior used by kc recalibration.",
+    )
+    g.add_argument(
+        "--cslc-smoothing-eps", type=float, default=None,
+        help="Override differentiability width [m] for the kernel smooth-step "
+             "gates (CSLCParams.smoothing_eps).  Production default 5e-4.  "
+             "Tighter values give stiffer contact (less smoothing tail) at the "
+             "cost of differentiability and lattice-solve stability; see "
+             "params.py:397-403.  Sweep for the H4 dome-grip hypothesis.",
     )
 
 
@@ -162,6 +190,8 @@ def _apply_args_to_config(args, config: GraspConfig) -> GraspConfig:
         config.cslc.ka = args.cslc_ka
     if args.cslc_contact_fraction is not None:
         config.cslc.contact_fraction = args.cslc_contact_fraction
+    if args.cslc_smoothing_eps is not None:
+        config.cslc.smoothing_eps = args.cslc_smoothing_eps
     if args.cslc_alpha is not None:
         config.cslc.alpha = args.cslc_alpha
     if args.cslc_n_iter is not None:
@@ -174,7 +204,7 @@ def _apply_args_to_config(args, config: GraspConfig) -> GraspConfig:
     if args.ke_physical is not None:
         config.material.ke_pad_physical = args.ke_physical
     if args.ke_constraint is not None:
-        config.material.ke_target_constraint = args.ke_constraint
+        config.material.ke_target_physical = args.ke_constraint
     if args.kh is not None:
         config.material.kh = args.kh
     if args.pad_r_pad is not None:
@@ -193,6 +223,10 @@ def _apply_args_to_config(args, config: GraspConfig) -> GraspConfig:
         config.object.box_face_pitch = args.box_face_pitch
     if args.object_spawn_y_offset is not None:
         config.object.spawn_y_offset = args.object_spawn_y_offset
+    if args.object_density is not None:
+        config.object.density = args.object_density
+    if args.pad_n_samples is not None:
+        config.pad.n_samples = args.pad_n_samples
 
     # C2e geometric-constraint warning: dome contact patch must fit
     # inside one box face (with a 3mm margin per side) -- otherwise the

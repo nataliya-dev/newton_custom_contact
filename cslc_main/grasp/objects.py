@@ -21,11 +21,11 @@ CSLC handler transforms them to world per-step via the box body's
 ``body_q``.
 
 :func:`compute_k_max` derives the per-pad-sphere contact-buffer budget
-``K_max`` from the active-set inclusion radius (``r_lat + R_target +
+``K_max`` from the active-set inclusion radius (``r_lat +
 INCLUSION_FACTOR * eps``, where ``INCLUSION_FACTOR = 50`` comes from
 :mod:`cslc_main.theory.cslc_theory`).  The handler's runtime
-truncation counter (``cslc_handler._launch_vs_point_set``) is the
-backstop if this formula under-counts on a new geometry.
+truncation counter (in :meth:`CSLCHandler._launch`) is the backstop if
+this formula under-counts on a new geometry.
 """
 
 from __future__ import annotations
@@ -55,13 +55,13 @@ def make_object_shape_cfg(
     the analytic sphere geometry.  Other contact models use the bare
     Hunt–Crossley + Coulomb material parameters.
     """
-    # C2 ke-split: the object's ke flows to MuJoCo as
-    # ``pair.other_ke`` -> ``target_ke`` in the CSLC kc_series
-    # composition (numerical / regularisation knob).  Under hydro,
-    # ``kh`` is the physical compliance knob and ``ke`` here is the
-    # constraint regularisation.
+    # Object's ke flows to MuJoCo as ``pair.other_ke`` -> the
+    # series-spring partner in CSLC's calibrate_kc, and as MuJoCo's
+    # rigid-contact stiffness.  Under hydro, ``kh`` is the physical
+    # compliance knob and ``ke`` here sets MuJoCo's constraint
+    # stiffness only.
     kwargs = dict(
-        ke=material.ke_target_constraint,
+        ke=material.ke_target_physical,
         kd=material.kd,
         kf=material.kf,
         mu=material.mu,
@@ -160,17 +160,15 @@ def make_box_target(
             inner-loop cost without any wrench contribution.
 
     Returns:
-        Dict with three ``np.ndarray`` fields, all body-local:
+        Dict with four ``np.ndarray`` fields, all body-local:
           * ``positions``: ``(N, 3) float32``
           * ``radii``:     ``(N,) float32``  -- uniform ``pitch / 2``
           * ``normals``:   ``(N, 3) float32``  -- per-face outward normal
-
-    Notes:
-        * ``radii = pitch / 2`` makes adjacent target spheres just tile
-          their face without overlap.
-        * ``normals`` is populated for API completeness (C3+ per-pair
-          friction may consume it); the C2 production kernels use the
-          line-of-centres direction ``(t - q)/||t-q||`` and ignore it.
+          * ``areas``:     ``(N,) float32`` [m^2]  -- per-sample Voronoi
+            cell area on the underlying face (``step_a * step_b``).
+            Consumed by the area-weighted half-space contact kernels;
+            without it, the discrete sum over face samples overcounts
+            by ``face_area_in_tangential_reach / contact_patch_area``.
     """
     if pitch <= 0.0:
         raise ValueError(f"pitch must be > 0, got {pitch}")
@@ -189,7 +187,7 @@ def make_box_target(
 
     halfs = (hx, hy, hz)
 
-    pos_chunks, nrm_chunks = [], []
+    pos_chunks, nrm_chunks, area_chunks = [], [], []
     for face_name in faces:
         fixed_axis, fixed_sign, a_axis, b_axis, normal_xyz = _FACE_SPECS[face_name]
         fixed_value = fixed_sign * halfs[fixed_axis]
@@ -207,13 +205,79 @@ def make_box_target(
         pts[:, a_axis] = A.ravel()
         pts[:, b_axis] = B.ravel()
         nrm = np.tile(np.array(normal_xyz, dtype=np.float32), (na * nb, 1))
+        # Per-sample area on this face: uniform Voronoi cells of size
+        # ``step_a * step_b``.  Sum over the face's samples = the full
+        # face area (4 * a_extent * b_extent).
+        cell_area = float(step_a * step_b)
+        areas = np.full(na * nb, cell_area, dtype=np.float32)
         pos_chunks.append(pts)
         nrm_chunks.append(nrm)
+        area_chunks.append(areas)
 
     positions = np.concatenate(pos_chunks, axis=0).astype(np.float32)
     normals   = np.concatenate(nrm_chunks, axis=0).astype(np.float32)
     radii     = np.full(positions.shape[0], pitch * 0.5, dtype=np.float32)
-    return {"positions": positions, "radii": radii, "normals": normals}
+    areas     = np.concatenate(area_chunks, axis=0).astype(np.float32)
+    return {"positions": positions, "radii": radii,
+            "normals": normals, "areas": areas}
+
+
+def make_sphere_target(
+    radius: float,
+    n_samples: int,
+    *,
+    center: np.ndarray | tuple[float, float, float] | None = None,
+) -> dict[str, np.ndarray]:
+    """Sample a sphere surface into a point set for the CSLC handler.
+
+    Wrapper around :func:`cslc_main.theory.cslc_targets.make_sphere_target`
+    that returns the same ``{positions, radii, normals, areas}`` dict
+    layout :func:`make_box_target` produces, so the grasp pipeline can
+    handle sphere and box targets uniformly.
+
+    Args:
+        radius: sphere radius [m].
+        n_samples: number of Fibonacci-spiral samples on the surface
+            (1500 at production grasp; matches scene J in the bridge
+            harness).
+        center: sphere centre in body-local frame.  Defaults to origin
+            (which is the convention Newton's
+            :meth:`ModelBuilder.add_shape_sphere` uses: the shape's
+            local origin sits at the sphere centre).
+
+    Returns:
+        Dict with four ``np.ndarray`` fields, all body-local:
+          * ``positions``: ``(n_samples, 3) float32``
+          * ``radii``:     ``(n_samples,) float32`` -- placeholder
+            (``2·r_pad`` average), not consumed by the half-space kernels
+          * ``normals``:   ``(n_samples, 3) float32`` -- radial outward
+          * ``areas``:     ``(n_samples,) float32`` -- uniform
+            ``4πR²/n_samples`` (Fibonacci-spiral Voronoi cells).
+    """
+    from cslc_main.theory.cslc_targets import (
+        make_sphere_target as _theory_make_sphere_target,
+    )
+
+    if radius <= 0.0:
+        raise ValueError(f"radius must be > 0, got {radius}")
+    if n_samples < 4:
+        raise ValueError(f"n_samples ≥ 4 required, got {n_samples}")
+    centre = (
+        np.zeros(3, dtype=np.float64)
+        if center is None
+        else np.asarray(center, dtype=np.float64).reshape(3)
+    )
+    target = _theory_make_sphere_target(t=centre, R=float(radius),
+                                        n_samples=int(n_samples))
+    n = int(target.positions.shape[0])
+    return {
+        "positions": target.positions.astype(np.float32),
+        # Placeholder radii (kernel doesn't read them; kept for the
+        # make_box_target return-dict parity).
+        "radii": np.full(n, 1.0e-3, dtype=np.float32),
+        "normals": target.normals.astype(np.float32),
+        "areas": target.areas.astype(np.float32),
+    }
 
 
 def box_face_area(half_extents: tuple[float, float, float], face: str) -> float:
@@ -285,12 +349,32 @@ def compute_k_max(
         cost per pair is ``n_surface_pad_spheres * K_max * ~96 bytes``;
         production scenes are O(10 MB), well within GPU budgets.
     """
+    # The area-weighted half-space kernel emits a slot for any sample
+    # passing the combined gate ``contact_gate * w_tangent > 1e-4``.
+    # Option-2 tiling uses kernel half-width = r_pad (was 3·r_pad,
+    # paired with a CSLC_SOFTENING hack to cancel kernel overlap).
+    # The tangential weight ``w_tangent = smooth_step(r_pad - d_t, eps)``
+    # has a smooth tail; at d_t = r_pad + 5·eps the weight is still
+    # ~5e-3, well above the 1e-4 cull.  So the effective tangential
+    # reach is roughly ``r_pad + 5·eps``.
+    r_tangential = lattice_radii_max + 5.0 * smoothing_eps
+    # Legacy 3D inclusion radius — still controls the pen_half > -50*eps
+    # skip in the kernel (a sample further than this in 3D doesn't even
+    # enter the active set).  Kept as a separate bound.
     r_inclusion = (
         lattice_radii_max + target_radii_max
         + INCLUSION_FACTOR * smoothing_eps
     )
     density = target_count / target_surface_area
+    tangential_area = math.pi * r_tangential * r_tangential
     inclusion_area = math.pi * r_inclusion * r_inclusion
+    effective_area = min(tangential_area, inclusion_area)
     if pad_face_clip_area is not None:
-        inclusion_area = min(inclusion_area, pad_face_clip_area)
-    return int(math.ceil(inclusion_area * density)) + slack
+        effective_area = min(effective_area, pad_face_clip_area)
+    # Apply a generous safety factor.  Bounded estimates of "how many
+    # samples land inside the kernel" are noisy on coarse target grids
+    # (a pad sphere centered on a sample sees one more sample than one
+    # centered between samples) and corner spheres may pick up samples
+    # from adjacent faces.  4x + slack matches what production needs
+    # empirically without bloating the buffer for typical pads.
+    return int(math.ceil(4.0 * effective_area * density)) + slack

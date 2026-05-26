@@ -31,9 +31,10 @@ kernel knob that scales only the emission, which we defer.
 
 What we hold fixed (compared with the emitted-friction sweep):
 
-  * ``cfg.material.mu = 0.5`` -- production baseline; the
-    friction-sweep result already shows mu is invisible to the wedge.
-  * ``cfg.cslc.mu_friction = 0.3`` -- in-kernel knob, baseline.
+  * ``cfg.material.mu = 0.5`` -- single source of truth for friction
+    (drives both lattice stick-slip and MuJoCo Coulomb cone after
+    unification).  The friction-sweep result already shows mu is
+    invisible to the wedge.
   * ``cfg.cslc.k_stick = 2.5e4``  -- baseline.
   * Pad geometry: R=20mm/72deg dome (the wedge-canonical scene).
 
@@ -68,7 +69,6 @@ def make_cfg(*, ke: float, label: str) -> GraspConfig:
     # Hold every other knob at production baseline so the variation is
     # attributable solely to the constraint-stiffness sweep.
     cfg.material.mu = 0.5
-    cfg.cslc.mu_friction = 0.3
     cfg.cslc.k_stick = 2.5e4
 
     cfg.logging.run_label = label
@@ -90,7 +90,7 @@ def main() -> None:
         print()
         print("=" * 72)
         print(f"  material.ke = {ke:.1e}   ({name})   "
-              f"holds mu_pad=0.5, mu_friction=0.3")
+              f"holds material.mu=0.5")
         print("=" * 72)
         run_headless(make_cfg(ke=ke, label=label))
 

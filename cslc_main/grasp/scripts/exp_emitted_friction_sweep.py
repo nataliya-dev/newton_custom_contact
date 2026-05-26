@@ -1,30 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Emitted-friction sweep on the R=20mm/72deg dome (Step 11 closure follow-up).
+"""Friction sweep on the R=20mm/72deg dome (Step 11 closure follow-up).
 
-Question (from ``cslc_main/theory/notes.md`` Step 11): when in-kernel
-``mu_friction`` was swept in {0.3, 1.0}, the HOLD ``dz/dt`` climb rate
-on the R = 20 mm / 72 deg dome was UNCHANGED at ~3.0 mm/s.  Static
-math says ``tan(theta) < mu`` should be stable (tilt ~ 11.5 deg ->
-22 deg gives tan in [0.20, 0.40], both < mu=1.0).  Where's the gap?
+Question (from ``cslc_main/theory/notes.md`` Step 11): when friction
+was previously swept in {0.3, 1.0}, the HOLD ``dz/dt`` climb rate on
+the R = 20 mm / 72 deg dome was UNCHANGED at ~3.0 mm/s.  Static math
+says ``tan(theta) < mu`` should be stable (tilt ~ 11.5 deg -> 22 deg
+gives tan in [0.20, 0.40], both < mu=1.0).  Where's the gap?
 
-Hypothesis identified at notes.md:998-1014: the in-kernel ``mu_friction``
-controls CSLC's per-sphere stick-slip law on ``delta_t``, but the
-friction MuJoCo's rigid-body solver actually APPLIES is the geom-pair
-base (= ``cfg.material.mu``) multiplied by the ``out_friction = 1.0``
-scale written at ``cslc_kernels.py:964``.  Sweeping ``cslc.mu_friction``
-moves only the in-kernel knob; MuJoCo's effective friction stays
-pinned at ``cfg.material.mu``.
+Post-unification (Tier 2.3): a single ``material.mu`` drives BOTH the
+lattice stick-slip block and MuJoCo's Coulomb cone on emitted
+contacts.  The historic split (``cslc.mu_friction`` vs the geom-pair
+``material.mu``) is gone -- they were always the same knob in
+practice once :func:`cslc_kernels.write_cslc_contacts` started writing
+``out_friction = 1.0`` (= no extra scale).
 
-This script ISOLATES the emitted-friction layer.  We sweep
-``cfg.material.mu`` (the friction MuJoCo applies on the rigid contact)
-while holding ``cfg.cslc.mu_friction = 0.3`` (default) and every other
-knob fixed.  If the climb collapses as ``material.mu`` grows, friction
-WAS the bottleneck and the wedge is preventable with a higher
-geom-pair friction.  If the climb persists at large ``material.mu``,
-the wedge is geometric and cannot be stopped by friction at any
-level (= a pad-shape problem, not a parameter problem).
+This script sweeps ``material.mu`` from 0.5 to 5.0.  If the climb
+collapses as mu grows, friction WAS the bottleneck and the wedge is
+preventable with higher friction.  If the climb persists, the wedge
+is geometric (pad-shape problem, not a parameter problem).
 
 Falsification matrix:
 
@@ -54,12 +49,8 @@ def make_cfg(*, mu_material: float, label: str) -> GraspConfig:
     cfg.pad.dome_param_R_pad = 0.020
     cfg.pad.dome_param_half_angle = 72.0 * math.pi / 180.0
 
-    # Sweep ONLY the emitted-friction layer.
+    # Sweep the single unified friction knob.
     cfg.material.mu = mu_material
-
-    # Pin the in-kernel friction at production default so the comparison
-    # against notes.md Step 11's mu_friction sweep is clean.
-    cfg.cslc.mu_friction = 0.3
     cfg.cslc.k_stick = 2.5e4
 
     cfg.logging.run_label = label
@@ -80,7 +71,7 @@ def main() -> None:
         print()
         print("=" * 72)
         print(f"  material.mu = {mu}   ({name})   "
-              f"in-kernel mu_friction held at 0.3")
+              f"(unified -- drives both lattice and emission)")
         print("=" * 72)
         run_headless(make_cfg(mu_material=mu, label=label))
 

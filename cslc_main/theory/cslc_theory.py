@@ -1,19 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Pure-numpy reference implementation of the IDEAL CSLC model.
+"""Pure-numpy reference implementation of the CSLC v2 model.
 
 This module is the single source of truth for what the GPU kernels in
 ``newton/_src/geometry/cslc_kernels.py`` should converge to.  Every
-function corresponds to a printed equation; the docstrings cite both
-the paper section and the in-tree Overleaf transcript at
-``cslc_mujoco/docs/overleaf_theory_cslc_icra.txt``.
+function corresponds to an equation in
+``cslc_main/theory/contract_v2.md``.
 
-This file currently covers ONE lattice sphere against one rigid
-target.  Subsequent steps will extend it to lateral coupling, friction,
-and full lattice equilibrium.
+Phase 5 cleanup: v1 sphere-target primitives (``RigidTarget``,
+``effective_penetration``, ``contact_force``, ``equilibrium_face_on_analytical``,
+``equilibrium_numerical``, ``equilibrium_with_friction_*``, the v1
+``PointSetTarget`` with ``radii``, and the ``point_set_*`` family) and
+the ``kernel_contact_force_n_axis`` witness were removed.  Every target
+in v2 is a :class:`cslc_main.theory.cslc_targets.PointSetTargetV2`
+``(position, normal, area)`` triple-set; the unified path is the
+``half_space_*`` primitives + ``equilibrium_half_space_*`` solvers.
 
-Sign conventions (matching ``cslc_kernels.jacobi_step``):
+Sign conventions (matching ``cslc_kernels.jacobi_step``, contract §2):
 
     q = p - delta            (deformed centre; delta along +n_hat
                               means the sphere is compressed INWARD,
@@ -21,16 +25,16 @@ Sign conventions (matching ``cslc_kernels.jacobi_step``):
 
     f_anchor = +k_a * delta  (restoring; pulls q back toward p)
 
-    f_contact = +k_c * phi_eff * e_hat   where
-        phi_eff = max(0, (r + R) - ||t - q||)
-        e_hat   = (q - t) / ||q - t||  (unit vector FROM target TO sphere)
-    so contact pushes the sphere AWAY from the target.
+    f_contact = +k_c * phi_eff * gate * n_face       (contract §4)
+        phi_eff = sigma_eps(raw),  raw = r - n_face · (q - t_sample)
+        gate    = Sigma_eps(raw)
+    so contact pushes the pad sphere along +n_face (target's outward
+    direction) at any depth, monotone in penetration.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
 
 import numpy as np
 from scipy.optimize import minimize
@@ -105,6 +109,32 @@ INCLUSION_FACTOR: float = 50.0
 
 
 # ────────────────────────────────────────────────────────────────────────
+#  Alignment-gate smoothing half-width (contract §3.6)
+#
+#  ``EPS_ALIGN_DEFAULT`` is the half-width of the cubic-smoothstep
+#  alignment gate used to suppress back-side contacts on closed convex
+#  targets.  Both theory and the Warp kernel evaluate the gate with the
+#  SAME constant; bridge parity (T-K / T-L) regression-guards it via the
+#  literal-discipline check in test_07_kernel_bridge.
+#
+#  Same Python/Warp split as ``INACTIVE_RAW_EPS_FACTOR``:
+#    Python: import EPS_ALIGN_DEFAULT from cslc_main.theory.cslc_theory
+#            (used as the default of ``solve_lattice_contact(eps_align=…)``
+#             and ``lattice_contact_normal_forces(eps_align=…)``).
+#    Warp  : kernels embed the literal ``0.05`` with a comment pointing
+#            back to this constant.
+#
+#  Picked to match typical pad-lattice and target-sampling angular
+#  resolutions (~ 3° half-transition).  See contract §3.6 for the
+#  derivation; changing this value re-tunes the perpendicular-face
+#  smoothing band and requires kernel literal updates + bridge re-run.
+# ────────────────────────────────────────────────────────────────────────
+
+
+EPS_ALIGN_DEFAULT: float = 0.05
+
+
+# ────────────────────────────────────────────────────────────────────────
 #  Lattice sphere description
 # ────────────────────────────────────────────────────────────────────────
 
@@ -143,136 +173,14 @@ class LatticeSphere:
             raise ValueError(f"n must be unit length, got |n|={norm}")
 
 
-@dataclass(frozen=True)
-class RigidTarget:
-    """A rigid sphere we contact against.
-
-    No anchor, no compliance: it sits where it sits.  This matches the
-    paper's eq. 12 with the rigid-target limit ``k_e -> inf``, where the
-    series composition collapses to ``k_c`` alone.
-    """
-
-    t: np.ndarray  # Centre in world frame [m].
-    R: float       # Radius [m].
-
-    def __post_init__(self):
-        if self.t.shape != (3,):
-            raise ValueError(f"t must be shape (3,), got {self.t.shape}")
-
-
-@dataclass(frozen=True)
-class PointSetTarget:
-    """A rigid target represented as a discrete set of contact points.
-
-    Each point is a small rigid sphere with its own position, radius,
-    and a precomputed outward surface normal on the underlying geometry
-    the points were sampled from.  A pad sphere contacts every
-    overlapping target point independently and the per-point forces sum:
-
-        f_contact(q) = sum_j  kc * smooth_relu(raw_j) * gate_j * d_hat_j
-        raw_j        = (r_lat + R_j) - ||q - t_j||
-        d_hat_j      = (q - t_j) / ||q - t_j||                      (line of centres)
-
-    This generalises ``RigidTarget`` (which is one sphere) to arbitrary
-    target shapes sampled as point sets (box face, mesh, dome).  For a
-    single point with ``positions=[t]`` / ``radii=[R]`` it reduces
-    exactly to ``RigidTarget`` -- ``test_10_pad_vs_box.py``'s scene A
-    is the verification of that reduction.
-
-    The ``normals`` are NOT used by the basic sphere-vs-sphere overlap
-    check (which is geometry-agnostic line-of-centres); they are stored
-    as metadata of the underlying surface and are read by:
-
-      * the area-weighting / calibration path that scales ``kc`` so the
-        integrated stiffness matches a user-supplied bulk target (eq.
-        ``calibration``, theory.txt:979-989); and
-      * the eventual emission to MuJoCo, where they replace the
-        sphere-target line-of-centres direction with the local surface
-        normal at the contact patch -- the "symmetry-robust direction"
-        fix discussed in notes.md Step 11.
-
-    Attributes:
-        positions: (M, 3) target point centres in world frame [m].
-        radii:     (M,)  per-point sphere radii [m].
-        normals:   (M, 3) per-point outward unit normals on the
-                   underlying surface (precomputed at sample time).
-        areas:     (M,) per-point area weights [m^2] (the Voronoi /
-                   per-sample patch area on the underlying surface).
-                   Optional metadata; pass ``None`` if not yet computed.
-    """
-
-    positions: np.ndarray
-    radii: np.ndarray
-    normals: np.ndarray
-    areas: np.ndarray | None = None
-
-    def __post_init__(self):
-        if self.positions.ndim != 2 or self.positions.shape[1] != 3:
-            raise ValueError(
-                f"positions must be (M, 3), got {self.positions.shape}")
-        M = self.positions.shape[0]
-        if self.radii.shape != (M,):
-            raise ValueError(
-                f"radii must be (M,) with M={M}, got {self.radii.shape}")
-        if self.normals.shape != (M, 3):
-            raise ValueError(
-                f"normals must be (M, 3) with M={M}, got {self.normals.shape}")
-        if self.areas is not None and self.areas.shape != (M,):
-            raise ValueError(
-                f"areas must be (M,) with M={M}, got {self.areas.shape}")
-
-    @property
-    def M(self) -> int:
-        return int(self.positions.shape[0])
-
-
 # ────────────────────────────────────────────────────────────────────────
 #  Geometry primitives
 # ────────────────────────────────────────────────────────────────────────
 
 
 def deformed_centre(sphere: LatticeSphere, delta: np.ndarray) -> np.ndarray:
-    """q = p - delta.
-
-    The IDEAL CSLC formulation moves the sphere centre with delta and
-    keeps the radius at ``r``.  ``cslc_kernels.write_cslc_contacts`` does
-    the opposite: it keeps the centre at ``p`` and shrinks the radius to
-    ``r - dot(delta, n_eff)``.  See ``effective_radius_kernel`` below for
-    the kernel-style reduction we keep around for comparison.
-    """
+    """q = p - delta  (contract §2 / eq:def-centre)."""
     return sphere.p - delta
-
-
-def rest_overlap(sphere: LatticeSphere, target: RigidTarget) -> float:
-    """phi_rest = (r + R) - ||p - t||  [m].
-
-    Paper eq. 11 evaluated at delta = 0.  Positive when the rest spheres
-    geometrically overlap, zero when they just touch, negative when
-    separated.  No clamp here -- callers decide how to gate.
-    """
-    return (sphere.r + target.R) - float(np.linalg.norm(sphere.p - target.t))
-
-
-def effective_penetration(
-    sphere: LatticeSphere,
-    target: RigidTarget,
-    delta: np.ndarray,
-    *,
-    eps: float = 0.0,
-) -> float:
-    """phi_eff = [r + R - ||t - q||]_+   (paper eq. 11 with q = p - delta).
-
-    With ``eps = 0`` this is the hard ``max(0, ...)``.  With ``eps > 0`` it
-    is the smooth surrogate sigma_eps(x) = 0.5*(x + sqrt(x^2 + eps^2))
-    from the paper III.G smoothing scheme, so we can compare against the
-    kernel's smooth gates.
-    """
-    q = deformed_centre(sphere, delta)
-    dist = float(np.linalg.norm(target.t - q))
-    raw = (sphere.r + target.R) - dist
-    if eps <= 0.0:
-        return max(0.0, raw)
-    return 0.5 * (raw + np.sqrt(raw * raw + eps * eps))
 
 
 def smooth_step(x: float, eps: float) -> float:
@@ -298,42 +206,31 @@ def smooth_step(x: float, eps: float) -> float:
     return 0.5 * (1.0 + x / np.sqrt(x * x + eps * eps))
 
 
-def contact_raw_overlap(sphere: LatticeSphere, target: RigidTarget,
-                        delta: np.ndarray) -> float:
-    """Raw (signed) overlap before the positive-part clamp:
-        raw = (r + R) - ||t - q||,    q = p - delta.
+def smooth_relu(x: float, eps: float) -> float:
+    """C^infinity ReLU surrogate: sigma_eps(x) = 0.5*(x + sqrt(x^2 + eps^2)).
 
-    The smooth phi_eff is sigma_eps(raw); the gradient picks up
-    smooth_step(raw, eps).  Returned separately so callers don't have
-    to re-derive raw to apply the gradient factor.
+    The smooth-positive-part that appears throughout the contact code.
+    Its derivative is exactly :func:`smooth_step` (the chain-rule pair),
+    so any gradient of  d/d delta (k_c/2 * phi_eff^2)  with
+    phi_eff = sigma_eps(raw) picks up a :func:`smooth_step` factor.
+
+    Limits:
+        x >> eps   -> x          (active, identity)
+        x << -eps  -> eps^2/(4*|x|) -> 0  (decays as 1/|x|)
+        x ≈ 0      -> eps/2      (irreducible smoothing floor)
+
+    Previously defined inline in :func:`effective_penetration` and other
+    overlap helpers; extracted to a named function here so the v2
+    half-space primitives can share the same C^infinity surrogate
+    without duplicating the algebra.
     """
-    q = deformed_centre(sphere, delta)
-    dist = float(np.linalg.norm(target.t - q))
-    return (sphere.r + target.R) - dist
-
-
-def contact_direction(sphere: LatticeSphere, target: RigidTarget,
-                      delta: np.ndarray) -> np.ndarray:
-    """e_hat = (q - t) / ||q - t||  (unit, pointing from target to sphere).
-
-    This is the IDEAL contact direction: the line of centres of the
-    DEFORMED sphere and the target.  It tilts with tangential delta when
-    the target sits off-axis.  The kernel uses the REST line of centres
-    (``(t - p) / ||t - p||``) instead, so tangential delta cannot tilt the
-    kernel's contact direction.
-    """
-    q = deformed_centre(sphere, delta)
-    diff = q - target.t
-    n = float(np.linalg.norm(diff))
-    if n < 1e-15:
-        # Degenerate: centres coincide.  Fall back to the rest outward
-        # normal so callers never see NaN.
-        return sphere.n.copy()
-    return diff / n
+    if eps <= 0.0:
+        return max(0.0, x)
+    return 0.5 * (x + np.sqrt(x * x + eps * eps))
 
 
 # ────────────────────────────────────────────────────────────────────────
-#  Forces and energy (ideal model)
+#  Anchor force and energy (contract §6.1)
 # ────────────────────────────────────────────────────────────────────────
 
 
@@ -355,39 +252,6 @@ def anchor_force(sphere: LatticeSphere, delta: np.ndarray) -> np.ndarray:
     return sphere.ka * delta_n * sphere.n + (sphere.ka * sphere.ka_t_ratio) * delta_t
 
 
-def contact_force(
-    sphere: LatticeSphere,
-    target: RigidTarget,
-    delta: np.ndarray,
-    kc: float,
-    *,
-    eps: float = 0.0,
-) -> np.ndarray:
-    """f_contact = +k_c * phi_eff(delta) * e_hat(delta)   (paper eq. 12).
-
-    The IDEAL spring **force** (not the energy gradient): magnitude is
-    k_c times the actual deformation of the contact layer, direction
-    is from target toward sphere (pushes sphere away from target).
-
-    GRADIENT WARNING.  This is NOT the gradient of the contact
-    energy when ``eps > 0``.  The energy is E = 0.5 * k_c * phi_eff^2
-    with phi_eff = sigma_eps(raw), so its gradient picks up an extra
-    chain-rule factor:
-
-        dE/d delta = k_c * phi_eff * smooth_step(raw, eps) * e_hat.
-
-    For deep saturated contact (raw >> eps) the factor is ~1 and the
-    two coincide.  Near contact onset (raw ~ eps) they disagree by up
-    to 2x.  Always apply ``smooth_step(raw, eps)`` when using this for
-    L-BFGS-B Jacobians.  See ``contact_raw_overlap`` for raw.
-    """
-    phi = effective_penetration(sphere, target, delta, eps=eps)
-    if phi <= 0.0 and eps <= 0.0:
-        return np.zeros(3)
-    e = contact_direction(sphere, target, delta)
-    return kc * phi * e
-
-
 def anchor_energy(sphere: LatticeSphere, delta: np.ndarray) -> float:
     """E_anchor = 0.5 * k_a * ||delta||^2   (isotropic)."""
     if sphere.ka_t_ratio == 1.0:
@@ -397,146 +261,220 @@ def anchor_energy(sphere: LatticeSphere, delta: np.ndarray) -> float:
     return 0.5 * sphere.ka * delta_n * delta_n + 0.5 * (sphere.ka * sphere.ka_t_ratio) * delta_t_sq
 
 
-def contact_energy(
-    sphere: LatticeSphere,
-    target: RigidTarget,
-    delta: np.ndarray,
-    kc: float,
-    *,
-    eps: float = 0.0,
-) -> float:
-    """E_contact = 0.5 * k_c * phi_eff^2   (the spring's stored energy)."""
-    phi = effective_penetration(sphere, target, delta, eps=eps)
+# ────────────────────────────────────────────────────────────────────────
+#  Solvers — sphere-target v1 deleted in Phase 5; see ``half_space_*``
+#  primitives + ``equilibrium_half_space_*`` solvers below for the v2
+#  unified half-space contact.
+# ────────────────────────────────────────────────────────────────────────
+
+def half_space_raw(sphere: LatticeSphere, n_face: np.ndarray,
+                   t_sample: np.ndarray, delta: np.ndarray) -> float:
+    """Signed half-space overlap for one (pad sphere, target sample) pair.
+
+    ``raw = r - n_face · (q - t_sample),  q = p - delta``.
+    See contract_v2.md eq:raw.
+
+    Args:
+        sphere: pad lattice sphere (uses ``sphere.p``, ``sphere.r``).
+        n_face: target's outward unit face normal at the sample, shape (3,).
+        t_sample: target sample position [m], shape (3,).
+        delta: pad sphere displacement [m], shape (3,).
+
+    Returns:
+        Signed overlap [m]. Positive when the pad sphere center has
+        penetrated the target half-space to within distance ``r``; negative
+        when it sits outside the contact range.  Monotone-non-decreasing in
+        the penetration depth at any depth, no sign flip at face crossing.
+    """
+    q = sphere.p - delta
+    return float(sphere.r - np.dot(n_face, q - t_sample))
+
+
+def half_space_phi_eff(sphere: LatticeSphere, n_face: np.ndarray,
+                       t_sample: np.ndarray, delta: np.ndarray,
+                       *, eps: float = 0.0) -> float:
+    """Smoothed contact overlap: ``phi_eff = sigma_eps(raw)`` (eq:phi-eff)."""
+    raw = half_space_raw(sphere, n_face, t_sample, delta)
+    return smooth_relu(raw, eps)
+
+
+def half_space_gate(sphere: LatticeSphere, n_face: np.ndarray,
+                    t_sample: np.ndarray, delta: np.ndarray,
+                    *, eps: float = 0.0) -> float:
+    """Smoothed activation gate: ``gate = Sigma_eps(raw)`` (eq:gate).
+
+    Required as the chain-rule factor on every contact gradient — see
+    contract_v2.md §4 ("Why ``gate_ij`` appears in the load").
+    """
+    raw = half_space_raw(sphere, n_face, t_sample, delta)
+    return smooth_step(raw, eps)
+
+
+def half_space_force(sphere: LatticeSphere, n_face: np.ndarray,
+                     t_sample: np.ndarray, delta: np.ndarray,
+                     kc: float, *, eps: float = 0.0) -> np.ndarray:
+    """Per-pair contact term, returned as ``+∂E/∂δ`` (= physical force on q).
+
+    Under the contract_v2 convention ``q = p − δ`` (§2), the energy
+    gradient w.r.t. ``δ`` equals the physical force on the deformed
+    centre ``q`` — the two are the **same vector**::
+
+        +∂E/∂δ  =  +k_c · phi_eff · gate · n_face  =  f_phys(q)
+
+    The kernel-side "load" on ``δ`` (used by Jacobi as the negative
+    of the gradient) is the opposite sign: ``f_load = −f_phys``.
+
+    USAGE NOTE.  When summing with :func:`anchor_force` to form a
+    per-sphere residual, both functions return ``+∂E/∂δ``, so the sum
+    IS ``∂E_total/∂δ`` (gradient form, zero at equilibrium) — *not*
+    "net force on q" in the Newtonian sense.  At equilibrium under
+    the contract's convention the two are equal up to sign, but call
+    sites should be explicit about which they want.  See contract §6.5.
+
+    Both ``phi_eff`` and ``gate`` factors are present — together they
+    are the chain-rule expansion of ``∂(½ k_c · phi_eff²)/∂δ``.
+    Dropping ``gate`` is the silent-gradient bug (notes.md lesson #4).
+
+    For sub-sums over a target ``PointSetTarget`` and area + tangential
+    weight ``A_j · w_t``, see Phase 2+ in the lattice solver.
+    """
+    phi = half_space_phi_eff(sphere, n_face, t_sample, delta, eps=eps)
+    gate = half_space_gate(sphere, n_face, t_sample, delta, eps=eps)
+    return kc * phi * gate * np.asarray(n_face, dtype=np.float64)
+
+
+def half_space_energy(sphere: LatticeSphere, n_face: np.ndarray,
+                      t_sample: np.ndarray, delta: np.ndarray,
+                      kc: float, *, eps: float = 0.0) -> float:
+    """Per-pair contact energy: ``E = (1/2) k_c · phi_eff^2`` (eq:E-ij).
+
+    Single-pair primitive (``A_j = 1``, ``w_t = 1`` — the area + locality
+    weights enter at the lattice level, Phase 2+).
+    """
+    phi = half_space_phi_eff(sphere, n_face, t_sample, delta, eps=eps)
     return 0.5 * kc * phi * phi
 
 
-def total_energy(
+def equilibrium_half_space_face_on_analytical(
     sphere: LatticeSphere,
-    target: RigidTarget,
-    delta: np.ndarray,
-    kc: float,
-    *,
-    eps: float = 0.0,
-) -> float:
-    """E_total = E_anchor + E_contact.
-
-    The IDEAL quasistatic equilibrium is the minimiser of this scalar.
-    The minimum exists and is unique whenever ``k_a > 0`` (anchor
-    coercivity dominates the bounded contact term).
-    """
-    return anchor_energy(sphere, delta) + contact_energy(sphere, target, delta, kc, eps=eps)
-
-
-# ────────────────────────────────────────────────────────────────────────
-#  Solvers
-# ────────────────────────────────────────────────────────────────────────
-
-
-def equilibrium_face_on_analytical(
-    sphere: LatticeSphere,
-    target: RigidTarget,
+    n_face: np.ndarray,
+    t_sample: np.ndarray,
     kc: float,
 ) -> tuple[np.ndarray, float]:
-    """Closed-form equilibrium when the target lies on the rest normal.
+    """Closed-form equilibrium for one pad sphere vs face-on flat face.
 
-    Implements the paper's single-sphere closed form (paper IV.A and
-    derivation in cslc_main/theory's README):
+    Requires ``n_face`` anti-parallel to ``sphere.n`` (face-on geometry).
+    Implements the contract_v2 §6 series-spring law::
 
-        delta_n* = k_c * phi_rest / (k_a + k_c),     if phi_rest > 0
-        delta*   = delta_n* * n_hat
-        |F|*     = k_a * k_c * phi_rest / (k_a + k_c)
+        d         =  r - n_face · (p - t_sample)            (rest overlap)
+        delta_n*  =  k_c · d / (k_a + k_c)
+        F*        =  k_a · k_c · d / (k_a + k_c)  =  k_eff · d
+
+    Args:
+        sphere: pad sphere; the closed form requires isotropic anchor
+                in the normal direction (anisotropic ``ka_t_ratio`` is
+                irrelevant at face-on since the tangent component of
+                delta is exactly zero by symmetry).
+        n_face: target's outward face normal (must satisfy
+                ``n_face · sphere.n ≈ -1``).
+        t_sample: target sample position [m].
+        kc: contact stiffness [N/m].
 
     Returns:
-        (delta, force_magnitude).  ``delta`` is the full vec3
+        ``(delta, F_magnitude)`` where ``delta`` is the full vec3
         displacement (zero tangential component by symmetry).
-    """
-    # Sanity-check the "face-on" assumption: target must lie along the
-    # outward normal.  We don't enforce strict colinearity (numerical
-    # noise is fine) but we warn if the offset has any tangential
-    # component beyond a tight tolerance.
-    offset = target.t - sphere.p
-    offset_n = float(np.dot(offset, sphere.n))
-    offset_t = offset - offset_n * sphere.n
-    if float(np.linalg.norm(offset_t)) > 1e-9:
-        raise ValueError(
-            "equilibrium_face_on_analytical called with non-face-on geometry "
-            f"(tangential offset = {np.linalg.norm(offset_t):.3e} m). "
-            "Use equilibrium_numerical for off-axis configurations.")
 
-    phi = rest_overlap(sphere, target)
-    if phi <= 0.0:
+    Raises:
+        ValueError: if not face-on (n_face not anti-parallel to sphere.n
+                    within 1e-9 radian).
+    """
+    n_face = np.asarray(n_face, dtype=np.float64)
+    t_sample = np.asarray(t_sample, dtype=np.float64)
+
+    dot_nn = float(np.dot(n_face, sphere.n))
+    if not np.isclose(dot_nn, -1.0, atol=1e-9):
+        raise ValueError(
+            "equilibrium_half_space_face_on_analytical requires face-on "
+            f"(n_face = -sphere.n); got n_face·n = {dot_nn:.9f}. "
+            "Use equilibrium_half_space_numerical for tilted faces.")
+
+    d = half_space_raw(sphere, n_face, t_sample, np.zeros(3))
+    if d <= 0.0:
         return np.zeros(3), 0.0
-    delta_n = kc * phi / (sphere.ka + kc)
-    F = sphere.ka * kc * phi / (sphere.ka + kc)
+
+    delta_n = kc * d / (sphere.ka + kc)
+    F = sphere.ka * kc * d / (sphere.ka + kc)
+    # delta_n > 0 ⇒ pad compressed inward (q on body side of p) along
+    # sphere.n.  delta = delta_n · sphere.n.
     return delta_n * sphere.n, F
 
 
-def equilibrium_numerical(
+def equilibrium_half_space_numerical(
     sphere: LatticeSphere,
-    target: RigidTarget,
+    n_face: np.ndarray,
+    t_sample: np.ndarray,
     kc: float,
     *,
-    eps: float = 1.0e-7,
+    eps: float = 1.0e-9,
     delta0: np.ndarray | None = None,
     tol: float = 1.0e-12,
 ) -> tuple[np.ndarray, dict]:
-    """General-geometry equilibrium by minimising E_total over delta in R^3.
+    """General-geometry equilibrium: one pad sphere vs one face element.
 
-    Uses scipy's L-BFGS-B (quasi-Newton) on the smoothed energy.  We
-    smooth phi_eff with a tiny eps so the gradient is well-defined at
-    phi = 0; eps -> 0 recovers the exact hard model and shifts the
-    optimum by at most O(eps) (see paper III.G).
+    Minimises ``E_total = E_anchor + E_contact`` over delta in R^3 via
+    L-BFGS-B.  Handles anisotropic anchor (via ``sphere.ka_t_ratio``)
+    and arbitrary face orientation ``n_face``.
+
+    Gradient (gradient form per contract_v2.md §6.5)::
+
+        dE/d delta  =  anchor_force(sphere, delta)
+                       + k_c · phi_eff · gate · n_face
+
+    where ``phi_eff = sigma_eps(raw)`` and ``gate = Sigma_eps(raw)`` —
+    the ``gate`` factor is the chain-rule term required to keep the
+    gradient consistent with the smooth energy (notes.md lesson #4).
 
     Args:
-        sphere, target, kc: as elsewhere.
-        eps: smoothing width [m] for the contact potential.  Default
-            1e-7 m: ~10x tighter than the kernel default, so the smooth
-            answer is indistinguishable from the hard one at micrometre
-            precision.
-        delta0: initial guess.  Default zero.  For poorly-conditioned
-            problems (very high k_c / k_a), passing the analytical
-            face-on solution improves L-BFGS convergence.
-        tol: optimiser gradient tolerance (default 1e-12).
+        sphere: pad sphere (optionally anisotropic).
+        n_face: target's outward face normal, shape (3,).  Any
+                orientation; need NOT be anti-parallel to sphere.n.
+        t_sample: target sample position [m], shape (3,).
+        kc: contact stiffness [N/m].
+        eps: smoothing width [m].  Default 1e-9 (deep-saturated regime
+             for high-precision verification; production uses 5e-4).
+        delta0: warm start, shape (3,).  Defaults to zeros.
+        tol: L-BFGS-B ``gtol`` and ``ftol``.
 
     Returns:
-        (delta, info) where info is the scipy ``OptimizeResult`` dict.
+        ``(delta, info)`` where ``delta`` is the equilibrium displacement
+        (3,) and ``info`` is the scipy diagnostics dict.
     """
+    n_face = np.asarray(n_face, dtype=np.float64)
+    t_sample = np.asarray(t_sample, dtype=np.float64)
     if delta0 is None:
         delta0 = np.zeros(3)
+    delta0 = np.asarray(delta0, dtype=np.float64)
 
     def fun(d: np.ndarray) -> float:
-        return total_energy(sphere, target, d, kc, eps=eps)
+        return (anchor_energy(sphere, d)
+                + half_space_energy(sphere, n_face, t_sample, d, kc, eps=eps))
 
     def jac(d: np.ndarray) -> np.ndarray:
-        # dE/d delta = dE_anchor/d delta + dE_contact/d delta.
-        #
-        # E_anchor = (1/2) ka ||delta||^2:
-        #     dE_anchor/d delta = +ka * delta = anchor_force(...) by construction.
-        #
-        # E_contact = (1/2) kc * phi_eff^2  with  phi_eff = sigma_eps(raw),
-        #     raw = (r + R) - ||t - q||,    q = p - delta.
-        # Chain rule:
-        #     dE_contact/d delta = kc * phi_eff * d(phi_eff)/d delta
-        #                        = kc * phi_eff * sigma_eps'(raw) * d(raw)/d delta
-        #                        = kc * phi_eff * smooth_step(raw, eps) * e_hat,
-        # where e_hat = (q - t)/||q - t|| is the contact direction and
-        # smooth_step is the C^infinity Heaviside surrogate (derivative of
-        # sigma_eps).  Forgetting smooth_step is the silent gradient bug
-        # (see smooth_step docstring); it's invisible at raw >> eps but
-        # up to 2x wrong at raw ~ eps.
+        # dE/d delta in GRADIENT form (per contract_v2.md §6.5).  Each
+        # component is +∂E/∂δ; equilibrium sums them to zero.
         grad = anchor_force(sphere, d)
-        # Contact: emit even when phi <= 0 if eps > 0 (the smooth surrogate
-        # has a soft tail that contributes a small gradient there).
-        raw = contact_raw_overlap(sphere, target, d)
-        emit_contact = (raw > 0.0) or (eps > 0.0 and raw > -10.0 * eps)
-        if emit_contact:
-            grad = grad + (smooth_step(raw, eps)
-                           * contact_force(sphere, target, d, kc, eps=eps))
+        raw = half_space_raw(sphere, n_face, t_sample, d)
+        phi = smooth_relu(raw, eps)
+        gate = smooth_step(raw, eps)
+        # +∂E_contact/∂δ = +k_c · phi_eff · gate · n_face.  Both phi and
+        # gate are required (chain rule); forgetting gate gives 2x error
+        # at raw ~ eps (silent-gradient bug, notes.md lesson #4).
+        grad = grad + kc * phi * gate * n_face
         return grad
 
     res = minimize(
         fun, delta0, jac=jac, method="L-BFGS-B",
-        options={"gtol": tol, "ftol": tol, "maxiter": 500},
+        options={"gtol": tol, "ftol": tol, "maxiter": 2000},
     )
     info = {
         "success": bool(res.success),
@@ -545,192 +483,6 @@ def equilibrium_numerical(
         "final_grad_norm": float(np.linalg.norm(res.jac)),
         "energy": float(res.fun),
         "message": str(res.message),
-    }
-    return np.asarray(res.x, dtype=np.float64), info
-
-
-# ────────────────────────────────────────────────────────────────────────
-#  Multi-point target (step 10): pad sphere vs PointSetTarget
-#
-#  These functions mirror the single-target primitives above but sum the
-#  contact contributions over every overlapping target point.  For a
-#  point set of size M = 1 they reduce exactly to the single-sphere
-#  versions; that's the reduction test_10 scene A pins down.
-# ────────────────────────────────────────────────────────────────────────
-
-
-def point_set_raw_overlaps(
-    sphere: LatticeSphere,
-    target: PointSetTarget,
-    delta: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Per-point raw overlaps and contact directions for one pad sphere.
-
-    Vectorised version of ``contact_raw_overlap`` + ``contact_direction``
-    over all M target points:
-
-        raw_j   = (r_lat + R_j) - ||q - t_j||,    q = p - delta
-        d_hat_j = (q - t_j) / ||q - t_j||         (unit, target -> sphere)
-
-    Direction matches the single-sphere convention: contact pushes the
-    pad sphere AWAY from each target point.  At degenerate coincidence
-    (centres equal) the direction falls back to the rest outward normal
-    so callers never see NaN -- same fix as ``contact_direction``.
-
-    Returns:
-        raws:       (M,) signed overlaps [m].  Positive when the pair
-                    is geometrically overlapping; clamped through
-                    ``smooth_relu`` downstream.
-        directions: (M, 3) unit vectors from each target point to the
-                    pad sphere's deformed centre.
-    """
-    q = deformed_centre(sphere, delta)
-    diffs = q - target.positions                # (M, 3)
-    dists = np.linalg.norm(diffs, axis=1)       # (M,)
-    raws = (sphere.r + target.radii) - dists
-
-    # Avoid division by zero for any coincident centres; fall back to
-    # the sphere's own rest outward normal where dists ~ 0.  This is the
-    # vectorised analogue of contact_direction's degenerate branch.
-    safe = dists > 1.0e-15
-    inv = np.where(safe, 1.0 / np.where(safe, dists, 1.0), 0.0)
-    directions = diffs * inv[:, None]
-    if not bool(safe.all()):
-        directions = np.where(safe[:, None], directions, sphere.n[None, :])
-    return raws, directions
-
-
-def point_set_contact_energy(
-    sphere: LatticeSphere,
-    target: PointSetTarget,
-    delta: np.ndarray,
-    kc: float,
-    *,
-    eps: float = 0.0,
-) -> float:
-    """Sum of per-point Hookean contact energies.
-
-        E_contact = sum_j  (1/2) * kc * phi_eff_j^2,
-        phi_eff_j = sigma_eps(raw_j).
-
-    Reduces to ``contact_energy`` for M = 1.
-    """
-    raws, _ = point_set_raw_overlaps(sphere, target, delta)
-    if eps <= 0.0:
-        phi_effs = np.maximum(0.0, raws)
-    else:
-        phi_effs = 0.5 * (raws + np.sqrt(raws * raws + eps * eps))
-    return 0.5 * kc * float(np.sum(phi_effs * phi_effs))
-
-
-def point_set_contact_force(
-    sphere: LatticeSphere,
-    target: PointSetTarget,
-    delta: np.ndarray,
-    kc: float,
-    *,
-    eps: float = 0.0,
-) -> np.ndarray:
-    """Sum of per-point contact forces on one pad sphere.
-
-        f_contact = sum_j  kc * phi_eff_j * d_hat_j
-
-    GRADIENT WARNING.  This is the SPRING FORCE, not the gradient of the
-    contact energy when ``eps > 0``.  The energy gradient picks up the
-    smooth-step chain-rule factor at each point:
-
-        dE/d delta = sum_j  kc * phi_eff_j * smooth_step(raw_j, eps) * d_hat_j
-
-    See ``equilibrium_point_set_numerical`` for the gradient-correct
-    Jacobian (and the single-sphere ``contact_force`` docstring for the
-    silent-gradient-bug story).
-    """
-    raws, directions = point_set_raw_overlaps(sphere, target, delta)
-    if eps <= 0.0:
-        phi_effs = np.maximum(0.0, raws)
-    else:
-        phi_effs = 0.5 * (raws + np.sqrt(raws * raws + eps * eps))
-    return kc * (phi_effs[:, None] * directions).sum(axis=0)
-
-
-def total_energy_point_set(
-    sphere: LatticeSphere,
-    target: PointSetTarget,
-    delta: np.ndarray,
-    kc: float,
-    *,
-    eps: float = 0.0,
-) -> float:
-    """E_total = E_anchor + E_contact_point_set.  Minimised at equilibrium."""
-    return (anchor_energy(sphere, delta)
-            + point_set_contact_energy(sphere, target, delta, kc, eps=eps))
-
-
-def equilibrium_point_set_numerical(
-    sphere: LatticeSphere,
-    target: PointSetTarget,
-    kc: float,
-    *,
-    eps: float = 1.0e-7,
-    delta0: np.ndarray | None = None,
-    tol: float = 1.0e-12,
-) -> tuple[np.ndarray, dict]:
-    """L-BFGS-B equilibrium for one pad sphere against a PointSetTarget.
-
-    Minimises  E_anchor + sum_j  (1/2) kc phi_eff_j^2  over delta in R^3.
-    The anchor energy + each per-point contact energy is convex on its
-    own active set; the sum is strongly convex whenever ka > 0, so the
-    minimiser is unique.
-
-    Gradient (with the chain-rule ``smooth_step`` factor that is the
-    silent-gradient-bug fix from notes.md lesson #4):
-
-        dE/d delta = ka * delta + kc * sum_j  phi_eff_j * smooth_step(raw_j, eps) * d_hat_j
-
-    Args:
-        sphere, target, kc: as elsewhere.
-        eps: smoothing width [m].  1e-7 m default matches the
-             ``equilibrium_numerical`` (single-target) precision setting.
-        delta0: warm-start.  Defaults to zero.
-        tol: optimiser tolerance for ``gtol`` and ``ftol``.
-
-    Returns:
-        (delta, info).
-    """
-    if delta0 is None:
-        delta0 = np.zeros(3)
-
-    def fun(d: np.ndarray) -> float:
-        return total_energy_point_set(sphere, target, d, kc, eps=eps)
-
-    def jac(d: np.ndarray) -> np.ndarray:
-        grad = anchor_force(sphere, d)
-        raws, directions = point_set_raw_overlaps(sphere, target, d)
-        if eps <= 0.0:
-            phi_effs = np.maximum(0.0, raws)
-            steps = np.where(raws > 0.0, 1.0,
-                             np.where(raws == 0.0, 0.5, 0.0))
-        else:
-            denom = np.sqrt(raws * raws + eps * eps)
-            phi_effs = 0.5 * (raws + denom)
-            steps = 0.5 * (1.0 + raws / denom)
-        # d raw_j / d delta = +d_hat_j  (derivation in cslc_theory.py
-        # single-sphere jac() and in theory.txt eq. contact-grad).
-        contact_grad = kc * (phi_effs * steps)[:, None] * directions
-        return grad + contact_grad.sum(axis=0)
-
-    res = minimize(
-        fun, delta0, jac=jac, method="L-BFGS-B",
-        options={"gtol": tol, "ftol": tol, "maxiter": 500},
-    )
-    info = {
-        "success": bool(res.success),
-        "nit": int(res.nit),
-        "nfev": int(res.nfev),
-        "final_grad_norm": float(np.linalg.norm(res.jac)),
-        "energy": float(res.fun),
-        "message": str(res.message),
-        "M": target.M,
     }
     return np.asarray(res.x, dtype=np.float64), info
 
@@ -825,70 +577,108 @@ def friction_energy_smooth(delta_t_mag: float, f_n: float, k_stick: float,
     return M * delta_t_mag - (M * M / K) * np.log1p(K * delta_t_mag / M)
 
 
-def equilibrium_with_friction_analytical(
+
+
+# ────────────────────────────────────────────────────────────────────────
+#  Friction equilibria  (v2 contract — Phase 3)
+#
+#  Smooth stick-slip on the tangent axis (contract §6.4):
+#      f_t = K · M · s / (K · s + M),  K = k_stick, M = μ·f_n, s = |δ_t|.
+#  ``f_n`` is the half-space series-spring magnitude from
+#  ``equilibrium_half_space_face_on_analytical``.
+# ────────────────────────────────────────────────────────────────────────
+
+
+def equilibrium_half_space_friction_analytical(
     sphere: LatticeSphere,
-    target: RigidTarget,
+    n_face: np.ndarray,
+    t_sample: np.ndarray,
     kc: float,
     f_ext_tangent: np.ndarray,
     k_stick: float,
     mu: float,
 ) -> tuple[np.ndarray, dict]:
-    """Closed-form equilibrium for a face-on lattice sphere with friction.
+    """Closed-form face-on friction equilibrium for one pad sphere (v2).
 
-    Decouples normal and tangent axes (valid for isotropic anchor, face-on
-    contact, target along +n_hat).
+    The v2 successor to :func:`equilibrium_with_friction_analytical`.
+    Same physics (contract §6.4); only the ``f_n`` source changes from
+    the v1 sphere-vs-sphere overlap to the half-space form (eq:raw).
 
-    Normal: same as step 1.
-        delta_n = k_c * phi_rest / (k_a + k_c)
-        f_n     = k_a * k_c * phi_rest / (k_a + k_c)
+    Decoupled normal / tangent axes (valid for isotropic-normal anchor
+    and face-on geometry — anisotropy enters via ``ka_t = ka · ka_t_ratio``).
 
-    Tangent: stick-slip as a function of |f_ext_t|.
-        stick (|F| <= F_thresh):  s = |F| / (k_a + k_stick)
-                                  F_friction = k_stick * s
-        slip  (|F| >  F_thresh):  s = (|F| - mu * f_n) / k_a
-                                  F_friction = mu * f_n
-        F_thresh = mu * f_n * (k_a + k_stick) / k_stick
+    Normal axis (eq:phi-eff at δ=0, eq:f-anchor):
+        d         =  r - n_face · (p - t_sample)        (rest half-space overlap)
+        δ_n*      =  k_c · d / (k_a + k_c)
+        f_n       =  k_a · k_c · d / (k_a + k_c)
+
+    Tangent axis (stick-slip as a function of |F_ext|):
+        stick (|F| ≤ F_thresh):  s = |F| / (k_at + k_stick),
+                                 F_friction = k_stick · s
+        slip  (|F| >  F_thresh): s = (|F| - μ f_n) / k_at,
+                                 F_friction = μ f_n
+        F_thresh = μ f_n · (k_at + k_stick) / k_stick
+
+    Sign convention (contract §2): ``q = p - δ``, so an external force
+    F_ext along +f_hat moves q to +f_hat ⇒ δ_t = -s · f_hat.
+
+    The friction tangent frame is the **pad's** outward normal
+    ``sphere.n`` (contract §6.4), so ``f_ext_tangent`` must be
+    perpendicular to ``sphere.n`` — NOT ``n_face``.  At face-on these
+    are anti-parallel so the two perpendicular planes coincide.
+
+    Args:
+        sphere: pad sphere (anisotropic tangent via ``ka_t_ratio``).
+        n_face: target outward face normal (must satisfy
+                ``n_face · sphere.n ≈ -1``).
+        t_sample: target sample position [m].
+        kc: contact stiffness [N/m].
+        f_ext_tangent: external tangential force [N], shape (3,).
+            Perpendicular to ``sphere.n`` (raises ValueError otherwise).
+        k_stick: tangent stick spring stiffness [N/m].
+        mu: Coulomb friction coefficient.
 
     Returns:
-        (delta, info) where delta = delta_n * n_hat + delta_t * (- F / |F|).
-        Sign convention for delta_t: F is in +x_t direction, q moves in
-        +x_t direction (s > 0), so delta_t = -s * x_t_hat (since
-        delta = p - q).  info carries the regime, threshold, and force
-        magnitudes for verification.
+        ``(delta, info)`` where ``delta = δ_normal + δ_tangent`` is the
+        full 3-vector displacement and ``info`` carries ``regime``
+        (``"stick"`` / ``"slip"`` / ``"no_friction"``), ``s``,
+        ``F_friction``, ``F_thresh``, ``f_n``, ``delta_n``.
+
+    Raises:
+        ValueError: if ``n_face`` is not anti-parallel to ``sphere.n``
+                    or if ``f_ext_tangent`` has a non-trivial component
+                    along ``sphere.n``.
     """
+    f_ext_tangent = np.asarray(f_ext_tangent, dtype=np.float64)
     if f_ext_tangent.shape != (3,):
-        raise ValueError(f"f_ext_tangent must be (3,), got {f_ext_tangent.shape}")
-    # Make sure f_ext is genuinely tangential.
+        raise ValueError(
+            f"f_ext_tangent must be (3,), got {f_ext_tangent.shape}")
+    # Friction tangent frame uses sphere.n (contract §6.4).
     f_dot_n = float(np.dot(f_ext_tangent, sphere.n))
     if abs(f_dot_n) > 1e-9 * (np.linalg.norm(f_ext_tangent) + 1e-15):
         raise ValueError(
-            f"f_ext_tangent must be perpendicular to sphere.n; "
+            "f_ext_tangent must be perpendicular to sphere.n; "
             f"got |f.n| = {abs(f_dot_n):.3e}")
 
-    # Normal equilibrium (step 1).
-    delta_normal, F_normal = equilibrium_face_on_analytical(sphere, target, kc)
+    # Normal equilibrium via the v2 half-space series spring (face-on).
+    delta_normal, F_normal = equilibrium_half_space_face_on_analytical(
+        sphere, n_face, t_sample, kc)
     f_n = F_normal
 
-    # Tangent direction (unit vector along +f_ext_t; if F is zero we
-    # default to some arbitrary tangent direction).
     F_mag = float(np.linalg.norm(f_ext_tangent))
     if F_mag > 0:
         f_hat = f_ext_tangent / F_mag
     else:
-        # Pick any unit tangent.  Doesn't matter, s will be 0.
-        f_hat = np.array([1.0, 0.0, 0.0]) - sphere.n * float(np.dot(np.array([1.0, 0.0, 0.0]), sphere.n))
+        # Pick any unit tangent in the (sphere.n)-perpendicular plane;
+        # s = 0 makes the choice immaterial.
+        seed = np.array([1.0, 0.0, 0.0])
+        f_hat = seed - sphere.n * float(np.dot(seed, sphere.n))
         f_hat /= max(np.linalg.norm(f_hat), 1e-12)
 
-    # Tangent dynamics use ka_t = ka * ka_t_ratio (step 6).  Anisotropic
-    # anchor has the SAME normal stiffness ka (so f_n is unchanged) but a
-    # softer tangent stiffness ka_t.  ka_t_ratio = 1 recovers step-4.
     ka_t = sphere.ka * sphere.ka_t_ratio
 
-    # F_thresh is the |F_ext| at which stick gives way to slip:
-    #   k_stick * s = mu * f_n  with  s = F / (ka_t + k_stick).
-    # For k_stick = 0 there IS no stick spring, so the system has no
-    # slip threshold (anchor alone resists) -- F_thresh = +inf and the
-    # regime is "no_friction".  Mirrors the test-helper convention.
+    # Threshold: k_stick·s = μ·f_n at  s = F_thresh / (ka_t + k_stick).
+    # k_stick = 0 ⇒ no stick spring ⇒ no slip threshold (anchor alone resists).
     if k_stick > 0.0 and mu > 0.0:
         F_thresh = mu * f_n * (ka_t + k_stick) / k_stick
     else:
@@ -896,7 +686,7 @@ def equilibrium_with_friction_analytical(
 
     if k_stick <= 0.0 or mu <= 0.0:
         regime = "no_friction"
-        s = F_mag / ka_t
+        s = F_mag / ka_t if ka_t > 0.0 else 0.0
         F_friction = 0.0
     elif F_mag <= F_thresh:
         regime = "stick"
@@ -907,7 +697,6 @@ def equilibrium_with_friction_analytical(
         s = (F_mag - mu * f_n) / ka_t
         F_friction = mu * f_n
 
-    # delta_t = -s * f_hat (since q moves in +f_hat direction, delta = p - q).
     delta_tangent = -s * f_hat
     delta = delta_normal + delta_tangent
 
@@ -922,53 +711,50 @@ def equilibrium_with_friction_analytical(
     return delta, info
 
 
-def equilibrium_with_friction_hard_numerical(
+def equilibrium_half_space_friction_hard_numerical(
     sphere: LatticeSphere,
-    target: RigidTarget,
+    n_face: np.ndarray,
+    t_sample: np.ndarray,
     kc: float,
     f_ext_tangent: np.ndarray,
     k_stick: float,
     mu: float,
 ) -> tuple[np.ndarray, dict]:
-    """Numerical reference using the HARD piecewise friction law.
+    """Numerical reference using the HARD piecewise friction law (v2).
 
-    Decouples the normal axis (analytical, step 1) from the tangent axis
-    (1D scipy.optimize.minimize_scalar on the hard piecewise energy).
-    Independent code path from equilibrium_with_friction_analytical, so
-    agreement between the two is a real verification.
+    The v2 successor to :func:`equilibrium_with_friction_hard_numerical`.
+    Independent code path from
+    :func:`equilibrium_half_space_friction_analytical` — agreement
+    between the two is the real verification.
 
-    The 1D tangent energy:
+    Decouples normal axis (half-space analytical) from tangent axis
+    (1-D ``scipy.optimize.minimize_scalar`` on the hard piecewise
+    tangent energy).  Tangent energy::
 
-        E(s) = (1/2) k_a s^2
+        E(s) = (1/2) k_at s²
              + E_friction(s)
-             - F * s
+             - |F_ext| · s
 
-        E_friction(s) = (1/2) k_stick s^2,                  if s <= s_thresh
-                      = (1/2) k_stick s_thresh^2
-                        + mu * f_n * (s - s_thresh),         if s > s_thresh
-
-    The break point s_thresh = mu * f_n / k_stick.  Force law is
-    continuous; energy is continuous and C^1.
+        E_friction(s) = (1/2) k_stick s²,                  s ≤ s_thresh
+                      = (1/2) k_stick s_thresh²
+                        + μ f_n (s - s_thresh),             s > s_thresh
     """
     from scipy.optimize import minimize_scalar
 
-    # Normal equilibrium (decoupled, step 1).
-    delta_normal, F_normal = equilibrium_face_on_analytical(sphere, target, kc)
+    delta_normal, F_normal = equilibrium_half_space_face_on_analytical(
+        sphere, n_face, t_sample, kc)
     f_n = F_normal
 
     F_mag = float(np.linalg.norm(f_ext_tangent))
     if F_mag > 0:
-        f_hat = f_ext_tangent / F_mag
+        f_hat = np.asarray(f_ext_tangent, dtype=np.float64) / F_mag
     else:
         f_hat = np.array([1.0, 0.0, 0.0])
 
-    # Step 6: anisotropic anchor.  Tangent stiffness is ka_t = ka * ka_t_ratio
-    # (ka_t_ratio = 1 recovers step-4 isotropic behaviour).
     ka_t = sphere.ka * sphere.ka_t_ratio
 
     if k_stick <= 0.0 or mu <= 0.0:
-        # No friction; pure tangent-anchor balance.
-        s_opt = F_mag / ka_t
+        s_opt = F_mag / ka_t if ka_t > 0.0 else 0.0
         regime = "no_friction"
         F_friction = 0.0
     else:
@@ -983,8 +769,6 @@ def equilibrium_with_friction_hard_numerical(
                           + mu * f_n * (s - s_thresh))
             return E_anc + E_fric - F_mag * s
 
-        # Upper bracket: pick a generous bound that comfortably contains
-        # the slip-regime minimum.
         upper = max(3.0 * (F_mag + mu * f_n) / max(ka_t, 1e-30), 1e-3)
         res = minimize_scalar(E, bounds=(0.0, upper), method="bounded",
                               options={"xatol": 1e-15})
@@ -994,7 +778,6 @@ def equilibrium_with_friction_hard_numerical(
 
     delta_tangent = -s_opt * f_hat
     delta = delta_normal + delta_tangent
-
     info = {
         "regime": regime,
         "s": s_opt,
@@ -1004,9 +787,10 @@ def equilibrium_with_friction_hard_numerical(
     return delta, info
 
 
-def equilibrium_with_friction_smooth_numerical(
+def equilibrium_half_space_friction_smooth_numerical(
     sphere: LatticeSphere,
-    target: RigidTarget,
+    n_face: np.ndarray,
+    t_sample: np.ndarray,
     kc: float,
     f_ext_tangent: np.ndarray,
     k_stick: float,
@@ -1014,72 +798,105 @@ def equilibrium_with_friction_smooth_numerical(
     *,
     eps_contact: float = 1.0e-9,
     eps_friction: float = 1.0e-12,
+    f_n_override: float | None = None,
     delta0: np.ndarray | None = None,
     tol: float = 1.0e-12,
 ) -> tuple[np.ndarray, dict]:
-    """Numerical L-BFGS-B equilibrium with smooth contact + smooth friction.
+    """L-BFGS-B equilibrium with smooth contact + smooth friction (v2).
+
+    The v2 successor to :func:`equilibrium_with_friction_smooth_numerical`.
+    Replaces v1 sphere-vs-sphere contact energy/gradient with v2
+    half-space contact (contract eq:raw); the smooth friction surrogate
+    (eq:friction-energy / contract §6.4) is unchanged.
 
     Minimises::
 
-        E_total(delta) =
-              (1/2) k_a ||delta||^2                         (anchor, isotropic)
-            + (1/2) k_c sigma_eps(phi_rest - dot(delta, n))^2  (contact)
-            + E_friction(||delta_t||; f_n_quasi)              (friction)
-            - dot(f_ext_tangent, delta)                       (external work)
+        E_total(δ) = anchor_energy(sphere, δ)                    (anisotropic)
+                   + half_space_energy(sphere, n_face, t_sample, δ, kc)
+                   + friction_energy_smooth(|δ_t|; f_n, k_stick, μ)
+                   + f_ext_tangent · δ                            (external pot.)
 
-    The friction f_n is taken from the quasi-static normal equilibrium of
-    step 1 (decoupled from tangent for isotropic anchor + face-on
-    contact).  This decoupling holds exactly in the analytic limit; the
-    smooth contact makes the gradient C^infinity but f_n stays anchored
-    to the analytic value within smoothing epsilon.
+    The friction ``f_n`` is **frozen** at the value from the analytic
+    face-on normal equilibrium and held constant during optimisation
+    (i.e. ``f_n`` is not re-evaluated as δ changes).  This is the
+    quasi-static normal/tangent decoupling approximation — exact for
+    face-on geometry (where δ_n at convergence matches the analytic
+    value to smoothing precision), but it **underrates the coupling
+    on tilted faces** where the true f_n drifts with δ_n.  All
+    Phase-3 tests use face-on; this caveat is load-bearing for Phase
+    4+ scenes that mix friction with tilted contact.
 
-    Returns:
-        (delta, info) with optimisation diagnostics.
+    Args:
+        eps_contact: smoothing width [m] for the half-space surrogate.
+                     Default 1e-9 (deep-saturated regime for theory-
+                     grade precision; production kernel uses 5e-4).
+        eps_friction: API parity with v1 / kernel; ignored by the smooth
+                      friction law (the antiderivative is exact).
+        f_n_override: if not None, use this value as ``f_n`` in the
+                friction surrogate instead of the analytical
+                face-on value.  **Phase 4 bridge-side hook.**  The
+                kernel computes f_n LIVE (= ``|F_contact · n̂_pad|``
+                at the current iterate, contract §6.4) while this
+                primitive defaults to the analytical face-on value
+                (for the Phase 3 hard-law decoupling).  At theory-
+                grade ``eps_contact = 1e-9`` the two agree to
+                smoothing precision (matches Phase 3 T-I); at
+                production ``eps_contact = 5e-4`` the smooth
+                equilibrium δ_n drifts ~15-20% from analytical and
+                f_n drifts proportionally.  For bridge parity pass
+                ``f_n_override = ka·|δ_n_smooth|`` from the
+                normal-only :func:`cslc_lattice.solve_lattice_contact`
+                run at the same eps.  See contract §17 finding #12.
+        delta0: warm start.  None ⇒ falls back to the analytical
+                solution — strongly recommended for slip regimes where
+                the F = F_thresh kink in the hard limit gives L-BFGS-B
+                a hard line search at random starts.
+        tol: L-BFGS-B ``gtol`` / ``ftol``.
     """
-    # Pre-compute f_n from the (face-on) normal equilibrium.
-    _, f_n = equilibrium_face_on_analytical(sphere, target, kc)
+    n_face_arr = np.asarray(n_face, dtype=np.float64)
+    t_sample_arr = np.asarray(t_sample, dtype=np.float64)
+    f_ext_arr = np.asarray(f_ext_tangent, dtype=np.float64)
+
+    if f_n_override is None:
+        # f_n from the half-space normal equilibrium (decoupled).
+        _, f_n = equilibrium_half_space_face_on_analytical(
+            sphere, n_face_arr, t_sample_arr, kc)
+    else:
+        f_n = float(f_n_override)
 
     if delta0 is None:
-        delta_ana, _ = equilibrium_with_friction_analytical(
-            sphere, target, kc, f_ext_tangent, k_stick, mu)
+        delta_ana, _ = equilibrium_half_space_friction_analytical(
+            sphere, n_face_arr, t_sample_arr, kc, f_ext_arr, k_stick, mu)
         delta0 = delta_ana.copy()
+    delta0 = np.asarray(delta0, dtype=np.float64)
 
     def fun(d: np.ndarray) -> float:
         E_a = anchor_energy(sphere, d)
-        E_c = contact_energy(sphere, target, d, kc, eps=eps_contact)
-        # Tangent decomposition.
+        E_c = half_space_energy(sphere, n_face_arr, t_sample_arr, d, kc,
+                                eps=eps_contact)
         d_n = float(np.dot(d, sphere.n))
         d_t = d - d_n * sphere.n
         d_t_mag = float(np.linalg.norm(d_t))
-        E_f = friction_energy_smooth(d_t_mag, f_n, k_stick, mu, eps=eps_friction)
-        # External potential.  With q = p - delta the displacement of q
-        # from rest is (q - p) = -delta, so work done by an external
-        # force f_ext on q is W = f_ext . (-delta) = -f_ext.delta and
-        # the external potential is V_ext = -W = +f_ext.delta.  The
-        # previous code used  E_ext = -f_ext.delta  (a sign error that
-        # propagated to a flipped delta_t in stick mode; magnitude was
-        # right but direction was wrong, only invisible because the
-        # test pass criteria checked |delta_t|, not the vector).
-        E_ext = +float(np.dot(f_ext_tangent, d))
+        E_f = friction_energy_smooth(d_t_mag, f_n, k_stick, mu,
+                                     eps=eps_friction)
+        # External potential.  q = p - δ ⇒ work by f_ext on q is
+        #   W = f_ext · (q - p) = -f_ext · δ;  V_ext = -W = +f_ext · δ.
+        # Same sign-convention fix as the v1 smooth solver (see v1
+        # docstring comment).
+        E_ext = +float(np.dot(f_ext_arr, d))
         return E_a + E_c + E_f + E_ext
 
     def jac(d: np.ndarray) -> np.ndarray:
-        # Anchor.  Use anchor_force() so the anisotropic ka_t_ratio path
-        # in step 6 is consistent with anchor_energy() in fun(); writing
-        # `sphere.ka * d` here would be isotropic and would silently
-        # disagree with the energy for ka_t_ratio != 1.
         g = anchor_force(sphere, d)
-        # Contact (face-on, smooth).
-        #   dE_contact/d delta = kc * phi_eff * smooth_step(raw, eps) * e_hat,
-        # where e_hat = (q - t)/||q - t||.  For face-on contact (target
-        # along +n_hat, sphere compressed inward) e_hat = -n_hat exactly.
-        # Without smooth_step, the gradient is wrong by up to 2x at
-        # raw ~ eps -- the silent contact-gradient bug.
-        raw = contact_raw_overlap(sphere, target, d)
-        if (raw > 0.0) or (eps_contact > 0.0 and raw > -10.0 * eps_contact):
-            phi = effective_penetration(sphere, target, d, eps=eps_contact)
-            step = smooth_step(raw, eps_contact)
-            g = g - kc * phi * step * sphere.n
+        # Half-space contact gradient (contract §4):
+        #   ∂E_c/∂δ = +k_c · phi_eff · gate · n_face
+        # phi_eff = σ_ε(raw); gate = Σ_ε(raw) — both are required (chain
+        # rule).  Forgetting ``gate`` is the silent-gradient bug from
+        # notes.md lesson #4.
+        raw = half_space_raw(sphere, n_face_arr, t_sample_arr, d)
+        phi = smooth_relu(raw, eps_contact)
+        gate = smooth_step(raw, eps_contact)
+        g = g + kc * phi * gate * n_face_arr
         # Friction.
         d_n = float(np.dot(d, sphere.n))
         d_t = d - d_n * sphere.n
@@ -1087,12 +904,9 @@ def equilibrium_with_friction_smooth_numerical(
         if d_t_mag > 1e-15:
             F_fric = friction_force_smooth(d_t_mag, f_n, k_stick, mu,
                                            eps=eps_friction)
-            # Friction force magnitude is dE_f / d(d_t_mag) at the smoothed
-            # form (by construction of friction_energy_smooth).  Gradient
-            # contribution: dE_f / d delta = (dE_f/d|d_t|) · (d_t / |d_t|).
             g = g + F_fric * (d_t / d_t_mag)
-        # External.  V_ext = +f_ext . delta  =>  grad = +f_ext (see fun()).
-        g = g + f_ext_tangent
+        # External: V_ext = +f_ext·δ ⇒ grad = +f_ext.
+        g = g + f_ext_arr
         return g
 
     res = minimize(
@@ -1110,83 +924,32 @@ def equilibrium_with_friction_smooth_numerical(
     }
     return np.asarray(res.x, dtype=np.float64), info
 
-
-# ────────────────────────────────────────────────────────────────────────
-#  Kernel-style law (for comparison only)
-# ────────────────────────────────────────────────────────────────────────
-
-
-def kernel_contact_force_n_axis(
-    sphere: LatticeSphere,
-    target: RigidTarget,
-    delta: np.ndarray,
-    kc: float,
-    *,
-    eps: float = 1.0e-5,
-) -> float:
-    """The kernel's contact-force n-axis component (for comparison).
-
-    Reimplements ``jacobi_step``'s ``f_contact = kc * phi_rest * gate``
-    (line ~466 of newton/_src/geometry/cslc_kernels.py).  Returns the
-    component along ``sphere.n`` so you can plot it against the ideal
-    spring law.
-
-    This is NOT used by the solvers in this file -- it's a witness
-    function, kept here so the test scripts can plot kernel vs ideal on
-    the same axes.
-    """
-    phi_rest = rest_overlap(sphere, target)
-    if phi_rest <= 0.0 and eps <= 0.0:
-        return 0.0
-    # n_eff in the kernel is the LINE OF CENTRES FROM REST: (t - p)/||t - p||.
-    diff_rest = target.t - sphere.p
-    dist_rest = float(np.linalg.norm(diff_rest))
-    if dist_rest < 1e-15:
-        n_eff = sphere.n.copy()
-    else:
-        n_eff = diff_rest / dist_rest
-    delta_proj = float(np.dot(delta, n_eff))
-    eff_pen = phi_rest - delta_proj
-    if eps > 0.0:
-        gate = 0.5 * (1.0 + eff_pen / np.sqrt(eff_pen * eff_pen + eps * eps))
-    else:
-        gate = 1.0 if eff_pen > 0.0 else 0.0
-    # Kernel writes f_contact = kc * phi_rest * gate * n_eff.  Force
-    # FROM target TO sphere is -n_eff (since n_eff points TOWARD target
-    # from rest).  But the kernel's force has the OPPOSITE sign in its
-    # contribution to the equilibrium -- it's applied as a load on the
-    # sphere.  See cslc_kernels.py:466.  Returning the magnitude along
-    # the n-axis here keeps the sign aligned with the ideal model's
-    # n-axis force for comparison plotting.
-    return kc * phi_rest * gate
-
-
 __all__ = [
+    # Active-set + alignment constants (literal-discipline with kernel).
     "INACTIVE_RAW_EPS_FACTOR",
     "INCLUSION_FACTOR",
+    "EPS_ALIGN_DEFAULT",
+    # Lattice primitive.
     "LatticeSphere",
-    "RigidTarget",
-    "PointSetTarget",
+    # Geometry helpers.
     "deformed_centre",
-    "rest_overlap",
-    "effective_penetration",
-    "contact_direction",
+    "smooth_step",
+    "smooth_relu",
+    # Anchor (contract §6.1).
     "anchor_force",
-    "contact_force",
     "anchor_energy",
-    "contact_energy",
-    "total_energy",
-    "equilibrium_face_on_analytical",
-    "equilibrium_numerical",
-    "point_set_raw_overlaps",
-    "point_set_contact_energy",
-    "point_set_contact_force",
-    "total_energy_point_set",
-    "equilibrium_point_set_numerical",
+    # Half-space contact primitives (contract §3-4).
+    "half_space_raw",
+    "half_space_phi_eff",
+    "half_space_gate",
+    "half_space_force",
+    "half_space_energy",
+    "equilibrium_half_space_face_on_analytical",
+    "equilibrium_half_space_numerical",
+    # Friction (contract §6.4).
     "friction_force_smooth",
     "friction_energy_smooth",
-    "equilibrium_with_friction_analytical",
-    "equilibrium_with_friction_hard_numerical",
-    "equilibrium_with_friction_smooth_numerical",
-    "kernel_contact_force_n_axis",
+    "equilibrium_half_space_friction_analytical",
+    "equilibrium_half_space_friction_hard_numerical",
+    "equilibrium_half_space_friction_smooth_numerical",
 ]

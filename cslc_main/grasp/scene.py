@@ -161,7 +161,20 @@ def build_scene(config: GraspConfig) -> SceneArtifacts:
 
     # ── 4. ModelBuilder: ground, both pad arms, held object. ──
     b = newton.ModelBuilder()
-    ground_shape = b.add_ground_plane()
+    # Ground plane uses a STIFF contact spring so the held object settles
+    # at its analytic ``settled_z_center`` without measurable ground
+    # penetration.  With the default soft ke (≤ material.ke_target_physical
+    # ≈ 500 N/m via series composition), a 0.5 N ball compresses the
+    # ground by ~2.8 mm; that ground-compression equilibrium is broken
+    # when LIFT begins, releasing stored elastic energy that shoots the
+    # ball upward (max_z ≈ 7-11 cm in the regressed sphere/box runs).
+    # ke = 1e6 keeps pen < 0.5 µm at ball weight while staying well
+    # within MuJoCo's solref-stable regime.  mu = 0.5 matches the
+    # material's default for symmetric ball/box-vs-ground friction.
+    ground_cfg = newton.ModelBuilder.ShapeConfig(
+        ke=1.0e6, kd=1.0e3, kf=100.0, mu=0.5,
+    )
+    ground_shape = b.add_ground_plane(cfg=ground_cfg)
 
     ghost_cfg = newton.ModelBuilder.ShapeConfig(
         has_shape_collision=False, has_particle_collision=False, density=0.0
@@ -177,17 +190,25 @@ def build_scene(config: GraspConfig) -> SceneArtifacts:
         + _pad_thickness(config)
         + config.pad.approach_gap
     )
-    # Pad body z: explicit override, or auto-derive.  See
-    # PadParams.pad_center_z for the auto logic.  Box pads need to
-    # clear the ground (their box_hz extends below the body centre),
-    # so the auto value lifts the body so the bottom of the pad is
-    # 5 mm above z=0.  Dome pads are short -- they sit on the
-    # object's settled vertical centre (``settled_z_center``).
+    # Pad body z: explicit override, or auto-derive.  GENERAL CONVENTION
+    # (any object kind, any pad kind): align the pad's body centre with
+    # the object's settled COM (``settled_z_center``).  This puts the
+    # pad lattice ``contact face`` symmetric around the object's
+    # vertical centroid, so the integrated contact normal is purely
+    # horizontal at static equilibrium (sphere samples above and below
+    # the object equator contribute equal-magnitude opposing vertical
+    # force components, which cancel).  Without this alignment — e.g.
+    # the previous ``max(settled_z_center, box_hz + 0.005)`` formula
+    # that lifted box pads above the object centre for short objects —
+    # the pad sees the object on one side, contact normals tilt
+    # upward, and SQUEEZE applies a net upward force that visibly
+    # launches the held object until the geometry self-corrects (the
+    # object rises until pad and object centres re-align).  For a tall
+    # object (settled_z_center > box_hz), the previous formula already
+    # picked settled_z_center, so this change is a no-op there.
     if config.pad.pad_center_z is not None:
         spawn_z = config.pad.pad_center_z
-    elif config.pad.kind == "box":
-        spawn_z = max(config.object.settled_z_center, config.pad.box_hz + 0.005)
-    else:  # dome / dome_param -- centre apex on the object's equator
+    else:
         spawn_z = config.object.settled_z_center
 
     pad_body_indices: dict[str, int] = {}
@@ -218,6 +239,20 @@ def build_scene(config: GraspConfig) -> SceneArtifacts:
         pad_shape_indices[side] = len(b.shape_type) - 1
         # Light sanity check that the index is what we expect.
         assert len(b.shape_type) - before_shapes == 2
+
+        # Filter pad-mesh vs ground.  With the pad-aligned-to-object
+        # convention above, a short object (e.g. tennis ball, COM at
+        # z = 33.5 mm) drives the pad body centre below ``box_hz + 0.005``
+        # and the box-pad's bottom face dips ~6 mm below the ground
+        # plane.  Without this filter the ground would push the pad
+        # mesh upward (one of the bugs that previously appeared as a
+        # "pad floating away" visual).  The grasp pipeline already
+        # filters the invisible slider's ground collision; this adds
+        # the same exemption to the visible pad mesh shape.
+        if ground_shape is not None:
+            b.add_shape_collision_filter_pair(
+                pad_shape_indices[side], ground_shape,
+            )
 
         pad_body_indices[side] = pad_body
         pad_joints.extend([j_x, j_z])
@@ -277,6 +312,20 @@ def build_scene(config: GraspConfig) -> SceneArtifacts:
         # Per-scene kc recalibration so each pad's aggregate stiffness
         # matches ke_bulk under the expected contact fraction.
         contact_models.recalibrate_kc_per_pad(model, config.cslc.contact_fraction)
+
+    elif config.contact_model == "hydro":
+        # Pre-construct the collision pipeline with
+        # ``HydroelasticSDF.Config(output_contact_surface=True)`` so the
+        # viewer can render the contact isosurface (Newton's hydro
+        # contact-surface kernel path is only compiled in when this
+        # flag is set at pipeline construction time; flipping it later
+        # is a no-op).  See example_robot_panda_hydro.py.
+        from newton import CollisionPipeline
+        from newton._src.geometry.sdf_hydroelastic import HydroelasticSDF
+        sdf_cfg = HydroelasticSDF.Config(output_contact_surface=True)
+        model._collision_pipeline = CollisionPipeline(
+            model, sdf_hydroelastic_config=sdf_cfg,
+        )
 
     return SceneArtifacts(
         model=model,

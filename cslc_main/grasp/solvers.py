@@ -89,7 +89,14 @@ def make_solver(model, params: SolverParams):
 
     iterations = params.iterations
     if iterations is None:
-        iterations = 100 if has_cslc else 20
+        # 30 (down from 100) was tuned alongside the emission gate
+        # tightening (raw >= 0 cull in write_cslc_contacts) — with the
+        # cull, the active MuJoCo constraint count at HOLD is ~1k
+        # instead of ~5k, so CG converges faster and 30 iterations is
+        # ample.  100 was over-provisioned for the pre-cull constraint
+        # set.  Raise back to 100 if you see grasp drift or constraint
+        # residual.
+        iterations = 30 if has_cslc else 20
 
     return SolverMuJoCo(
         model,

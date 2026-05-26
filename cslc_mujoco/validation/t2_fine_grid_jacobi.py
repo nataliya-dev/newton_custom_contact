@@ -57,7 +57,7 @@ def _disable_a_inv(model, n_iter_override: int) -> None:
 
     Mutates the handler's cslc_data so the next launch() falls through
     the ``if data.A_inv is not None`` branch in
-    `_launch_vs_sphere`.  Also bumps n_iter — at strong kl the
+    :meth:`CSLCHandler._launch`.  Also bumps n_iter — at strong kl the
     Jacobi spectral radius approaches 1 and the 40-iteration default
     under-converges by ~50%.
     """

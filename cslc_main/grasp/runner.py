@@ -27,7 +27,13 @@ from .metrics import Metrics
 from .params import GraspConfig
 from .scene import SceneArtifacts, build_scene
 from .solvers import make_solver
-from .visualization import LatticeRenderer, StatsPanel, save_lattice_preview, save_postsim_plots
+from .visualization import (
+    LatticeRenderer,
+    StatsPanel,
+    TargetPointsRenderer,
+    save_lattice_preview,
+    save_postsim_plots,
+)
 
 
 # ── Wrench instrumentation ─────────────────────────────────────────────
@@ -69,11 +75,37 @@ def _simulate_one_step(
     config: GraspConfig,
     dof_map: dict[str, int],
 ) -> tuple[Any, Any, float, float]:
-    """Advance the simulation by one ``dt`` and return ``(state_a, state_b, dx, dz)``."""
+    """Advance the simulation by one ``dt`` and return ``(state_a, state_b, dx, dz)``.
+
+    When CSLC auto-tune is enabled (default), recompute ``kc`` after
+    the step from the freshly-emitted active count.  The updated kc
+    takes effect on the NEXT step's ``model.collide()``; the EMA
+    smooths transients across the step boundary.
+    """
     dx, dz = trajectory.set_pad_targets(control, step, config, dof_map)
     state_0.clear_forces()
     model.collide(state_0, contacts)
     solver.step(state_0, state_1, control, contacts, config.timing.dt)
+
+    if (config.contact_model == "cslc"
+            and config.cslc.auto_tune_contact_fraction):
+        from .contact_models import auto_tune_kc_per_step
+        cs = read_cslc_state(model)
+        if cs is not None:
+            # Use the strict (pen > eps) count: ``n_active`` includes
+            # the smooth_relu tail and overcounts by ~10x during
+            # APPROACH, biasing the EMA toward cf~0.4 even before
+            # contact engages.  ``n_active_strict`` is the count of
+            # spheres with confidently-positive raw -- the right signal
+            # for the calibration N_contact_per_pad.
+            auto_tune_kc_per_step(
+                model,
+                int(cs.get("n_active_strict", cs["n_active"])),
+                int(cs["n_surface"]),
+                ema_alpha=config.cslc.contact_fraction_ema_alpha,
+                cf_init=config.cslc.contact_fraction,
+            )
+
     return state_1, state_0, dx, dz
 
 
@@ -129,6 +161,12 @@ def run_headless(config: GraspConfig) -> Metrics:
     wp.synchronize()
 
     t0 = time.perf_counter()
+    # Per-window timing: ms/step over the last `print_every` steps.
+    # Wall-clock between print boundaries divided by the step count;
+    # picks up real per-step cost variation across phases (APPROACH
+    # has no contacts, HOLD has full contact load).
+    print_every = 200
+    t_window_start = time.perf_counter()
     for step in range(config.total_steps):
         state_0, state_1, dx, dz = _simulate_one_step(
             model, solver, control, contacts,
@@ -154,17 +192,23 @@ def run_headless(config: GraspConfig) -> Metrics:
         )
         metrics.contacts.append(n_contacts)
 
-        if (step + 1) % 200 == 0 or step == config.total_steps - 1:
+        if (step + 1) % print_every == 0 or step == config.total_steps - 1:
             extra = ""
             if cslc_state is not None:
                 extra = (
                     f"  cslc={cslc_state['n_active']}/{cslc_state['n_surface']}  "
                     f"max_δ={cslc_state['max_delta_mm']:.2f}mm"
                 )
+            wp.synchronize()  # one sync per print, so per-window ms reflects GPU work
+            now = time.perf_counter()
+            window_steps = (((step + 1) % print_every) or print_every)
+            window_ms = 1000.0 * (now - t_window_start) / window_steps
+            t_window_start = now
             print(
                 f"  step={step + 1:5d}/{config.total_steps}  "
                 f"[{phase:8s}]  obj_z={obj_xyz[2]:+.5f}  "
-                f"pad_z={left_pad_z:+.4f}  n={n_contacts}{extra}"
+                f"pad_z={left_pad_z:+.4f}  n={n_contacts}{extra}  "
+                f"({window_ms:.2f} ms/step)"
             )
 
     wall = time.perf_counter() - t0
@@ -236,6 +280,7 @@ class Example:
         self.last_object_z = config.object.start_z
 
         self.lattice = LatticeRenderer(self.model, self.viewer)
+        self.target_points = TargetPointsRenderer(self.model, self.viewer)
         self.stats = StatsPanel(config)
         self.viewer.set_model(self.model)
         self.viewer.set_camera(
@@ -243,6 +288,13 @@ class Example:
             pitch=-15.0,
             yaw=135.0,
         )
+        # Enable hydroelastic contact-surface rendering when the viewer
+        # supports it AND the scene built the pipeline with
+        # ``output_contact_surface=True`` (see scene.py hydro branch).
+        # Safe to set unconditionally — viewer ignores it when the
+        # kernels weren't compiled with the surface-output path.
+        if config.contact_model == "hydro" and hasattr(self.viewer, "renderer"):
+            self.viewer.show_hydro_contact_surface = True
 
     def simulate(self) -> None:
         for _ in range(self.sim_substeps):
@@ -285,6 +337,7 @@ class Example:
         self.viewer.log_state(self.state_0)
         self.viewer.log_contacts(self.contacts, self.state_0)
         self.lattice.update(self.state_0)
+        self.target_points.update(self.state_0)
         self.viewer.end_frame()
 
     def gui(self, ui) -> None:

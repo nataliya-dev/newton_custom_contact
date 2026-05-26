@@ -133,6 +133,22 @@ class LatticeRenderer:
         self.mats = np.tile([0.5, 0.3, 0.0, 0.0], (n, 1)).astype(np.float32)
         self.enabled = True
 
+    # Engagement cutoff: any |delta_n| below this is treated as rest
+    # (gray).  10 µm is well below the meaningful CSLC operating depth
+    # (~0.1-1 mm at silicone calibration) but well above the bounded
+    # GPU-non-determinism noise floor (<<1 µm).  Old code used 10 nm
+    # which is below the noise floor and caused spurious red coloring
+    # before contact engagement.
+    ENGAGED_THRESHOLD_M = 1.0e-5  # 10 µm
+    # Color-intensity reference scale.  Old code normalised against the
+    # per-frame MAX |delta_n|, which made tiny deltas saturate to full
+    # red when no real contact was happening AND made the color of any
+    # given sphere flicker frame-to-frame depending on which OTHER
+    # sphere happened to have the largest delta.  Fixed 1 mm scale ≈
+    # the typical operating depth so red intensity is physically
+    # interpretable.
+    INTENSITY_REFERENCE_M = 1.0e-3  # 1 mm
+
     def update(self, state) -> None:
         if not self.enabled:
             return
@@ -142,17 +158,27 @@ class LatticeRenderer:
         pw, dl_scalar, _radii, surface_mask = viz
 
         idx = 0
-        max_dl = max(float(np.max(np.abs(dl_scalar))), 1e-6)
         for i in range(len(dl_scalar)):
             if surface_mask[i] == 0 or idx >= self.n:
                 continue
             self.xforms[idx, :3] = pw[i]
-            t = min(abs(dl_scalar[i]) / max_dl, 1.0)
-            # Red = compressed, gray = uncompressed.  Bulging (dl < 0)
-            # treated as compression magnitude for now.
-            if dl_scalar[i] > 1e-8:
+            d = float(dl_scalar[i])
+            if d > self.ENGAGED_THRESHOLD_M:
+                # Compressed inward (engaged).  Red intensity scales
+                # against a FIXED reference depth (1 mm), so values are
+                # physically comparable frame-to-frame and pad-to-pad.
+                t = min(d / self.INTENSITY_REFERENCE_M, 1.0)
                 self.colors[idx] = [t, 0.2 * (1.0 - t), 1.0 - t]
+            elif d < -self.ENGAGED_THRESHOLD_M:
+                # Bulging outward — geometric Poisson signature of the
+                # distance-preserving lateral spring at the patch
+                # perimeter (theory step 5, notes.md §5).  Cyan so it's
+                # visually distinct from both compressed (red) and at-
+                # rest (gray).  Real CSLC characteristic worth seeing.
+                t = min(-d / self.INTENSITY_REFERENCE_M, 1.0)
+                self.colors[idx] = [0.0, 0.5 + 0.5 * t, 0.5 + 0.5 * t]
             else:
+                # At rest (within ±10 µm of the rest position).
                 self.colors[idx] = [0.3, 0.3, 0.35]
             idx += 1
         if idx == 0:
@@ -165,6 +191,173 @@ class LatticeRenderer:
             wp.array(self.xforms[:idx], dtype=wp.transform),
             wp.array(self.colors[:idx], dtype=wp.vec3),
             wp.array(self.mats[:idx], dtype=wp.vec4),
+        )
+
+
+class TargetPointsRenderer:
+    """Visualises the CSLC box-target (point-set) sample points.
+
+    Under the Phase 5 v2 unified path, the CSLC kernels iterate per
+    pad sphere over every target point sampled on the held object's
+    approach faces.  This viewer overlay logs those target points as
+    small grey spheres so the user can see the sampling density the
+    kernel is grinding against.  Cost: one ``viewer.log_shapes`` call
+    per frame with N_target transforms; cheap relative to the
+    simulation step.
+
+    No-op when no CSLC handler is attached or no pair has populated
+    target arrays.
+    """
+
+    def __init__(self, model, viewer):
+        self.model = model
+        self.viewer = viewer
+        self.enabled = False
+        pipeline = getattr(model, "_collision_pipeline", None)
+        handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
+        if handler is None:
+            return
+        self.handler = handler
+        # Collect all (pair, positions_local, normals_local, body_idx,
+        # cslc_shape) for each CSLC pair.  Concatenate across pairs so
+        # we render with a single log_shapes call.  The v2 unified
+        # path has no per-target radii -- use the pad lattice's mean
+        # sphere radius (halved) as the rendered point size.
+        pair_data = []
+        for pair in getattr(handler, "shape_pairs", []):
+            if pair.target_positions_local is None:
+                continue
+            pos = pair.target_positions_local.numpy().astype(np.float32)
+            normals = pair.target_normals_local.numpy().astype(np.float32)
+            pair_data.append({
+                "pos_local": pos,
+                "normals_local": normals,
+                "body_idx": int(pair.other_body),
+                "cslc_shape": int(pair.cslc_shape),
+            })
+        if not pair_data:
+            return
+        self.pair_data = pair_data
+        # Rendered ball radius derived from the pad lattice's mean
+        # surface-sphere radius; halved so points appear as dots that
+        # don't overlap at typical Poisson-disc sampling density.
+        pad_radii = handler.cslc_data.radii.numpy()
+        pad_is_surface = handler.cslc_data.is_surface.numpy().astype(bool)
+        self.radius = float(np.mean(pad_radii[pad_is_surface])) * 0.5
+        self.n_total = int(sum(p["pos_local"].shape[0] for p in pair_data))
+        # Pre-allocated CPU buffers reused each frame.
+        self.xforms = np.zeros((self.n_total, 7), np.float32)
+        self.xforms[:, 6] = 1.0  # identity quaternion
+        self.colors = np.tile([0.6, 0.6, 0.7],
+                              (self.n_total, 1)).astype(np.float32)
+        self.mats = np.tile([0.4, 0.2, 0.0, 0.0],
+                            (self.n_total, 1)).astype(np.float32)
+        self.enabled = True
+
+    # Engagement reference depth for color intensity (1 mm = saturated red).
+    ENGAGEMENT_REFERENCE_M = 1.0e-3
+
+    def update(self, state) -> None:
+        if not self.enabled:
+            return
+        body_q = state.body_q.numpy()
+        # CSLC state needed to compute per-target engagement (which pad
+        # spheres are currently penetrating each target sample).
+        d = self.handler.cslc_data
+        pad_pos_local = d.positions.numpy()            # (N_pad_total, 3)
+        pad_radii    = d.radii.numpy()
+        pad_delta    = d.sphere_delta.numpy()
+        pad_shape    = d.sphere_shape.numpy()
+        pad_surface  = d.is_surface.numpy()
+        shape_body   = self.model.shape_body.numpy()
+        shape_xform  = self.model.shape_transform.numpy()
+        eps = float(d.smoothing_eps)
+
+        cursor = 0
+        for pair in self.pair_data:
+            pos_local    = pair["pos_local"]
+            normals_local = pair["normals_local"]
+            t_body_xform = body_q[pair["body_idx"]]
+            t_world_pos  = t_body_xform[:3]
+            t_world_quat = t_body_xform[3:7]
+            # Transform target samples + normals to world frame.
+            t_world = np.array([
+                _quat_rotate(t_world_quat, pos_local[k]) + t_world_pos
+                for k in range(pos_local.shape[0])
+            ], dtype=np.float32)
+            n_world = np.array([
+                _quat_rotate(t_world_quat, normals_local[k])
+                for k in range(normals_local.shape[0])
+            ], dtype=np.float32)
+
+            # For this pair's CSLC pad: compute world-frame deformed
+            # pad-sphere positions (q_i = X_wb * X_ws * p_local - delta).
+            s_idx = pair["cslc_shape"]
+            mask_pad = (pad_shape == s_idx) & (pad_surface == 1)
+            pad_idx = np.where(mask_pad)[0]
+            if pad_idx.size == 0:
+                # Still draw the sample positions; just no engagement.
+                for k in range(pos_local.shape[0]):
+                    self.xforms[cursor, :3] = t_world[k]
+                    self.colors[cursor] = [0.6, 0.6, 0.7]
+                    cursor += 1
+                continue
+            b_idx = int(shape_body[s_idx])
+            X_wb = body_q[b_idx]
+            X_ws = shape_xform[s_idx]
+            pad_p_local = pad_pos_local[pad_idx]                # (Np, 3)
+            pad_r       = pad_radii[pad_idx]                    # (Np,)
+            pad_d       = pad_delta[pad_idx]                    # (Np, 3)
+            # World positions of pad-sphere REST centres:
+            #   p_w = X_wb · (X_ws · p_local)
+            pad_p_shape = np.array([
+                _quat_rotate(X_ws[3:7], p) + X_ws[:3]
+                for p in pad_p_local
+            ], dtype=np.float32)
+            pad_p_world = np.array([
+                _quat_rotate(X_wb[3:7], p) + X_wb[:3]
+                for p in pad_p_shape
+            ], dtype=np.float32)
+            q_world = pad_p_world - pad_d                       # (Np, 3)
+
+            # For each target sample j: max over pad spheres of
+            #   engagement_ij = kernel_w_ij · phi_eff_ij (half-space)
+            # phi_eff_ij = smooth_relu(r_i - n_face_j · (q_i - t_j))   (v2)
+            # kernel_w_ij = smooth_step(3·r_i - ||(q_i - t_j)_tangent||)
+            # Visual saturated at ENGAGEMENT_REFERENCE_M.
+            #
+            # Vectorised: diffs[i, j] = q_i - t_j, shape (Np, M, 3).
+            diffs = q_world[:, None, :] - t_world[None, :, :]   # (Np, M, 3)
+            projs = np.einsum("ijk,jk->ij", diffs, n_world)     # (Np, M)
+            raw_half = pad_r[:, None] - projs                   # (Np, M)
+            phi_eff = 0.5 * (raw_half + np.sqrt(raw_half ** 2 + eps ** 2))
+            d_t_vec = diffs - projs[:, :, None] * n_world[None, :, :]
+            d_t_mag = np.linalg.norm(d_t_vec, axis=2)            # (Np, M)
+            arg = 3.0 * pad_r[:, None] - d_t_mag                 # (Np, M)
+            kernel_w = 0.5 * (1.0 + arg / np.sqrt(arg ** 2 + eps ** 2))
+            engagement_ij = kernel_w * phi_eff                   # (Np, M)
+            engagement_j = engagement_ij.max(axis=0)             # (M,)
+
+            # Color: red when engaged, gray otherwise.
+            for k in range(pos_local.shape[0]):
+                self.xforms[cursor, :3] = t_world[k]
+                eng = float(engagement_j[k])
+                if eng > 1.0e-6:    # above noise floor (1 µm)
+                    intensity = min(eng / self.ENGAGEMENT_REFERENCE_M, 1.0)
+                    self.colors[cursor] = [
+                        intensity, 0.2 * (1.0 - intensity), 1.0 - intensity
+                    ]
+                else:
+                    self.colors[cursor] = [0.6, 0.6, 0.7]
+                cursor += 1
+        if cursor == 0:
+            return
+        import newton
+        self.viewer.log_shapes(
+            "/cslc_target_points", newton.GeoType.SPHERE, self.radius,
+            wp.array(self.xforms[:cursor], dtype=wp.transform),
+            wp.array(self.colors[:cursor], dtype=wp.vec3),
+            wp.array(self.mats[:cursor], dtype=wp.vec4),
         )
 
 
@@ -332,3 +525,52 @@ def save_postsim_plots(run_dir: Path) -> None:
             fig.tight_layout()
             fig.savefig(run_dir / "cslc_delta.png", dpi=120)
             plt.close(fig)
+
+            # ── Repro-A diagnostics (H2 + H3) ───────────────────────
+            # Per-pad active counts (H2) and apex normal/tangential
+            # delta split (H3).  Older CSVs without these columns
+            # simply skip this plot.
+            try:
+                n_act_l = np.array(
+                    [int(r["n_active_left"]) for r in cslc_rows])
+                n_act_r = np.array(
+                    [int(r["n_active_right"]) for r in cslc_rows])
+                ap_l_n = np.array(
+                    [float(r["apex_left_delta_n_mm"]) for r in cslc_rows])
+                ap_l_t = np.array(
+                    [float(r["apex_left_delta_t_mm"]) for r in cslc_rows])
+                ap_r_n = np.array(
+                    [float(r["apex_right_delta_n_mm"]) for r in cslc_rows])
+                ap_r_t = np.array(
+                    [float(r["apex_right_delta_t_mm"]) for r in cslc_rows])
+            except KeyError:
+                pass
+            else:
+                fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+                ax = axes[0]
+                _phase_bands(ax, 0, max(n_act_l.max(), n_act_r.max(), 1))
+                ax.plot(t_c, n_act_l, label="left pad", color="tab:blue")
+                ax.plot(t_c, n_act_r, label="right pad", color="tab:orange")
+                ax.set_ylabel("active surface spheres")
+                ax.set_title("Per-pad active sphere count (H2)")
+                ax.legend(loc="upper left", fontsize=9)
+                ax.grid(True, alpha=0.3)
+
+                ax = axes[1]
+                ax.plot(t_c, ap_l_n, label="left δ·n̂", color="tab:blue")
+                ax.plot(t_c, ap_l_t, label="left |δ_t|",
+                        color="tab:blue", ls="--")
+                ax.plot(t_c, ap_r_n, label="right δ·n̂", color="tab:orange")
+                ax.plot(t_c, ap_r_t, label="right |δ_t|",
+                        color="tab:orange", ls="--")
+                ax.set_ylabel("apex δ [mm]")
+                ax.set_xlabel("time [s]")
+                ax.set_title(
+                    "Apex sphere normal vs tangential δ (H3 — tangential >> "
+                    "normal means lateral springs dominate)"
+                )
+                ax.legend(loc="upper left", fontsize=9, ncol=2)
+                ax.grid(True, alpha=0.3)
+                fig.tight_layout()
+                fig.savefig(run_dir / "cslc_apex_delta.png", dpi=120)
+                plt.close(fig)

@@ -356,7 +356,7 @@ def measure_anchors(config: GraspConfig, *,
     # the protocol choice is transparent.
     kc = float(cslc_data.kc)
     ka = float(cslc_data.ka)
-    ke_target = float(config.material.ke_target_constraint)
+    ke_target = float(config.material.ke_target_physical)
     kc_series = (kc * ke_target) / (kc + ke_target) if (kc + ke_target) > 0 else 0.0
     if kc_series > 0:
         phi_eff_factor = (ka + kc_series) / kc_series
@@ -456,7 +456,7 @@ def measure_anchors(config: GraspConfig, *,
         "config_pad_close_offset": float(
             config.timing.squeeze_speed * config.timing.squeeze_duration),
         "config_ke_pad_physical": float(config.material.ke_pad_physical),
-        "config_ke_target_constraint": float(config.material.ke_target_constraint),
+        "config_ke_target_physical": float(config.material.ke_target_physical),
         "config_mu": float(config.material.mu),
         "config_cslc_alpha": float(config.cslc.alpha),
         "config_cslc_n_iter": int(config.cslc.n_iter),
@@ -482,7 +482,7 @@ def _build_config_from_args(args: argparse.Namespace) -> GraspConfig:
     if args.ke_physical is not None:
         cfg.material.ke_pad_physical = float(args.ke_physical)
     if args.ke_constraint is not None:
-        cfg.material.ke_target_constraint = float(args.ke_constraint)
+        cfg.material.ke_target_physical = float(args.ke_constraint)
     if args.mu is not None:
         cfg.material.mu = float(args.mu)
     # CSLC solver tuning -- benchmark §3.6 recommends alpha=0.3 and
@@ -537,7 +537,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "1.38e6; for v0.8 re-anchor pass an a-priori estimate "
                         "and re-run with the measured ke_pad_physical = E*A/L.")
     p.add_argument("--ke-constraint", type=float, default=None,
-                   help="Override material.ke_target_constraint [N/m].  "
+                   help="Override material.ke_target_physical [N/m].  "
                         "Default: GraspConfig default (5e5 in v0.7).")
     p.add_argument("--mu", type=float, default=None,
                    help="Override material.mu (Coulomb friction).  "

@@ -185,7 +185,7 @@ def run_pilot(config: GraspConfig, *,
         "config_box_side": float(2.0 * min(config.object.box_half_extents)),
         "config_object_density": float(config.object.density),
         "config_ke_pad_physical": float(config.material.ke_pad_physical),
-        "config_ke_target_constraint": float(config.material.ke_target_constraint),
+        "config_ke_target_physical": float(config.material.ke_target_physical),
         "config_kh": float(config.material.kh),
         "config_mu": float(config.material.mu),
         "wall_seconds": wall,
@@ -209,7 +209,7 @@ def _build_config_from_args(args: argparse.Namespace) -> GraspConfig:
     if args.ke_physical is not None:
         cfg.material.ke_pad_physical = float(args.ke_physical)
     if args.ke_constraint is not None:
-        cfg.material.ke_target_constraint = float(args.ke_constraint)
+        cfg.material.ke_target_physical = float(args.ke_constraint)
     if args.kh is not None:
         cfg.material.kh = float(args.kh)
     if args.mu is not None:
@@ -261,7 +261,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--ke-physical", type=float, default=5.0e5,
                    help="material.ke_pad_physical [N/m]; default 5e5 (v0.9 anchor).")
     p.add_argument("--ke-constraint", type=float, default=5.0e5,
-                   help="material.ke_target_constraint [N/m]; default 5e5.")
+                   help="material.ke_target_physical [N/m]; default 5e5.")
     p.add_argument("--kh", type=float, default=1.8e9,
                    help="material.kh [Pa/m] for hydro; default 1.8e9 (v0.9 anchor).")
     p.add_argument("--mu", type=float, default=0.5)

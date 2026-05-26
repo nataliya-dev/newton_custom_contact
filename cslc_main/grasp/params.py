@@ -45,31 +45,59 @@ class ObjectParams:
         m = (4/3) · π · r³ · ρ  →  ρ = m / V ≈ 368 kg/m³.
     """
 
-    # "sphere" (default, tennis ball) or "box" (C2e: dome-vs-flat-face
+    # "sphere" (default, tennis ball) or "box" (dome-vs-flat-face
     # falsification).  The box's surface is uniformly point-set sampled
-    # at construction; the CSLC handler dispatches to the point-set
-    # contact path (``_launch_vs_point_set``) automatically.
+    # at construction; the CSLC handler dispatches to its single v2
+    # unified ``_launch`` path automatically.
     kind: str = "sphere"
 
     # Sphere radius [m].  Tennis ball: 0.0335.  Only used when
     # ``kind == "sphere"``.
     radius: float = 0.0335
 
-    # Box half-extents [m] in body-local frame (C2e).  Default 12.5 mm
-    # half-side = 25 mm full side, chosen to satisfy the dome-vs-box
-    # geometric constraint at the default dome geometry
-    # (R_pad = 20 mm, half-angle = 72 deg, patch_radius ~= 19 mm).
-    # Below 25 mm the contact patch overflows the box edges and mixes
-    # normals, creating a local wedge that confounds the falsification;
-    # the scene builder warns when ``2*hx < 2*patch_radius + 6mm``.
-    box_half_extents: tuple[float, float, float] = (0.0125, 0.0125, 0.0125)
+    # Fibonacci-spiral sample count on the sphere surface (Phase 7).
+    # Default 500 ⇒ mean spacing ≈ 6 mm on a 33.5 mm sphere.  The
+    # half-space approximation is fit-for-purpose at R/r_pad ≫ 1
+    # (contract §7.2); at R=33.5 mm, r_pad≈1 mm, R/r_pad ≈ 33, so
+    # spacing-to-r_pad ratio of 6 is still well within the locality
+    # kernel half-width 3·r_pad ≈ 3 mm — every active pad sphere sees
+    # 1-2 target samples within its kernel disc.  Cutting from the
+    # bridge-harness 1500 saves 3× on the inner loop of every CSLC
+    # kernel that iterates target samples (warm-start argmax, jacobi
+    # iteration, emission), trading 3× per-step speed for negligible
+    # change in grip stability.  Raise back to ~1500 if you need
+    # ultra-fine ``F = ∫ kc·phi·n dA`` integration accuracy.
+    sphere_n_samples: int = 100
 
-    # Target-point pitch [m] on each box face (C2e).  Default 1 mm gives
-    # 625 samples per 25 mm face, 3750 total across 6 faces.  Pitch sets
-    # both the per-target radius (``pitch / 2``) and the lattice
-    # density that feeds into ``compute_k_max``.  Smaller pitch ->
-    # denser target -> larger K_max budget.
-    box_face_pitch: float = 0.001
+    # Box half-extents [m] in body-local frame.  Default 33.5 mm
+    # half-side = 67 mm full side, matching the sphere's bounding box
+    # (radius 33.5 mm) so the two object kinds spawn at the same
+    # ``settled_z_center`` (= 33.5 mm) and pads spawn at the same
+    # ``grasp_axis_half`` (= 33.5 mm).  This makes sphere-vs-box a
+    # head-to-head comparison with identical pad placement and
+    # identical SQUEEZE/LIFT trajectories.
+    #
+    # The dome-vs-box geometric constraint
+    # (``2*hx < 2*patch_radius + 6mm``) is still enforced by the
+    # scene builder warning -- with R_pad = 10 mm, half-angle = 72°,
+    # patch_radius ≈ 9.5 mm, so 2*hx = 67 mm comfortably exceeds the
+    # 25 mm minimum.
+    box_half_extents: tuple[float, float, float] = (0.0335, 0.0335, 0.0335)
+
+    # Target-point pitch [m] on each box face.  Default 5 mm gives
+    # ~169 samples per 67 mm face, ~338 total across the two approach
+    # faces (the +y/-y/+z/-z faces are physically unreachable to the
+    # ±x pads and are not sampled; see ``_BOX_APPROACH_FACES`` in
+    # ``contact_models.py``).
+    #
+    # Pitch must be ≤ the pad sphere's tangential-locality kernel
+    # half-width ``3·r_pad`` (default r_pad ≈ 2.8 mm → kernel half-
+    # width ≈ 8.5 mm) so every active pad sphere sees at least one
+    # target sample inside its kernel disc.  Below ~2 mm pitch the
+    # box scene gets very slow (target_count → 800+) without a
+    # meaningful change in contact-patch resolution; above ~8 mm
+    # pitch the locality kernel starts missing samples.
+    box_face_pitch: float = 0.005
 
     # Material density [kg/m³].  368 → tennis-ball mass at r=33.5 mm.
     density: float = 368.0
@@ -77,7 +105,7 @@ class ObjectParams:
     # Spawn height [m] of the object's centre at t=0.  Chosen so a
     # free-falling sphere settles on the ground (z ≈ radius) before the
     # pads make contact.
-    start_z: float = 0.10
+    start_z: float = 0.05
 
     # Lateral spawn jitter [m] along Y, used to drive multi-seed
     # statistics for the C2 ke-sweep falsification (3 seeds at
@@ -159,15 +187,19 @@ class PadParams:
     kind: str = "box"
 
     # Box pad half-extents [m] (only used when kind="box").  Defaults:
-    # 16 mm thick × 40 mm wide × 80 mm tall.  The 80 mm height is
-    # taller than the default tennis-ball diameter (67 mm) so the
-    # contact face fully spans the sphere vertically — without this,
-    # the pads contact only the upper or lower hemisphere and squeeze
-    # the sphere out of the grip.  Make ``box_hz`` ≥ object.radius
-    # for any new held object.
+    # 16 mm thick × 40 mm wide × 40 mm tall.  ``box_hz`` was previously
+    # 40 mm (= 80 mm tall) so the pad face fully spanned the
+    # tennis-ball vertically.  That created a LIFT-phase artifact: pad
+    # lattice spheres beyond the ball's vertical extent participate
+    # in the contact set, and as the pad translates upward those
+    # asymmetric off-equator spheres drive the ball UP much faster
+    # than the pad itself (sphere flew to z = 8 cm with pads at 5.4 cm
+    # commanded).  Shrinking to 40 mm tall (matches box_hy for a
+    # square contact face) reduces the fly-up overshoot from ~5 cm to
+    # ~1 cm while preserving grip stability.
     box_hx: float = 0.008
     box_hy: float = 0.020
-    box_hz: float = 0.040
+    box_hz: float = 0.020
 
     # Dome OBJ path (only used when kind="dome").  The shipped asset is
     # fingertip-scale: ~20 mm wide × 10 mm thick with a curved face.
@@ -207,7 +239,7 @@ class PadParams:
     # Number of Lloyd/CVT samples drawn per pad contact face.  Determines
     # the resolution of the lattice; ``sample_mesh_lloyd`` returns
     # exactly this count.
-    n_samples: int = 150
+    n_samples: int = 100
 
     # k for the k-NN neighbour graph used to wire each lattice sphere to
     # its lateral-spring neighbours.  6 ≈ Delaunay valency in 2-D, which
@@ -240,28 +272,34 @@ class MaterialParams:
     (``kd``), tangential stiffness (``kf``), and Coulomb friction
     coefficient (``mu``) at the SHAPE level.
 
-    ke is split by role under CSLC (see C2 closure in
-    ``cslc_main/theory/notes.md``):
+    ke is split by role (two physical knobs, one per body of the
+    contact pair):
 
-    * ``ke_pad_physical`` is the CSLC pad's bulk Young's-modulus-equivalent.
-      It feeds ``calibrate_kc(ke_bulk=...)`` and so sets the pad's
-      per-sphere contact stiffness ``kc``.  Physical knob.
-    * ``ke_target_constraint`` is the OBJECT's effective contact stiffness.
-      It enters the harmonic-mean series-spring composition
-      ``kc_series = kc * target_ke / (kc + target_ke + eps^2)`` in the
-      emission kernel and so sets the MuJoCo rigid-contact stiffness
-      (which drives both force-per-penetration AND regularisation
-      timeconst -- MuJoCo's contact API takes one stiffness slot per
-      contact).  Numerical / regularisation knob.
-    * ``kh`` is the hydroelastic physical-compliance modulus [Pa/m].
-      Used only when ``contact_model="hydro"``; ignored under CSLC.
+    * ``ke_pad_physical`` -- the CSLC pad's bulk Young's-modulus-
+      equivalent.  Feeds ``calibrate_kc(ke_bulk=...)`` and sets the
+      pad's per-sphere contact stiffness ``kc``.
+    * ``ke_target_physical`` -- the OBJECT's effective contact stiffness.
+      Enters the series-spring composition ``1/kc_eff = 1/kc + 1/ke_target``
+      in ``calibrate_kc`` (Newton III), so increasing ``ke_target_physical``
+      makes the object behave more rigidly in contact.
+    * ``kh`` -- hydroelastic physical-compliance modulus [Pa/m].  Used
+      only under ``contact_model="hydro"``.
 
-    The split decouples per-role knobs at the configuration layer but
-    DOES NOT make them physically independent: kc and target_ke
-    co-determine kc_series via the harmonic-mean composition.  The
-    cleanest apples-to-apples comparison with hydroelastic uses
-    ``ke_target_constraint`` held fixed and ``ke_pad_physical`` /
-    ``kh`` swept as the "physical material" axis.
+    Apples-to-apples comparison with hydroelastic: hold
+    ``ke_target_physical`` fixed and sweep ``ke_pad_physical`` / ``kh``
+    as the parallel "physical material" axis.
+
+    .. note:: MuJoCo regularization coupling
+
+       Under CSLC, ``ke_target_physical`` co-determines MuJoCo's
+       constraint regularization timeconst because MuJoCo derives the
+       timeconst from the emitted per-contact stiffness (one stiffness
+       slot per contact in MuJoCo's API).  Truly decoupling physical
+       compliance from numerical regularization would require wiring a
+       separate solref override into the contact emission, which is
+       deferred to the physics-cleanup phase.  Today, tuning
+       ``ke_target_physical`` changes BOTH force-per-penetration AND
+       solver stability characteristics.
 
     The legacy ``MaterialParams.ke`` is preserved as a property
     alias for ``ke_pad_physical`` (silent; no DeprecationWarning).
@@ -275,42 +313,49 @@ class MaterialParams:
     # CSLC pad physical bulk-modulus equivalent [N/m].  Drives
     # ``calibrate_kc(ke_bulk=...)`` on the pad lattice.  Under
     # ``contact_model="hydro"`` this field is unused (hydro reads
-    # ``kh`` for physical compliance instead).  Default 5e4
-    # preserves the pre-split single-ke default.
-    ke_pad_physical: float = 5.0e4
+    # ``kh`` for physical compliance instead).
+    ke_pad_physical: float = 5.0e2
 
-    # Object's harmonic-mean composition partner [N/m].  Drives
-    # kc_series target_ke in the CSLC emission kernel; flows to
-    # MuJoCo as the rigid-contact stiffness for the regularisation
-    # timeconst.  Default 5e4 preserves the pre-split single-ke
-    # default; bump to 5e5 (the C2 day-1 / Bug B operating point)
-    # for the wedge-suppressing regime.
-    ke_target_constraint: float = 5.0e4
+    # Object's physical contact stiffness [N/m].  Enters the
+    # series-spring composition ``1/kc_eff = 1/kc + 1/ke_target`` in
+    # ``calibrate_kc``; also flows to MuJoCo as the rigid-contact
+    # stiffness (which is intrinsically coupled to the regularisation
+    # timeconst by MuJoCo's API -- see class docstring's MuJoCo
+    # regularization coupling note).
+    ke_target_physical: float = 5.0e2
 
-    # Hydroelastic physical-compliance modulus [Pa/m].  Used only
-    # when ``contact_model="hydro"``; ignored under CSLC / point.
-    # Default 5.3e8 matches the pre-split ``HydroParams.kh`` default
-    # (fair-calibrated against MaterialParams.ke at the expected
-    # contact patch area; see cslc_mujoco/summary.md §2).
-    # Centralising on MaterialParams lets the squeeze-sweep treat
-    # CSLC ``ke_pad_physical`` and hydro ``kh`` as the parallel
-    # "physical material" axis.  ``HydroParams.kh`` removed as part
-    # of the same split.
+    # Hydroelastic physical-compliance modulus [Pa/m].  Used ONLY when
+    # ``contact_model="hydro"``; setting this under CSLC or point has
+    # NO effect.  Default 5.3e8 is fair-calibrated against
+    # ``ke_pad_physical`` at the expected contact patch area (see
+    # cslc_mujoco/summary.md §2), so the squeeze-sweep can treat CSLC
+    # ``ke_pad_physical`` and hydro ``kh`` as the parallel "physical
+    # material" axis.
     kh: float = 5.3e8
 
-    # Hunt-Crossley damping coefficient [N·s/m].
+    # Hunt-Crossley damping coefficient [N·s/m].  Used by ``point``
+    # contact.  Under ``cslc`` the emission kernel writes
+    # ``rigid_contact_damping = 0`` to use MuJoCo's stiffness-derived
+    # timeconst branch; under ``hydro`` MuJoCo uses its own kd.  Tuning
+    # this knob has NO effect under cslc.
     kd: float = 5.0e2
 
     # Tangential / friction-spring stiffness [N/m] for the regularised
-    # Coulomb model.  Only matters under point-contact mode.
+    # Coulomb model.  Used ONLY by ``point`` contact (cslc handles
+    # tangential stiffness via :attr:`CSLCParams.k_stick`; hydro doesn't
+    # use a tangential spring).
     kf: float = 100.0
 
-    # Coulomb friction coefficient [-].  May be overridden per-shape for
-    # CSLC (see :attr:`CSLCParams.mu_friction`).
+    # Coulomb friction coefficient [-].  Single source of truth for
+    # friction across all contact models.  ``point`` and ``hydro`` use
+    # it directly on the geom pair; ``cslc`` reads it for the lattice's
+    # stick-slip block AND lets MuJoCo apply it on emitted contacts.
     mu: float = 0.5
 
-    # Proximity gap [m] for narrow-phase early-out.  Should comfortably
-    # exceed the maximum penetration expected during SQUEEZE.
+    # Proximity gap [m] for narrow-phase early-out.  Used by ``point``
+    # and ``hydro`` collision narrow-phase.  ``cslc`` bypasses
+    # narrow-phase (it samples target surfaces directly), so this knob
+    # has NO effect under cslc.
     gap: float = 0.002
 
     # ── Legacy property (pre-split back-compat) ──
@@ -322,7 +367,7 @@ class MaterialParams:
         Pre-split code reads ``material.ke``; the split keeps this
         as a property returning the physical knob so no external
         consumer breaks.  New code should use ``ke_pad_physical``
-        and ``ke_target_constraint`` explicitly.
+        and ``ke_target_physical`` explicitly.
         """
         return self.ke_pad_physical
 
@@ -330,15 +375,15 @@ class MaterialParams:
     def ke(self, value: float) -> None:
         """Legacy setter -- sets BOTH ke fields to ``value``.
 
-        Pre-split semantics: ``material.ke = X`` set both the
-        physical and constraint roles to the same number.
-        Preserved here so existing scripts and the
-        ``--material-ke`` CLI alias keep working bit-identically.
-        Explicit per-role assignment should set ``ke_pad_physical``
-        and ``ke_target_constraint`` directly.
+        Pre-split semantics: ``material.ke = X`` set both pad and
+        target stiffness to the same number.  Preserved here so
+        existing scripts and the ``--material-ke`` CLI alias keep
+        working bit-identically.  Explicit per-role assignment
+        should set ``ke_pad_physical`` and ``ke_target_physical``
+        directly.
         """
         self.ke_pad_physical = value
-        self.ke_target_constraint = value
+        self.ke_target_physical = value
 
 
 # ── CSLC compliant-skin tuning ───────────────────────────────────────────
@@ -367,27 +412,55 @@ class CSLCParams:
     # bulging at the cost of grip strength on dome pads.
     kl: float = 5_000.0
 
-    # Contact damping coefficient [-].
+    # Contact damping coefficient [-].  CURRENTLY UNUSED at emission --
+    # ``write_cslc_contacts`` writes ``out_damping = 0.0`` (uses MuJoCo's
+    # stiffness-derived timeconst branch).  Plumbed through to Newton's
+    # ``shape_cslc_dc`` array for kernel-signature stability; setting
+    # this value has NO effect on emitted contacts.  Kept as a knob for
+    # future Hunt-Crossley reintroduction.
     dc: float = 2.0
 
     # Per-step Jacobi refinement iterations on top of the closed-form
-    # warm-start.  20 is sufficient for ~mm-scale δ; raise for stiffer
-    # geometries.
+    # warm-start.  Each iteration is one wp.launch of ``jacobi_step``;
+    # cost scales linearly.
+    #
+    # The physics-investigation sweep (see notes.md / probe_failure.py)
+    # shows a sharp phase transition at n_iter=20: at n_iter <= 10 the
+    # damped Jacobi can diverge on stiff scenes (sphere grasp at
+    # ill-calibrated kc explodes to max_δ ~ 3 m); n_iter >= 20 lands at
+    # max_δ ~ 0.4 mm regardless of calibration.  Returns saturate by
+    # n_iter=40 (no further improvement at 80).  20 is the production-
+    # safe default; raise to 40 for paper-grade convergence margin.
     n_iter: int = 20
 
     # Damping factor in the Jacobi step.  0.6 balances stability and
     # convergence rate.
     alpha: float = 0.6
 
-    # Fraction of surface spheres that should be considered "active"
+    # Initial / fallback fraction of surface spheres considered "active"
     # under the operating penetration.  Drives the kc recalibration so
-    # the per-pad aggregate stiffness equals ke_bulk.  0.025 matches
-    # the working ``cslc_mujoco/pad_lift_test`` calibration at
-    # face_pen=1 mm on dome pads — bigger pads (box, large contact
-    # patch) engage more spheres and should override upward via
-    # ``--cslc-contact-fraction`` (~0.15 is a reasonable starting
-    # point for a flat box pad on a tennis-ball-sized sphere).
+    # the per-pad aggregate stiffness equals ke_bulk.  When
+    # ``auto_tune_contact_fraction`` is True (default), this seeds the
+    # EMA at t=0 and is otherwise unused: per-step ``n_active`` from
+    # ``read_cslc_state`` drives kc recalibration directly, eliminating
+    # the scene-specific tuning that used to require knowing the active
+    # fraction in advance (0.025 for dome pads, ~0.05 for box pads on
+    # spheres, ~0.15 for box pads on boxes -- a 6x sensitivity range).
     contact_fraction: float = 0.025
+
+    # Auto-tune ``contact_fraction`` per step from the previous step's
+    # measured active sphere count.  When True (default), the static
+    # ``contact_fraction`` above is only the t=0 seed; thereafter kc is
+    # recomputed each step from the actual lattice state.  Set False to
+    # pin kc at the static-cf calibration (legacy behaviour).
+    auto_tune_contact_fraction: bool = True
+
+    # EMA smoothing rate for the auto-tuned contact fraction.  0.1
+    # means each step's measurement contributes 10% to the running
+    # average; the lattice adapts to step-changes in active fraction
+    # over ~30 steps (= 60 ms at dt=2 ms).  Lower = slower adaptation
+    # but more robust to transients; higher = faster but jittery.
+    contact_fraction_ema_alpha: float = 0.1
 
     # Anisotropy of the anchor: tangent_axis_ka = ka × ratio.  1.0 =
     # isotropic; 1/3 (≈0.333) matches incompressible-flesh Poisson
@@ -403,11 +476,11 @@ class CSLCParams:
     smoothing_eps: float = 5.0e-4
 
     # Stick-slip friction stiffness [N/m] on the tangential δ_t.  Set
-    # to 0 to disable friction entirely.
+    # to 0 to disable friction entirely.  The friction COEFFICIENT used
+    # by the stick-slip block (and by MuJoCo's Coulomb cone on emitted
+    # contacts) lives on :attr:`MaterialParams.mu` -- single source of
+    # truth across both friction sites.
     k_stick: float = 25_000.0
-
-    # Tangential friction coefficient [-] in the stick-slip model.
-    mu_friction: float = 0.3
 
     # If True, build the dense A_inv (= (K + kc·I)^-1) for the
     # closed-form linear warm-start before the Jacobi refinement.
@@ -457,7 +530,18 @@ class TimingParams:
     approach_duration: float = 1.5
 
     # SQUEEZE: each pad continues inward at this slower speed [m/s] to
-    # build a controlled penetration into the object.
+    # build a controlled penetration into the object.  Trajectory commands
+    # 1 mm of dx beyond the closed approach_gap.
+    #
+    # CAVEAT (2026-05-24, H5 — open): when the target is rigid and the
+    # contact stiffness is high (e.g. point-set kernel, steel-cube Repro B),
+    # the joint actually OVER-TRAVELS the dx setpoint by ~4 mm under load
+    # (measured qd ≈ +25 mm vs target +21 mm) and snaps back to target the
+    # moment contact breaks.  Over-travel is roughly independent of ke,
+    # which rules out PD overshoot — looks like MuJoCo constraint-solver
+    # residual at high contact stiffness.  Apex penetration as seen in the
+    # GL viewer is therefore ~5 mm here, not the commanded 1 mm.  Fix is
+    # deferred to the H5 round.
     squeeze_speed: float = 1.0e-3 / 0.5  # 2 mm/s → 1 mm in 0.5 s
     squeeze_duration: float = 0.5
 

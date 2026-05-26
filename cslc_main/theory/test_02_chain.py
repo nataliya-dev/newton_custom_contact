@@ -1,11 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Step 2 / 1D chain of lattice spheres with anchor + lateral springs.
+"""Phase 2 / T-E — 1D chain of lattice spheres, graph-Laplacian only.
 
-No contact target here -- step 2 is the lateral-coupling reference.
-Step 3 will add a target and watch how the lateral spreads the contact
-load across the patch.
+In-place edit of the v1 ``test_02_chain.py``.  v2 drops the
+distance-preserving lateral law (contract_v2.md §6.2 and §13);
+graph-Laplacian is now the sole lateral spring.  The DP-vs-GL
+diagnostic PART D of the v1 test is therefore removed — there is
+nothing to compare against — and replaced with a graph-Laplacian
+transverse-load sanity check (PART D') that verifies axes decouple
+under GL (the property that the linearised DP law also satisfies and
+that the v1 PART D used as its baseline).
+
+No contact target here — Step 2 is the lateral-coupling reference.
+T-F (test_chain_contact_flat.py) adds a flat-face target and watches
+how the GL lateral spreads the contact load across the patch.
 
 A chain of N spheres along the x-axis at spacing h:
 
@@ -15,11 +24,8 @@ A chain of N spheres along the x-axis at spacing h:
 
 Each sphere has an anchor spring (stiffness k_a) tethering its centre
 q_i = p_i - delta_i to its rest position p_i.  Adjacent spheres are
-connected by lateral springs (stiffness k_l).
-
-Two lateral laws are tested side by side (see cslc_lattice.py):
-  * graph-Laplacian:   f_lat(i,j) = -k_l * (delta_i - delta_j)
-  * distance-preserving: f_lat(i,j) = -k_l * (||q_j - q_i|| - L_ij) * e_hat_ij
+connected by lateral GL springs (stiffness k_l): ``f_lat(i, j) =
+-k_l · (delta_i - delta_j)``.
 
 What the parts test:
 
@@ -36,24 +42,23 @@ What the parts test:
   PART C.  Green's function along the chain axis.  Apply external force
            f_ext = F * x_hat on the centre sphere; solve K @ delta_x =
            f_ext.  Plot delta_x(i - i_centre); fit exponential decay;
-           recover the lateral correlation length
-              l_c = sqrt(k_l / k_a)
-           in lattice-spacing units.  Sweep three regimes
+           recover the discrete-lattice decay length
+              l_c_discrete = -1 / ln(z_-)
+           where z_- is the small root of the characteristic equation
+           (see cslc_lattice.chain_discrete_decay_length).  Sweep three
+           regimes
               k_l/k_a = 0.2 (sub-grid, production CSLC default)
               k_l/k_a = 1   (well-coupled, l_c = 1 spacing)
               k_l/k_a = 10  (strongly coupled, l_c ~ 3 spacings)
            to make the regime-dependence visible.
 
-  PART D.  The DIAGNOSTIC test that distinguishes graph-Laplacian from
-           distance-preserving.  Apply f_ext = F * y_hat (perpendicular
-           to the chain axis) at the centre sphere.  At small delta,
-           the distance-preserving linearisation projects onto the
-           rest edge direction (here, x_hat), so y-components of delta
-           do NOT couple to neighbours.  Predicted result:
-              graph-Laplacian: delta_y(i) spreads with l_c, same Green's
-                  function as Part C (axes decouple).
-              distance-pres:   delta_y(i_centre) = F / k_a (anchor only),
-                                delta_y(i != centre) = 0.
+  PART D'.  Graph-Laplacian axes-decouple sanity check.  Apply
+           f_ext = F * y_hat (perpendicular to the chain axis) at the
+           centre sphere; verify the y-axis response is identical to
+           the x-axis response from PART C (under GL the per-axis
+           system is the same scalar K, just with the rhs along the
+           loaded axis).  This is the GL-only successor to v1's
+           DP-vs-GL diagnostic.
 
 Run::
 
@@ -64,7 +69,7 @@ Outputs::
     cslc_main/theory/figures/02a_K_matrix.txt          (printed matrix)
     cslc_main/theory/figures/02b_eigenvalue_spectrum.png
     cslc_main/theory/figures/02c_greens_function_axial.png
-    cslc_main/theory/figures/02d_perpendicular_diagnostic.png
+    cslc_main/theory/figures/02d_GL_axes_decouple.png
 """
 
 from __future__ import annotations
@@ -80,7 +85,6 @@ from cslc_main.theory.cslc_lattice import (
     chain_discrete_decay_length,
     make_chain,
     solve_equilibrium_graph_laplacian,
-    solve_equilibrium_numerical,
 )
 
 FIG_DIR = Path(__file__).resolve().parent / "figures"
@@ -303,112 +307,118 @@ def part_c_axial_greens_function() -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-#  PART D.  Perpendicular load: graph-Laplacian vs distance-preserving
+#  PART D'.  Graph-Laplacian axes-decouple sanity check
+#
+#  v2 successor to v1's PART D (which compared GL against the
+#  distance-preserving law).  DP is gone in v2 (contract_v2.md §6.2);
+#  this part just verifies that the GL system decouples per Cartesian
+#  axis — the property the v1 PART D used as the GL baseline.
 # ─────────────────────────────────────────────────────────────────────────
 
 
-def part_d_perpendicular_diagnostic() -> bool:
-    """Apply f_ext in +y on the chain centre; compare lateral laws.
+def part_d_GL_axes_decouple() -> bool:
+    """Apply f_ext along +y at the chain centre; verify GL gives the
+    same per-axis response as the +x load from PART C.
 
-    Graph-Laplacian:  delta_y spreads with l_c = sqrt(kl/ka) (axes decouple).
-    Distance-pres:    only the centre yields; delta_y(centre) = F / k_a.
+    Under graph-Laplacian, the full 3N×3N stiffness is K ⊗ I_3 (with K
+    the scalar (N×N) Laplacian + anchor matrix), so each Cartesian
+    axis decouples and solves K·δ_axis = f_axis with the same K.  A
+    transverse load (+y) should therefore give exactly the same δ
+    spatial profile as an axial load (+x), with values placed in the
+    y-component instead of the x-component.
 
-    Quantitative test:
-      * Distance-pres distant-sphere |delta_y| should be << anchor-only
-        prediction (within a per-mille of zero in our default setup).
-      * Distance-pres centre |delta_y| should equal F / k_a to within
-        the second-order correction k_l * delta_y^2 / (k_a * h^2).
-      * Graph-Laplacian centre |delta_y| should be SMALLER than F/k_a
-        (load shares).
+    Quantitative check (3 production-relevant k_l/k_a ratios):
+      * δ_y profile under +y load matches δ_x profile under +x load to
+        machine precision (rel err < 1e-12).
+      * Off-axis components (e.g. δ_x under +y load) are zero to fp.
+      * Centre |δ| < F/k_a (lateral spring shares the load — same as
+        PART C's axial response).
     """
     print()
     print("=" * 72)
-    print("PART D.  Perpendicular-load diagnostic")
-    print("         graph-Laplacian spreads | distance-preserving localises")
+    print("PART D'. GL axes decouple under perpendicular load")
     print("=" * 72)
 
     N = 21
     ka = 25_000.0
-    kl = 5_000.0          # production-ish ratio kl/ka = 0.2
     h = 2.5e-3
     i_centre = N // 2
-    F_ext = 1.0           # 1 N in +y at centre
-
-    lat = make_chain(N=N, h=h, ka=ka, kl=kl)
-    f_ext = np.zeros((N, 3))
-    f_ext[i_centre, 1] = F_ext
-
-    # Graph-Laplacian: closed-form linear solve.
-    delta_GL = solve_equilibrium_graph_laplacian(lat, f_ext)
-
-    # Distance-preserving: nonlinear minimisation.
-    delta_DP, info = solve_equilibrium_numerical(
-        lat, f_ext, lateral="distance_preserving",
-        delta0=delta_GL,  # warm-start from the linear answer
-        tol=1e-12,
-    )
-
-    # Linearised prediction for distance-pres: anchor alone resists.
-    delta_lin_DP = np.zeros_like(delta_GL)
-    delta_lin_DP[i_centre, 1] = F_ext / ka
+    F_ext = 1.0
+    kl_ratios = [0.2, 1.0, 10.0]
 
     print()
-    print(f"  N = {N}   k_a = {ka:.0f}   k_l = {kl:.0f}   F_ext_y = {F_ext} N at centre")
-    print(f"  l_c = sqrt(k_l/k_a) = {np.sqrt(kl/ka):.3f} spacings")
+    print(f"  N = {N},  k_a = {ka:.0f},  F_ext = {F_ext} N at centre")
     print()
-    print(f"  centre delta_y prediction:")
-    print(f"    anchor only         = F / k_a            "
-          f"= {F_ext / ka * 1e6:>8.3f} um")
-    print(f"    graph-Laplacian num = (K^-1)_cc * F      "
-          f"= {delta_GL[i_centre, 1] * 1e6:>8.3f} um   "
-          f"(< anchor-only because load spreads)")
-    print(f"    distance-pres num   = numerical optimum  "
-          f"= {delta_DP[i_centre, 1] * 1e6:>8.3f} um   "
-          f"(= anchor-only to leading order)")
+    print(f"  {'k_l/k_a':>9} {'l_c (disc)':>11} "
+          f"{'δ_x[+x]@c':>11} {'δ_y[+y]@c':>11} "
+          f"{'max axis-prof Δ':>17} {'off-axis leak':>15}")
+    print("  " + "-" * 86)
+
+    all_ok = True
+    profile_storage = {}
+    for r in kl_ratios:
+        kl = ka * r
+        lat = make_chain(N=N, h=h, ka=ka, kl=kl)
+        # Axial load.
+        f_x = np.zeros((N, 3))
+        f_x[i_centre, 0] = F_ext
+        delta_x_loaded = solve_equilibrium_graph_laplacian(lat, f_x)
+        # Transverse load.
+        f_y = np.zeros((N, 3))
+        f_y[i_centre, 1] = F_ext
+        delta_y_loaded = solve_equilibrium_graph_laplacian(lat, f_y)
+
+        # Profile equivalence on the loaded axis.
+        prof_x = delta_x_loaded[:, 0]
+        prof_y = delta_y_loaded[:, 1]
+        prof_diff = float(np.max(np.abs(prof_x - prof_y)))
+        prof_rel = prof_diff / max(float(np.max(np.abs(prof_x))), 1e-30)
+
+        # Off-axis components should be zero.
+        off_axis = max(
+            float(np.max(np.abs(delta_x_loaded[:, 1]))),
+            float(np.max(np.abs(delta_x_loaded[:, 2]))),
+            float(np.max(np.abs(delta_y_loaded[:, 0]))),
+            float(np.max(np.abs(delta_y_loaded[:, 2]))),
+        )
+
+        lc_disc = chain_discrete_decay_length(ka, kl)
+        decouple_ok = (prof_rel < 1e-12) and (off_axis < 1e-12)
+        all_ok = all_ok and decouple_ok
+        print(f"  {r:>9.2f} {lc_disc:>11.3f} "
+              f"{prof_x[i_centre]*1e6:>11.3f} {prof_y[i_centre]*1e6:>11.3f} "
+              f"{prof_rel:>17.3e} {off_axis:>15.3e}  "
+              f"{'PASS' if decouple_ok else 'FAIL'}")
+        profile_storage[r] = (prof_x, prof_y)
+
     print()
+    print(f"PART D' result: {'PASS' if all_ok else 'FAIL'}")
 
-    # Quantitative checks.
-    eps_GL_lt = delta_GL[i_centre, 1] < F_ext / ka            # GL shares load
-    eps_DP_eq = abs(delta_DP[i_centre, 1] - F_ext / ka) / (F_ext / ka)
-    eps_DP_neighbours = float(np.max(
-        np.abs(delta_DP[i_centre - 1: i_centre + 2, 1] -
-               delta_lin_DP[i_centre - 1: i_centre + 2, 1])
-    )) / (F_ext / ka)
-
-    print(f"  graph-Laplacian centre < anchor-only?              "
-          f"{'YES' if eps_GL_lt else 'NO'}")
-    print(f"  distance-pres rel deviation from F/k_a at centre  "
-          f"{eps_DP_eq:>8.2e}    (want < 1e-3)")
-    print(f"  distance-pres max |delta_y(i) - lin_pred| / (F/ka)"
-          f" {eps_DP_neighbours:>8.2e}    (want < 1e-3)")
-
-    d_ok = eps_GL_lt and eps_DP_eq < 1e-3 and eps_DP_neighbours < 1e-3
-    print()
-    print(f"PART D result: {'PASS' if d_ok else 'FAIL'}")
-
-    # Plot.
+    # Plot: overlay +x-load and +y-load profiles for the production
+    # k_l/k_a = 0.2 case to show they coincide.
+    prof_x, prof_y = profile_storage[0.2]
     fig, ax = plt.subplots(figsize=(8, 5))
     offsets = np.arange(N) - i_centre
-    ax.plot(offsets, delta_GL[:, 1] * 1e6, "o-", color="C3", lw=1.5, ms=6,
-            label="graph-Laplacian: load spreads")
-    ax.plot(offsets, delta_DP[:, 1] * 1e6, "s-", color="C0", lw=1.5, ms=6,
-            label="distance-preserving: localised")
-    ax.axhline(F_ext / ka * 1e6, ls="--", color="gray",
-               label=rf"$F/k_a = {F_ext/ka*1e6:.1f}\,\mu$m (anchor-only)")
-    ax.axvline(0, ls=":", color="black", alpha=0.5)
-    ax.set_xlabel("sphere index offset $i - i_{\\mathrm{centre}}$")
-    ax.set_ylabel(r"$\delta_y(i)$ [$\mu$m]")
-    ax.set_title("Perpendicular load: distance-preserving lateral leaves "
-                 "$\\delta_y$ uncoupled\n"
-                 f"$k_l/k_a = {kl/ka:.2f}$, $F_y = {F_ext}$ N at centre")
+    ax.plot(offsets, prof_x * 1e6, "o-", color="C3", lw=1.5, ms=6,
+            label=r"$\delta_x(i)$ under $F\hat x$ at centre")
+    ax.plot(offsets, prof_y * 1e6, "s--", color="C0", lw=1.5, ms=6,
+            mfc="none", label=r"$\delta_y(i)$ under $F\hat y$ at centre")
+    ax.axhline(F_ext / ka * 1e6, ls=":", color="gray",
+               label=rf"$F/k_a = {F_ext/ka*1e6:.1f}\,\mu$m (anchor only)")
+    ax.axvline(0, ls=":", color="black", alpha=0.4)
+    ax.set_xlabel(r"sphere index offset $i - i_{\mathrm{centre}}$")
+    ax.set_ylabel(r"$\delta$ component [$\mu$m]")
+    ax.set_title("T-E/D'. Graph-Laplacian axes decouple\n"
+                 r"$+\hat x$ and $+\hat y$ loads give identical profiles "
+                 r"(at $k_l/k_a = 0.2$)")
     ax.legend(loc="upper right", fontsize=9)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    out = FIG_DIR / "02d_perpendicular_diagnostic.png"
+    out = FIG_DIR / "02d_GL_axes_decouple.png"
     fig.savefig(out, dpi=140)
     plt.close(fig)
     print(f"Saved figure to {out}")
-    return d_ok
+    return all_ok
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -421,13 +431,14 @@ def main() -> int:
     a = part_a_K_matrix()
     b = part_b_eigenvalue_spectrum()
     c = part_c_axial_greens_function()
-    d = part_d_perpendicular_diagnostic()
+    d = part_d_GL_axes_decouple()
     all_ok = a and b and c and d
     print()
     print("=" * 72)
-    print(f"Step 2 chain test: {'PASS' if all_ok else 'FAIL'}   "
+    print(f"T-E chain test (graph-Laplacian only): "
+          f"{'PASS' if all_ok else 'FAIL'}   "
           f"(A={'P' if a else 'F'} B={'P' if b else 'F'} "
-          f"C={'P' if c else 'F'} D={'P' if d else 'F'})")
+          f"C={'P' if c else 'F'} D'={'P' if d else 'F'})")
     print("=" * 72)
     return 0 if all_ok else 1
 

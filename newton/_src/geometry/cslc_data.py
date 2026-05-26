@@ -167,6 +167,21 @@ def calibrate_kc(
         # The anchor (and/or target) alone is too soft to reach the
         # per-sphere effective stiffness with any kc; fall back to a
         # conservative per-sphere stiffness.
+        ka_min = ke_bulk / float(n_contact)
+        if ke_target is not None and ke_target > 0.0:
+            inv_term = 1.0 / ka_min - 1.0 / ke_target
+            ka_min = (1.0 / inv_term) if inv_term > 0.0 else float("inf")
+        import warnings as _warnings
+        _warnings.warn(
+            f"calibrate_kc: anchor ka={ka:.3g} too soft for "
+            f"ke_bulk={ke_bulk:.3g} at N_contact={n_contact} "
+            + (f"(ke_target={ke_target:.3g}) " if ke_target else "")
+            + f"-- analytic series-spring has no positive kc solution. "
+            f"Falling back to kc=ke_bulk/N_contact={ke_bulk / n_contact:.3g}. "
+            f"To use the analytic formula, raise ka to > {ka_min:.3g}.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return ke_bulk / max(n_contact, 1)
     return 1.0 / inv_kc
 
@@ -207,17 +222,6 @@ class CSLCData:
     neighbor_start: wp.array  # (n_spheres,) int32 — CSR row pointer
     neighbor_count: wp.array  # (n_spheres,) int32
     neighbor_list: wp.array   # (n_edges,) int32
-    # Precomputed Euclidean rest length L_ij = ‖p_j_local − p_i_local‖
-    # for each directed edge in the CSR neighbor list.  Used by the
-    # distance-preservation lateral spring in `jacobi_step`:
-    #     f_spring(i, j) = k_l · (‖q_j − q_i‖ − L_ij) · unit(q_j − q_i)
-    # where q_i = p_i_world − δ_i is the deformed centre.  Linearises
-    # to the graph-Laplacian as δ → 0 but produces geometric Poisson
-    # bulging at finite δ on curved patches (theory step 5).  Body-local
-    # rest distances are rigid-motion invariant, so they're computed once
-    # at construction.  CSR layout matches `neighbor_list`: entry k is
-    # the rest length of the edge ending at neighbour `neighbor_list[k]`.
-    neighbor_rest_length: wp.array
     # Smoothing width [m] for the differentiable surrogates of `[·]_+` and
     # the contact-active gates in cslc_kernels.py.  eps → 0 recovers the
     # original non-smooth behaviour; default 1e-5 m is essentially binary
@@ -376,44 +380,26 @@ class CSLCData:
             all_normals[sl] = lattice.outward_normals
             all_shape[sl] = lattice.shape_index
 
-        # CSR neighbor structure + per-edge rest length L_ij.
+        # CSR neighbor structure.  Per-edge rest-lengths were removed
+        # (2026-05-24) when the production kernel switched from the
+        # distance-preserving lateral spring to the linear graph-
+        # Laplacian; see ``jacobi_step`` in cslc_kernels.py.
         all_start = np.zeros(n_total, dtype=np.int32)
         all_count = np.zeros(n_total, dtype=np.int32)
         neighbor_lists = []
-        rest_length_lists = []
         edge_offset = 0
 
         for lattice, glob_off in zip(lattices, offsets):
-            lat_pos = lattice.positions
             for local_i, neighbors in enumerate(lattice.neighbor_indices):
                 global_i = glob_off + local_i
                 all_start[global_i] = edge_offset
                 all_count[global_i] = len(neighbors)
                 neighbor_lists.append(neighbors + glob_off)
-                # Precompute rest distances in body-local frame.  Rest
-                # distances are rigid-body invariant, so we compute them
-                # once here against lattice.positions; the kernel will
-                # later compare against ‖q_j_world − q_i_world‖ which is
-                # equivalent up to the rigid body transform (preserves
-                # distances).  Cross-lattice neighbours would need
-                # world-frame rest distances, but our lattices are
-                # connected only intra-lattice, so body-local is
-                # sufficient.
-                if len(neighbors):
-                    deltas = lat_pos[neighbors] - lat_pos[local_i]
-                    L_ij = np.linalg.norm(deltas, axis=-1).astype(np.float32)
-                else:
-                    L_ij = np.zeros(0, dtype=np.float32)
-                rest_length_lists.append(L_ij)
                 edge_offset += len(neighbors)
 
         all_neighbor_list = (
             np.concatenate(neighbor_lists).astype(np.int32)
             if neighbor_lists else np.zeros(0, dtype=np.int32)
-        )
-        all_rest_length = (
-            np.concatenate(rest_length_lists).astype(np.float32)
-            if rest_length_lists else np.zeros(0, dtype=np.float32)
         )
 
         # Build TWO dense inverses for the closed-form lattice solve,
@@ -477,8 +463,6 @@ class CSLCData:
             neighbor_start=wp.array(all_start, dtype=wp.int32, device=device),
             neighbor_count=wp.array(all_count, dtype=wp.int32, device=device),
             neighbor_list=wp.array(all_neighbor_list, dtype=wp.int32, device=device),
-            neighbor_rest_length=wp.array(
-                all_rest_length, dtype=wp.float32, device=device),
             smoothing_eps=smoothing_eps,
             ka_tangent_ratio=ka_tangent_ratio,
             k_stick=k_stick if k_stick is not None else ka,
