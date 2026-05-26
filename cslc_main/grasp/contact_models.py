@@ -34,7 +34,6 @@ is the canonical reference for that flow.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
 
 import numpy as np
 import warp as wp
@@ -47,7 +46,6 @@ import newton
 from newton._src.geometry.cslc_data import (
     CSLCData,
     CSLCLattice,
-    calibrate_kc,
 )
 from newton._src.geometry.cslc_handler import (
     _CSLC_FLAG,
@@ -135,12 +133,13 @@ def make_pad_shape_cfg(
         density=pad.density,
     )
     if contact_model == "cslc":
+        # NOTE: cslc_dc dropped — the v2 emission kernel hardcodes
+        # out_damping = 0.0, so any value was silently ignored.
         kwargs.update(
             is_cslc=True,
             cslc_spacing=0.005,  # placeholder, real value lives on CSLCLattice
             cslc_ka=cslc.ka,
             cslc_kl=cslc.kl,
-            cslc_dc=cslc.dc,
             cslc_n_iter=cslc.n_iter,
             cslc_alpha=cslc.alpha,
         )
@@ -308,7 +307,6 @@ def build_cslc_handler_with_mesh_pads(
 
     cslc_ka_arr = model.shape_cslc_ka.numpy()
     cslc_kl_arr = model.shape_cslc_kl.numpy()
-    cslc_dc_arr = model.shape_cslc_dc.numpy()
     shape_ke = model.shape_material_ke.numpy()
     shape_mu = model.shape_material_mu.numpy()
     shape_scale_np = model.shape_scale.numpy()
@@ -316,7 +314,9 @@ def build_cslc_handler_with_mesh_pads(
     first_cslc = cslc_shape_indices[0]
     ka = float(cslc_ka_arr[first_cslc])
     kl = float(cslc_kl_arr[first_cslc])
-    dc = float(cslc_dc_arr[first_cslc])
+    # dc dropped — emission kernel hardcodes out_damping = 0.0.  Pass
+    # 0.0 to from_lattices so the kernel-signature slot stays a no-op.
+    dc = 0.0
     # Single friction coefficient: read from MaterialParams.mu (the
     # pad's shape material), used by BOTH the lattice stick-slip block
     # and MuJoCo's Coulomb cone on emitted contacts.
@@ -338,36 +338,22 @@ def build_cslc_handler_with_mesh_pads(
             )
         lattices.append(mesh_pads_by_shape[shape_idx])
 
-    # Initial kc calibration uses contact_fraction=0.3 (generic prior).
-    # Post-build, callers should re-call :func:`recalibrate_kc_per_pad`
-    # with the scene-specific fraction (e.g. cslc.contact_fraction).
-    ke_bulk = float(shape_ke[first_cslc])
-    kc = calibrate_kc(ke_bulk, lattices, ka=ka, contact_fraction=0.3, per_lattice=True)
-
-    # Area-weighted contact, Option-2 tiling: kernel half-width = r_pad
-    # (was 3·r_pad pre-Option-2, with a CSLC_SOFTENING ≈ 0.1 hack to
-    # compensate for the ~7× kernel overlap on a Lloyd lattice at
-    # spacing 2·r_pad).  With kernel_h = r_pad the discs tile the pad
-    # face without overlapping, so each unit of target area is
-    # integrated by exactly one pad sphere and the calibration identity
-    #     kc_per_volume · A_kernel = kc_per_sphere
-    # holds without an empirical fudge factor.
-    #
-    # ``calibrate_kc`` returns per-sphere [N/m] stiffness satisfying
-    # the series-spring chain ``1/kc = N/ke_bulk − 1/ka − 1/ke_target``.
-    # Divide by A_kernel = π·r_pad² to convert to the per-volume
-    # stiffness [N/m³] that ``jacobi_step`` and ``write_cslc_contacts``
-    # multiply by A_j · w_tangent.
+    # Contact stiffness: direct from CSLCParams.kc_per_volume.  No
+    # series-spring derivation, no scene-prior contact_fraction, no
+    # per-step auto-tune.  The kernels multiply kc_per_volume by per-
+    # sample area ``A_j`` and locality weight ``w_tangent`` (kernel
+    # half-width = r_pad, Option-2 tiling) to get per-contact stiffness.
+    # Per-pad-sphere aggregate at saturation is ``kc_per_volume · π·r_pad²``;
+    # for diagnostic comparison with material-modulus expectations.
     first_lat = lattices[0]
     r_pad_avg = float(np.mean(
         first_lat.radii[first_lat.is_surface.astype(bool)]
     ))
     A_kernel = float(np.pi * r_pad_avg * r_pad_avg)
-    kc_per_sphere = kc
-    kc = kc_per_sphere / A_kernel
-    print(f"  CSLC area-weighted kc: kc_per_sphere={kc_per_sphere:.3e} N/m, "
-          f"r_pad_avg={r_pad_avg*1e3:.2f} mm, A_kernel={A_kernel*1e6:.2f} mm^2"
-          f" -> kc_per_volume={kc:.3e} N/m^3")
+    kc = cslc.kc_per_volume
+    print(f"  CSLC kc_per_volume={kc:.3e} N/m^3  "
+          f"(r_pad_avg={r_pad_avg*1e3:.2f} mm, A_kernel={A_kernel*1e6:.2f} mm^2 "
+          f"-> implied per-pad-sphere = {kc * A_kernel:.3e} N/m at saturation)")
 
     cslc_data = CSLCData.from_lattices(
         lattices,
@@ -518,226 +504,6 @@ def patched_cslc_from_model(handler: CSLCHandler):
         yield
     finally:
         CSLCHandler._from_model = original
-
-
-# ── Post-build kc recalibration ────────────────────────────────────────
-
-
-@dataclass
-class _KcCalibCache:
-    """Cached scene constants for the series-spring kc recalibration.
-
-    Populated once at scene build (multiple GPU->CPU syncs to read
-    static model arrays) and reused every step by the fast per-step
-    auto-tune.  All fields are scene-static; only ``contact_fraction``
-    varies between calls.
-    """
-    ke_bulk: float
-    ke_target: float | None
-    ka: float
-    n_surface_per_pad: int
-    A_kernel: float
-
-
-def _build_kc_calib_cache(model, handler) -> _KcCalibCache:
-    """Read all static GPU arrays needed for kc recalibration.
-
-    Called once at scene build (and lazily by the fast auto-tune if
-    not already populated).  After this returns, all subsequent
-    kc updates use the cached constants and are pure CPU math.
-    """
-    d = handler.cslc_data
-    shape_flags = model.shape_flags.numpy()
-    cslc_shape_idx = next(
-        (i for i in range(model.shape_count) if (shape_flags[i] & _CSLC_FLAG)),
-        0,
-    )
-    ke_bulk = float(model.shape_material_ke.numpy()[cslc_shape_idx])
-
-    ke_target: float | None = None
-    if hasattr(handler, "shape_pairs") and handler.shape_pairs:
-        ke_raw = float(handler.shape_pairs[0].other_ke)
-        if ke_raw > 0.0:
-            ke_target = ke_raw
-
-    shape_ids = d.sphere_shape.numpy()
-    is_surface = d.is_surface.numpy()
-    n_pads = int(len(np.unique(shape_ids)))
-    n_surface_per_pad = int(is_surface.sum()) // max(n_pads, 1)
-
-    # Unit-correctness conversion (Option-2 tiling): the kernels multiply
-    # ``kc`` by ``A_j · w_tangent`` (kernel half-width = r_pad), so ``kc``
-    # must be per-volume [N/m³].  ``A_kernel = π·r_pad²`` is the per-sphere
-    # kernel disc area; with non-overlapping tiling, ``kc_per_volume ·
-    # A_kernel = kc_per_sphere`` holds without a fudge factor.
-    radii_all = d.radii.numpy()
-    first_shape = int(shape_ids[0])
-    mask = (shape_ids == first_shape) & (is_surface.astype(bool))
-    r_pad_avg = float(np.mean(radii_all[mask]))
-    A_kernel = float(np.pi * r_pad_avg * r_pad_avg)
-
-    return _KcCalibCache(
-        ke_bulk=ke_bulk, ke_target=ke_target, ka=float(d.ka),
-        n_surface_per_pad=n_surface_per_pad, A_kernel=A_kernel,
-    )
-
-
-def _kc_from_cf(cache: _KcCalibCache, contact_fraction: float
-                ) -> tuple[float, float, int, bool]:
-    """Math-only kc derivation from cached constants and a target cf.
-
-    Returns ``(kc_per_volume, kc_per_sphere, n_contact_per_pad,
-    used_fallback)``.  ``used_fallback`` is True when the analytic
-    series-spring has no positive solution and we fell back to the
-    conservative ``ke_bulk / N_contact``.  No GPU sync, no print.
-    """
-    n_contact = max(int(cache.n_surface_per_pad * contact_fraction), 1)
-    inv_keff = float(n_contact) / cache.ke_bulk
-    inv_kc = inv_keff - 1.0 / cache.ka
-    if cache.ke_target is not None:
-        inv_kc -= 1.0 / cache.ke_target
-    if inv_kc <= 0.0:
-        kc_per_sphere = cache.ke_bulk / n_contact
-        used_fallback = True
-    else:
-        kc_per_sphere = 1.0 / inv_kc
-        used_fallback = False
-    return kc_per_sphere / cache.A_kernel, kc_per_sphere, n_contact, used_fallback
-
-
-def recalibrate_kc_per_pad(model, contact_fraction: float,
-                           *, verbose: bool = True) -> float | None:
-    """Override per-sphere ``kc`` so each pad's aggregate stiffness ≈ ke_bulk.
-
-    Series-spring identity (anchor + contact + target, in series)::
-
-        1/keff_per_sphere = 1/ka + 1/kc + 1/ke_target
-        N_contact_per_pad · keff_per_sphere = ke_bulk
-
-    Solving for ``kc``::
-
-        1/kc = N_contact/ke_bulk - 1/ka - 1/ke_target     (exact)
-        ⇒ kc = ke_bulk / N_contact                        (fallback when 1/kc ≤ 0)
-
-    Builds (and caches) ``handler._kc_cache`` on first call so the
-    per-step fast variant :func:`auto_tune_kc_per_step` can reuse it
-    without GPU syncs.
-
-    Returns the new per-volume ``kc``, or ``None`` if no CSLC handler.
-    """
-    pipeline = getattr(model, "_collision_pipeline", None)
-    handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
-    if handler is None:
-        return None
-
-    if not hasattr(handler, "_kc_cache"):
-        handler._kc_cache = _build_kc_calib_cache(model, handler)
-    cache = handler._kc_cache
-
-    kc_pv, kc_ps, n_contact, used_fallback = _kc_from_cf(cache, contact_fraction)
-
-    if used_fallback:
-        ka_min = cache.ke_bulk / float(n_contact)
-        if cache.ke_target is not None and cache.ke_target > 0.0:
-            inv_term = 1.0 / ka_min - 1.0 / cache.ke_target
-            ka_min = (1.0 / inv_term) if inv_term > 0.0 else float("inf")
-        import warnings as _warnings
-        _warnings.warn(
-            f"recalibrate_kc_per_pad: anchor ka={cache.ka:.3g} too soft for "
-            f"ke_bulk={cache.ke_bulk:.3g} at N_contact_per_pad={n_contact} "
-            + (f"(ke_target={cache.ke_target:.3g}) " if cache.ke_target else "")
-            + f"-- analytic series-spring has no positive kc solution. "
-            f"Falling back to kc=ke_bulk/N_contact={cache.ke_bulk / n_contact:.3g}. "
-            f"To use the analytic formula, raise CSLCParams.ka to > {ka_min:.3g}, "
-            f"or lower contact_fraction so N_contact_per_pad drops.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-
-    if verbose:
-        print(
-            f"  recalibrate_kc_per_pad (Option-2 tiling): "
-            f"new_kc (per-sphere) = {kc_ps:.3e} N/m  -> "
-            f"per-volume = {kc_pv:.3e} N/m^3 "
-            f"(A_kernel={cache.A_kernel * 1e6:.2f} mm^2). "
-            f"Implied per-pad-sphere stiffness = "
-            f"{kc_pv * cache.A_kernel:.3e} N/m "
-            f"(designed = ke_bulk/N_contact = {kc_ps:.3e} N/m)."
-        )
-
-    handler.cslc_data.kc = kc_pv
-    return kc_pv
-
-
-def auto_tune_kc_per_step(model, n_active: int, n_surface: int,
-                          *, ema_alpha: float = 0.1,
-                          cf_min: float = 0.01,
-                          cf_max: float = 0.5,
-                          cf_init: float = 0.05) -> float | None:
-    """Per-step kc auto-tune from measured lattice active fraction.
-
-    Replaces the static ``contact_fraction`` knob with a measurement
-    from the previous step's :func:`read_cslc_state`.  The
-    ``contact_fraction = 0.025`` default targets a dome-pad scene with
-    a small Hertz patch; on a flat-pad-on-sphere or box-on-box scene
-    the actual active fraction is ~0.4-0.8, leaving kc 16-32× too
-    stiff and causing the lattice solver to diverge (see physics
-    investigation notes).
-
-    Mechanism (per call):
-      1. cf_measured = clamp(n_active / n_surface, cf_min, cf_max)
-      2. cf_smoothed = ema_alpha · cf_measured + (1 − ema_alpha) · cf_prev
-         (initialised from cf_init on first call)
-      3. kc_new = _kc_from_cf(cache, cf_smoothed)  -- math only
-      4. cslc_data.kc = kc_new
-
-    All math is pure CPU; the cache (built lazily here if
-    :func:`recalibrate_kc_per_pad` wasn't called first) handles GPU
-    syncs once.  Per-step overhead: ~10 µs.
-
-    Args:
-        model: Newton model with attached CSLC handler.
-        n_active, n_surface: from :func:`read_cslc_state(model)`.
-        ema_alpha: smoothing rate.
-        cf_min, cf_max: clamp on the measured fraction.
-        cf_init: EMA seed on first call (also used when n_active drops
-            to zero, e.g. mid-APPROACH before contact, so the kc
-            doesn't lurch to the cf_min floor).
-
-    Returns:
-        Updated per-volume ``kc``, or ``None`` if no handler / no
-        surface spheres.
-    """
-    pipeline = getattr(model, "_collision_pipeline", None)
-    handler = getattr(pipeline, "cslc_handler", None) if pipeline else None
-    if handler is None or n_surface <= 0:
-        return None
-
-    cache = getattr(handler, "_kc_cache", None)
-    if cache is None:
-        cache = _build_kc_calib_cache(model, handler)
-        handler._kc_cache = cache
-
-    # n_active sums BOTH pads in the current implementation; per-pad
-    # active fraction (which feeds the per-pad calibration formula)
-    # is n_active / n_surface (the n_pads cancels in the ratio).
-    if n_active > 0:
-        cf_measured = max(cf_min, min(cf_max, n_active / max(n_surface, 1)))
-    else:
-        # No contact yet (APPROACH phase) -- seed at cf_init so the EMA
-        # doesn't drift to cf_min and over-stiffen the moment contact
-        # engages.
-        cf_measured = cf_init
-
-    prev = getattr(handler, "_cf_smoothed", None)
-    cf = cf_measured if prev is None else (
-        ema_alpha * cf_measured + (1.0 - ema_alpha) * prev
-    )
-    handler._cf_smoothed = cf
-
-    kc_pv, _, _, _ = _kc_from_cf(cache, cf)
-    handler.cslc_data.kc = kc_pv
-    return kc_pv
 
 
 # ── High-level convenience ──────────────────────────────────────────────

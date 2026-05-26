@@ -4,22 +4,33 @@
 ###########################################################################
 # Example UXPBD Pick and Place (Scenario A)
 #
-# A Franka arm with lattice-shelled finger pads friction-grasps a free
-# shape-matched rigid cube (mass 0.3 kg, mu=0.7) and lifts it.
-# Phase machine: APPROACH -> SQUEEZE -> LIFT -> HOLD.
+# A spherical Franka arm — each link is shelled by a sphere lattice attached
+# via add_lattice — near a free shape-matched rigid cube (mass 0.3 kg,
+# mu=0.7). The robot loads from assets/panda/urdfs/10/sphere_panda.urdf:
+# the articulated 7-DOF chain (fingers fixed) is loaded as rigid bodies, and
+# each link's child collision spheres are stripped from the URDF and
+# re-attached as a UXPBD lattice (substrate 0, anchored to the link).
+# Phase machine: APPROACH -> SQUEEZE (placeholder) -> LIFT -> HOLD.
 #
 # Phase 2 demo: validates the cross-substrate lattice <-> SM-rigid contact
-# path with friction closure. Requires Phase 2 PBD-R kernels (CUDA only).
+# path. Requires Phase 2 PBD-R kernels (CUDA only).
 #
 # Command: python -m newton.examples uxpbd_pick_and_place
 ###########################################################################
 
+
+import tempfile
+import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import numpy as np
 import warp as wp
 
 import newton
 import newton.examples
+
+_ASSETS_DIR = Path(__file__).resolve().parents[3] / "assets"
+SPHERE_PANDA_URDF = _ASSETS_DIR / "panda" / "urdfs" / "25" / "sphere_panda.urdf"
 
 FRANKA_HOME_Q = [
     0.0,
@@ -42,10 +53,9 @@ PHASE_HOLD = 3
 def _find_body(builder, label):
     """Find a body index by suffix match on body_label.
 
-    URDF bodies are registered with a URDF-name prefix, e.g.
-    ``fr3/fr3_leftfinger``. This helper matches any label whose last
-    path component equals *label*, so callers do not need to know the
-    prefix.
+    URDF bodies are registered with a URDF-name prefix (e.g. ``panda/panda_link3``).
+    This helper matches any label whose last path component equals *label*, so
+    callers do not need to know the prefix.
     """
     for i, lbl in enumerate(builder.body_label):
         if lbl == label or lbl.split("/")[-1] == label:
@@ -54,48 +64,111 @@ def _find_body(builder, label):
         f"Body '{label}' not found in builder. Available: {builder.body_label}")
 
 
-def _attach_pad_lattice(builder, link_idx, half_extents, pos):
-    """Build a 2x2x2 uniform lattice inside a finger pad and attach via add_lattice.
+def _prepare_sphere_panda_urdf(urdf_path):
+    """Preprocess a spherical-Panda URDF for use with ``add_urdf`` + ``add_lattice``.
 
-    The lattice is a 2x2x2 grid of equal-radius spheres inscribed in the
-    rectangular pad volume. All spheres are marked as surface particles
-    (is_surface=1) so they participate in cross-substrate contact.
+    Two transforms are applied to the in-memory XML:
 
-    Args:
-        builder: The ModelBuilder in progress.
-        link_idx: Body index of the finger link to host the lattice.
-        half_extents: (hx, hy, hz) half-extents [m] of the pad in link-local frame.
-        pos: World-space position of the finger body at t=0 (after FK). The
-            lattice particles are placed in world space as ``pos + p_local``,
-            so the anchor constraint sees zero error on frame 1. Without
-            this, mass-0 lattice particles get pulled across the world by
-            the stiff anchor and the solver diverges to NaN within a couple
-            of steps.
+    1. **Strip the sphere lattice children.** The sphere_panda format (see
+       ``assets/panda/urdfs/<N>/sphere_panda.urdf``) encodes each link's
+       collision lattice as N child links named ``<parent>_sphereK`` attached
+       via a fixed joint ``<parent>_to_<parent>_sphereK`` whose origin xyz is
+       the sphere center in the parent's local frame; the child link holds the
+       sphere's radius in its collision geometry. We pull that data into a
+       dict suitable for ``ModelBuilder.add_lattice(morphit_json=...)`` and
+       drop the children so the remaining URDF is just the articulated chain.
+    2. **Re-actuate the finger joints.** The source URDF ships the gripper
+       finger joints (``panda_finger_joint{1,2}``) as ``fixed`` with their
+       prismatic ``<limit>`` element commented out (frozen-hand variant).
+       We promote them back to ``prismatic`` with the limits the source URDF
+       documents, so the gripper has the 2 DOFs needed for pick-and-place.
+
+    Returns:
+        (cleaned_tree, link_lattices) where ``link_lattices`` maps parent
+        link name -> {"centers": [[x,y,z], ...], "radii": [r, ...],
+        "is_surface": [1, ...]}.
     """
-    hx, hy, hz = half_extents
-    n_per_axis = 2
-    sphere_r = min(hx, hy, hz) / n_per_axis
-    coords_x = np.linspace(-hx + sphere_r, hx - sphere_r, n_per_axis)
-    coords_y = np.linspace(-hy + sphere_r, hy - sphere_r, n_per_axis)
-    coords_z = np.linspace(-hz + sphere_r, hz - sphere_r, n_per_axis)
+    tree = ET.parse(urdf_path)
+    root = tree.getroot()
 
-    centers = []
-    radii = []
-    is_surface = []
-    for x in coords_x:
-        for y in coords_y:
-            for z in coords_z:
-                centers.append([float(x), float(y), float(z)])
-                radii.append(float(sphere_r))
-                is_surface.append(1)
+    link_by_name = {link.get("name"): link for link in root.findall("link")}
 
-    builder.add_lattice(
-        link=link_idx,
-        morphit_json={"centers": centers,
-                      "radii": radii, "is_surface": is_surface},
-        total_mass=0.0,
-        pos=pos,
-    )
+    # Limits restored on the finger joints; values match the commented-out
+    # <limit> in the source URDF (effort N, lower/upper m, velocity m/s).
+    _FINGER_LIMITS = {
+        "effort": "20", "lower": "0.0", "upper": "0.04", "velocity": "0.2",
+    }
+    # The source URDF's finger joints have the rpy=π marker on the LEFT
+    # finger (and a negated axis on the right), which (a) makes both fingers
+    # translate to the same side of the hand on open, and (b) — combined
+    # with identical sphere centers in both finger links' local frames —
+    # bunches the gripper lattice onto one side instead of mirroring it
+    # across the hand axis. The original Franka URDF (fr3_franka_hand) puts
+    # the π flip on the RIGHT finger with axis (0,1,0) on both joints; we
+    # rewrite both joints to that convention so the gripper opens
+    # symmetrically and the per-finger sphere lattices mirror correctly.
+    _FINGER_JOINT_FIX = {
+        "panda_finger_joint1": {"rpy": "0 0 0",
+                                "axis": "0 1 0"},  # left
+        "panda_finger_joint2": {"rpy": "0 0 3.141592653589793",
+                                "axis": "0 1 0"},  # right
+    }
+
+    link_lattices: dict[str, dict[str, list]] = {}
+    joints_to_remove = []
+    child_links_to_remove: set[str] = set()
+    for joint in root.findall("joint"):
+        name = joint.get("name") or ""
+        if name in _FINGER_JOINT_FIX:
+            joint.set("type", "prismatic")
+            fix = _FINGER_JOINT_FIX[name]
+            origin_el = joint.find("origin")
+            if origin_el is not None:
+                origin_el.set("rpy", fix["rpy"])
+            axis_el = joint.find("axis")
+            if axis_el is not None:
+                axis_el.set("xyz", fix["axis"])
+            # Remove any existing <limit> (shouldn't exist, but be defensive)
+            # and add a fresh one with the documented gripper limits.
+            for existing in list(joint.findall("limit")):
+                joint.remove(existing)
+            limit_el = ET.SubElement(joint, "limit")
+            for k, v in _FINGER_LIMITS.items():
+                limit_el.set(k, v)
+            continue
+        if "_sphere" not in name:
+            continue
+        parent_el = joint.find("parent")
+        child_el = joint.find("child")
+        if parent_el is None or child_el is None:
+            continue
+        parent = parent_el.get("link")
+        child = child_el.get("link")
+        child_link = link_by_name.get(child)
+        if child_link is None:
+            continue
+        col = child_link.find("collision/geometry/sphere")
+        if col is None:
+            continue
+        origin = joint.find("origin")
+        xyz = [0.0, 0.0, 0.0] if origin is None else [
+            float(v) for v in origin.get("xyz", "0 0 0").split()]
+        radius = float(col.get("radius"))
+
+        entry = link_lattices.setdefault(
+            parent, {"centers": [], "radii": [], "is_surface": []})
+        entry["centers"].append(xyz)
+        entry["radii"].append(radius)
+        entry["is_surface"].append(1)
+        joints_to_remove.append(joint)
+        child_links_to_remove.add(child)
+
+    for j in joints_to_remove:
+        root.remove(j)
+    for cname in child_links_to_remove:
+        root.remove(link_by_name[cname])
+
+    return tree, link_lattices
 
 
 class Example:
@@ -113,54 +186,70 @@ class Example:
         builder = newton.ModelBuilder(up_axis="Z")
         builder.add_ground_plane()
 
-        # Franka FR3 arm with hand (9 DOFs: 7 arm revolutes + 2 finger prismatic).
+        # Spherical Panda: 7-DOF revolute chain with fixed hand/fingers.
+        # The URDF's per-link collision spheres are stripped here and
+        # re-attached below as UXPBD lattices anchored to each link.
+        cleaned_tree, link_lattices = _prepare_sphere_panda_urdf(SPHERE_PANDA_URDF)
+        with tempfile.NamedTemporaryFile(
+                suffix=".urdf", delete=False, mode="wb") as _tmp:
+            cleaned_tree.write(_tmp)
+            cleaned_urdf_path = _tmp.name
         builder.add_urdf(
-            newton.utils.download_asset(
-                "franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
+            cleaned_urdf_path,
             xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.0), q=wp.quat_identity()),
             floating=False,
             enable_self_collisions=False,
-            collapse_fixed_joints=True,
+            collapse_fixed_joints=False,
         )
 
-        # Set arm home pose and finger open width BEFORE attaching the lattices.
-        # The lattice anchor is rigid (mass-0 particles) and starts in world space
-        # at ``pos + p_local``; if ``pos`` does not match the finger's home-pose
-        # world position, the anchor sees a huge initial error and diverges to NaN.
-        # The target gains replicate the PD-gravity-comp tuning from robot_lift.py.
+        # Set arm home pose + open-gripper width (9 DOFs: 7 arm revolutes
+        # plus the 2 prismatic finger joints re-actuated above). The target
+        # gains replicate the PD-gravity-comp tuning from robot_lift.py;
+        # finger gains are softer so a future SQUEEZE doesn't launch the
+        # cube on contact.
         builder.joint_q[:7] = FRANKA_HOME_Q
         builder.joint_q[7:9] = [FINGER_OPEN, FINGER_OPEN]
         builder.joint_target_pos[:9] = builder.joint_q[:9]
+        builder.joint_target_ke[:9] = [4500, 4500,
+                                       3500, 3500, 2000, 2000, 2000, 500, 500]
+        builder.joint_target_kd[:9] = [
+            450, 450, 350, 350, 200, 200, 200, 50, 50]
 
-        # Probe FK to read the finger bodies' home-pose world transforms. We
-        # finalize the URDF-only builder, run eval_fk, and discard; the second
-        # finalize below picks up the lattices and cube added after this point.
-        finger_l_idx = _find_body(builder, "fr3_leftfinger")
-        finger_r_idx = _find_body(builder, "fr3_rightfinger")
+        # Probe FK to read each link's home-pose world position. The lattice
+        # anchor is rigid (mass-0 particles) and starts in world space at
+        # ``pos + p_local``; if ``pos`` does not match the link's home-pose
+        # world position the anchor sees a huge initial error and the
+        # solver diverges to NaN within a couple of steps.
         _probe_model = builder.finalize()
         _probe_state = _probe_model.state()
         newton.eval_fk(_probe_model, _probe_model.joint_q,
                        _probe_model.joint_qd, _probe_state)
         _probe_bq = _probe_state.body_q.numpy()
-        finger_l_pos = wp.vec3(*[float(v)
-                               for v in _probe_bq[finger_l_idx, :3]])
-        finger_r_pos = wp.vec3(*[float(v)
-                               for v in _probe_bq[finger_r_idx, :3]])
 
-        # Attach a 2x2x2 lattice to each finger pad so they participate in
-        # particle-based contact with the cube. The pad geometry is chosen to
-        # match the physical finger tip dimensions of the Franka Hand.
-        # Pad half-extents [m]: hx=cross-gap, hy=width, hz=height along finger
-        pad_half = (0.012, 0.004, 0.025)
-        _attach_pad_lattice(builder, finger_l_idx, pad_half, finger_l_pos)
-        _attach_pad_lattice(builder, finger_r_idx, pad_half, finger_r_pos)
-
-        # PD gains: arm joints use high stiffness; finger joints are softer
-        # so they can be compliant without launching the cube.
-        builder.joint_target_ke[:9] = [4500, 4500,
-                                       3500, 3500, 2000, 2000, 2000, 500, 500]
-        builder.joint_target_kd[:9] = [
-            450, 450, 350, 350, 200, 200, 200, 50, 50]
+        # Attach a sphere lattice to each Panda link that carried spheres in
+        # the source URDF. Each lattice's particles are anchored to the link
+        # via add_lattice's mass-0 rigid anchor constraint, so the robot moves
+        # rigidly while its collision surface is a particle lattice that
+        # participates in cross-substrate UXPBD contact. Both the link's
+        # world position AND rotation must be passed; add_lattice places each
+        # particle at ``rot * p_local + pos`` at t=0 and any mismatch with the
+        # link's actual world pose injects a huge initial constraint error
+        # (most Panda links have non-trivial rotation at home pose).
+        for link_name, spheres in link_lattices.items():
+            link_idx = _find_body(builder, link_name)
+            bq = _probe_bq[link_idx]
+            link_pos = wp.vec3(float(bq[0]), float(bq[1]), float(bq[2]))
+            # body_q quaternion layout is (qx, qy, qz, qw); wp.quat uses the
+            # same xyzw layout.
+            link_rot = wp.quat(float(bq[3]), float(bq[4]),
+                               float(bq[5]), float(bq[6]))
+            builder.add_lattice(
+                link=link_idx,
+                morphit_json=spheres,
+                total_mass=0.0,
+                pos=link_pos,
+                rot=link_rot,
+            )
 
         # Pickable cube: 4x4x4 sphere packing inscribed in a 0.08 m cube.
         # Total mass 0.3 kg, mu=0.7 (friction-closure grasp). The sphere packing
@@ -181,7 +270,39 @@ class Example:
             pos=wp.vec3(0.55, 0.0, 0.05),
         )
 
+        # Fluid block dropping onto the robot's upper arm. Centered above
+        # panda_link2 (shoulder, world (0, 0, 0.333)) at z=0.95; the block
+        # free-falls ~0.6 m onto the lattice, cascading down the chain.
+        # 6x6x4 = 144 particles, particle radius 8 mm, cells touching at
+        # 16 mm spacing (rest_density matches add_fluid_grid default).
+        fluid_dims = (6, 6, 4)
+        fluid_cell = 0.016
+        fluid_r = 0.008
+        fluid_corner = wp.vec3(
+            -(fluid_dims[0] - 1) * fluid_cell / 2,
+            -(fluid_dims[1] - 1) * fluid_cell / 2,
+            0.95,
+        )
+        builder.add_fluid_grid(
+            pos=fluid_corner,
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=fluid_dims[0], dim_y=fluid_dims[1], dim_z=fluid_dims[2],
+            cell_x=fluid_cell, cell_y=fluid_cell, cell_z=fluid_cell,
+            particle_radius=fluid_r,
+            rest_density=1000.0,
+            smoothing_radius_factor=3.0,
+            viscosity=0.05,
+            cohesion=0.0,
+        )
+
         self.model = builder.finalize()
+        # Cap particle velocity to suppress cross-substrate "impact launch"
+        # when the fluid block hits the robot's lattice (see the note in
+        # example_uxpbd_lattice_into_fluid for the underlying mechanism).
+        # Only applies to mass>0 particles, so the lattice anchors are
+        # unaffected and the cube grasp dynamics still play normally.
+        self.model.particle_max_velocity = 2.0
         # Friction coefficient on cube particles (mu for particle-particle and
         # particle-shape contacts, including the lattice finger pads). The
         # particle-shape kernel uses mu = 0.5 * (particle_mu + shape_material_mu[shape]),
@@ -193,7 +314,8 @@ class Example:
             np.full(self.model.shape_count, 0.7, dtype=np.float32))
 
         self.solver = newton.solvers.SolverUXPBD(
-            self.model, iterations=8, shock_propagation_k=1.0)
+            self.model, iterations=8, shock_propagation_k=1.0,
+            fluid_iterations=4)
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
@@ -210,7 +332,8 @@ class Example:
 
         Each phase transition updates joint_target_pos on the control object.
         APPROACH: wait 1 s (arm already at home pose near cube).
-        SQUEEZE:  close fingers from FINGER_OPEN to FINGER_CLOSED over 1 s.
+        SQUEEZE:  close fingers from FINGER_OPEN to FINGER_CLOSED so the
+                  gripper lattice friction-grasps the cube before LIFT.
         LIFT:     retract elbow joint (joint_q[3]) to raise the end-effector.
         HOLD:     freeze targets indefinitely.
         """

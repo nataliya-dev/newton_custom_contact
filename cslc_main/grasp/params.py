@@ -239,7 +239,7 @@ class PadParams:
     # Number of Lloyd/CVT samples drawn per pad contact face.  Determines
     # the resolution of the lattice; ``sample_mesh_lloyd`` returns
     # exactly this count.
-    n_samples: int = 100
+    n_samples: int = 50
 
     # k for the k-NN neighbour graph used to wire each lattice sphere to
     # its lateral-spring neighbours.  6 ≈ Delaunay valency in 2-D, which
@@ -314,7 +314,7 @@ class MaterialParams:
     # ``calibrate_kc(ke_bulk=...)`` on the pad lattice.  Under
     # ``contact_model="hydro"`` this field is unused (hydro reads
     # ``kh`` for physical compliance instead).
-    ke_pad_physical: float = 5.0e2
+    ke_pad_physical: float = 5.0e4
 
     # Object's physical contact stiffness [N/m].  Enters the
     # series-spring composition ``1/kc_eff = 1/kc + 1/ke_target`` in
@@ -322,16 +322,22 @@ class MaterialParams:
     # stiffness (which is intrinsically coupled to the regularisation
     # timeconst by MuJoCo's API -- see class docstring's MuJoCo
     # regularization coupling note).
-    ke_target_physical: float = 5.0e2
+    ke_target_physical: float = 5.0e4
 
     # Hydroelastic physical-compliance modulus [Pa/m].  Used ONLY when
     # ``contact_model="hydro"``; setting this under CSLC or point has
-    # NO effect.  Default 5.3e8 is fair-calibrated against
-    # ``ke_pad_physical`` at the expected contact patch area (see
-    # cslc_mujoco/summary.md §2), so the squeeze-sweep can treat CSLC
-    # ``ke_pad_physical`` and hydro ``kh`` as the parallel "physical
-    # material" axis.
-    kh: float = 5.3e8
+    # NO effect.
+    #
+    # Sweep on tennis-ball lift (pad commanded to z = 54 mm at HOLD):
+    #     5e7  → ball slips out (held=N), 21 mm settle gap below pad
+    #     5.3e8 → held, peak 63 mm, +12 mm jump, 2 mm settle gap
+    # *   5e9  → held, peak 57 mm, +3.3 mm jump, settles within 0.8 mm
+    #             of pad target.  BEST: matches CSLC default
+    #             ``kc_per_volume = 1.5e8`` lift outcome for apples-to-
+    #             apples comparison.  kh/kc ratio ≈ 30 because hydro
+    #             integrates over the smaller Hertz contact disc while
+    #             CSLC integrates over its locality kernel disc.
+    kh: float = 5.0e9
 
     # Hunt-Crossley damping coefficient [N·s/m].  Used by ``point``
     # contact.  Under ``cslc`` the emission kernel writes
@@ -393,98 +399,134 @@ class MaterialParams:
 class CSLCParams:
     """Knobs for the CSLC (Compliant Sphere Lattice Contact) model.
 
-    Defaults are the may_18 production values that ship 4-6 mm XY slip
-    on the dome pad_lift test (see ``cslc_mujoco/may_18_summary.md``
-    §4).  ``contact_fraction`` is the only knob that needs scene-
-    dependent tuning — it scales the kc recalibration to the empirical
-    active-sphere fraction at the operating face_pen.
+    Contact force law (Hertz-like ``raw^(3/2)``):
+        F_per_contact = kc · A_j · w_tangent · α · gate · raw^1.5
+    Per-MuJoCo-contact LOCAL stiffness is the derivative:
+        dF/d(raw) = 1.5 · kc · A_j · w_tangent · α · gate · √raw
+    which vanishes at first touch (raw → 0) and grows as √raw at depth
+    — same scaling as Hertz's local stiffness ``2·E*·√(R·δ)``.  This
+    eliminates the constant-stiffness impulse-on-engagement that broke
+    the previous linear-law model across most material stiffnesses.
+
+    Sphere-on-flat integration: ``∫ raw^1.5 dA ≈ (4πR/5)·δ^2.5``, so the
+    aggregate ``F_total ∝ δ^2.5`` — one power stiffer than Hertz's
+    ``δ^1.5`` because the contact patch grows with δ.  ``kc`` is
+    therefore not literally a Young's modulus; the kc-to-E mapping
+    picks a representative operating depth δ_op and matches local
+    stiffness at that depth (see field comment below).
+
+    Units: ``kc`` has units N / (m² · m^1.5) = Pa · m^(−1/2).  Previous
+    linear-law default 1.5e8 Pa/m no longer applies; new default
+    3e10 Pa·m^(−1/2) verified on tennis-ball lift.
+
+    Tune intentionally:
+      - ``kc_per_volume`` -- primary contact stiffness, derive from
+        material via ``kc ≈ (5/3π) · E* / (√R · δ_op)`` at a chosen
+        operating depth.
+      - ``ka`` has a threshold (~10·weight, scene-dependent); above it
+        the value is irrelevant.  Below it, lattice goes liquid and
+        the ball squirts sideways.
+      - ``kl``, ``k_stick``, ``ka_tangent_ratio`` don't move lift
+        outcome on the standard tennis-ball test; reserve for shear-
+        dominated or Poisson-bulging studies.
+      - ``smoothing_eps``, ``n_iter``, ``alpha`` are numerical and
+        calibrated together; change one, you may need to change another.
     """
 
-    # Anchor stiffness [N/m] — pulls each lattice sphere back toward its
-    # rest position relative to the pad body.  Above the threshold
-    # ke_bulk/(N − ke_bulk/ke_target) ≈ 16667 to admit a positive kc; see
-    # ``cslc_data.calibrate_kc``.
-    ka: float = 25_000.0
+    # Per-volume contact stiffness [Pa · m^(−1/2)].  PRIMARY contact knob.
+    # Hertz-like force: F = kc · A_j · w_tangent · α · gate · raw^1.5.
+    #
+    # Sweep on tennis-ball lift after the Hertz revision (pad commanded
+    # to z = 54 mm at HOLD):
+    #     1e9   → held, peak 58 mm, +7.5 mm jump
+    #     3e9   → held, peak 57 mm, +6.3 mm jump
+    #     5e9   → held, peak 55 mm, +3.8 mm jump
+    #     1e10  → held, peak 55 mm, +4.0 mm jump
+    # *   3e10  → held, peak 56 mm, +2.8 mm jump, settles within 1.4 mm
+    #             of pad target.  BEST: smallest peak-to-final excursion;
+    #             corresponds to a silicone-stiffness pad (E ~ 1e7 Pa)
+    #             at δ_op = 1 mm via kc ≈ (5/3π) E* / (√R · δ_op).
+    #
+    # Material → kc mapping (kc such that local stiffness at δ_op matches
+    # Hertz 2·E*·√(R·δ_op)):
+    #     foam        E=1e5, δ_op=1mm → kc ≈ 3e8
+    #     silicone    E=1e6              → kc ≈ 3e9
+    #     rubber      E=1e7              → kc ≈ 3e10  (DEFAULT)
+    #     hard rubber E=1e8              → kc ≈ 3e11
+    #
+    # Fair comparison against ``contact_model="point"`` / ``"hydro"``:
+    # use this default with MaterialParams.kh = 5e9 (hydro) and
+    # MaterialParams.ke_pad_physical = 5e4 (point) -- the three models
+    # then deliver ``final_z`` within 2 mm of each other and jump
+    # < 4 mm on the tennis-ball test.  Comparison with hydro ``kh``
+    # (units Pa/m) requires picking an operating depth: at δ_op = 1 mm,
+    # ``kh ≈ 1.5 · kc · √δ_op`` for matched local stiffness.
+    kc_per_volume: float = 3.0e10
+
+    # Anchor stiffness [N/m] — pulls each lattice sphere back toward
+    # its rest position relative to the pad body.  Threshold knob:
+    #     3.5e3 → lattice liquefies, ball slides 230 mm sideways
+    #   ≥3.5e4 → identical outcome (sweep: 35k, 350k both held cleanly)
+    # Set to comfortably exceed the threshold for your scene.  Raising
+    # past ~10× the object weight buys nothing.
+    ka: float = 35_000.0
 
     # Lateral / distance-preservation stiffness [N/m] connecting each
-    # sphere to its k-NN neighbours.  may_18 default is 5000 (Micro-3
-    # production value); raise to ~25000 to surface geometric Poisson
-    # bulging at the cost of grip strength on dome pads.
-    kl: float = 5_000.0
+    # sphere to its k-NN neighbours.  Skin elasticity knob:
+    #         0 → spheres act alone, slip rises to ~6.7 mm
+    # *    1000 → held cleanly, slip ~2.5 mm (BEST for tennis ball)
+    #     20000 → lattice over-coupled, can't conform to curvature,
+    #             lift truncated (final_z 49 vs 60 mm)
+    # Raise toward ~25000 only if studying Poisson-bulging behaviour;
+    # it costs grip strength.
+    kl: float = 1_000.0
 
-    # Contact damping coefficient [-].  CURRENTLY UNUSED at emission --
-    # ``write_cslc_contacts`` writes ``out_damping = 0.0`` (uses MuJoCo's
-    # stiffness-derived timeconst branch).  Plumbed through to Newton's
-    # ``shape_cslc_dc`` array for kernel-signature stability; setting
-    # this value has NO effect on emitted contacts.  Kept as a knob for
-    # future Hunt-Crossley reintroduction.
-    dc: float = 2.0
-
-    # Per-step Jacobi refinement iterations on top of the closed-form
-    # warm-start.  Each iteration is one wp.launch of ``jacobi_step``;
-    # cost scales linearly.
-    #
-    # The physics-investigation sweep (see notes.md / probe_failure.py)
-    # shows a sharp phase transition at n_iter=20: at n_iter <= 10 the
-    # damped Jacobi can diverge on stiff scenes (sphere grasp at
-    # ill-calibrated kc explodes to max_δ ~ 3 m); n_iter >= 20 lands at
-    # max_δ ~ 0.4 mm regardless of calibration.  Returns saturate by
-    # n_iter=40 (no further improvement at 80).  20 is the production-
-    # safe default; raise to 40 for paper-grade convergence margin.
+    # Per-step Jacobi refinement iterations.  Each is one
+    # ``wp.launch(jacobi_step)``; cost scales linearly.
+    #     3 → under-converged, ball slips out (held=N)
+    # * 15 → converged on this scene (BEST cost/quality)
+    #    40 → no measurable improvement over 15
+    # Coupled with ``alpha``: low alpha needs more iters to converge.
     n_iter: int = 20
 
-    # Damping factor in the Jacobi step.  0.6 balances stability and
-    # convergence rate.
+    # Damping factor in the Jacobi step.  Coupled with ``n_iter``.
+    #   0.2 → too damped, lattice can't reach equilibrium in n_iter=15
+    # * 0.6 → converges cleanly (BEST)
+    #   0.9 → aggressive but stable on this scene
     alpha: float = 0.6
 
-    # Initial / fallback fraction of surface spheres considered "active"
-    # under the operating penetration.  Drives the kc recalibration so
-    # the per-pad aggregate stiffness equals ke_bulk.  When
-    # ``auto_tune_contact_fraction`` is True (default), this seeds the
-    # EMA at t=0 and is otherwise unused: per-step ``n_active`` from
-    # ``read_cslc_state`` drives kc recalibration directly, eliminating
-    # the scene-specific tuning that used to require knowing the active
-    # fraction in advance (0.025 for dome pads, ~0.05 for box pads on
-    # spheres, ~0.15 for box pads on boxes -- a 6x sensitivity range).
-    contact_fraction: float = 0.025
-
-    # Auto-tune ``contact_fraction`` per step from the previous step's
-    # measured active sphere count.  When True (default), the static
-    # ``contact_fraction`` above is only the t=0 seed; thereafter kc is
-    # recomputed each step from the actual lattice state.  Set False to
-    # pin kc at the static-cf calibration (legacy behaviour).
-    auto_tune_contact_fraction: bool = True
-
-    # EMA smoothing rate for the auto-tuned contact fraction.  0.1
-    # means each step's measurement contributes 10% to the running
-    # average; the lattice adapts to step-changes in active fraction
-    # over ~30 steps (= 60 ms at dt=2 ms).  Lower = slower adaptation
-    # but more robust to transients; higher = faster but jittery.
-    contact_fraction_ema_alpha: float = 0.1
-
-    # Anisotropy of the anchor: tangent_axis_ka = ka × ratio.  1.0 =
-    # isotropic; 1/3 (≈0.333) matches incompressible-flesh Poisson
-    # ν → 0.5.
+    # Anisotropy of the anchor: tangent_axis_ka = ka × ratio.
+    # No measurable effect on the symmetric squeeze-and-lift grasp
+    # (sweep 0.333 / 1.0 / 3.0 all within noise).  Matters for shear-
+    # dominated motion; 1/3 (≈0.333) matches incompressible-flesh
+    # Poisson ν → 0.5.
     ka_tangent_ratio: float = 1.0
 
     # Differentiability width [m] for the kernel smooth-step gates.
-    # Tighter ε ≈ stiffer contact, less differentiability.  5e-4 is
-    # the production default from ``cslc_mujoco/pad_lift_test``,
-    # empirically calibrated on dome pads: tighter values (1e-4)
-    # produce bimodal slip behaviour ("always cascades" or
-    # "sometimes 7 mm, sometimes 360 mm").
+    #   1e-4 → sharper gates, effective contact stiffens, lift truncated
+    # * 5e-4 → calibrated sweet spot
+    #   2e-3 → tail extends past surface, back-side samples leak in,
+    #          ball slips out (12.5 mm slip)
+    # Bigger eps breaks worse than smaller.  Couples with ``kc_per_volume``
+    # (sharper gates ≈ effectively stiffer kc).
     smoothing_eps: float = 5.0e-4
 
-    # Stick-slip friction stiffness [N/m] on the tangential δ_t.  Set
-    # to 0 to disable friction entirely.  The friction COEFFICIENT used
-    # by the stick-slip block (and by MuJoCo's Coulomb cone on emitted
-    # contacts) lives on :attr:`MaterialParams.mu` -- single source of
-    # truth across both friction sites.
+    # Stick-slip friction stiffness [N/m] on the tangential δ_t.  For
+    # the symmetric squeeze-and-lift test this knob is a NO-OP: 0,
+    # 25000, and 250000 all give identical lift (within 0.2 mm) and
+    # identical slip (within 0.2 mm).  Grip on this scene is dominated
+    # by normal force + MuJoCo-level Coulomb friction; the lattice's
+    # tangential δ stays small enough that the stick-slip term is
+    # negligible.
+    #
+    # Become relevant only when lattice slip > a few mm (shear-heavy
+    # motions, low-friction objects, asymmetric grasps).  Friction
+    # COEFFICIENT lives on :attr:`MaterialParams.mu` -- single source
+    # of truth across both the stick-slip block and MuJoCo's cone.
     k_stick: float = 25_000.0
 
     # If True, build the dense A_inv (= (K + kc·I)^-1) for the
     # closed-form linear warm-start before the Jacobi refinement.
-    # Required for the may_18 hybrid solver path.
     build_A_inv: bool = True
 
 
@@ -781,8 +823,8 @@ class GraspConfig:
             f"  pad      : {p.kind}  n_samples={p.n_samples}  "
             f"k_neighbors={p.k_neighbors}  approach_gap={p.approach_gap * 1e3:.0f} mm",
             f"  material : ke={m.ke:.0f}  kd={m.kd:.0f}  mu={m.mu:.2f}",
-            f"  cslc     : ka={c.ka:.0f}  kl={c.kl:.0f}  "
-            f"cf={c.contact_fraction:.3f}  k_stick={c.k_stick:.0f}",
+            f"  cslc     : kc={c.kc_per_volume:.2e}  ka={c.ka:.0f}  "
+            f"kl={c.kl:.0f}  k_stick={c.k_stick:.0f}",
             f"  timing   : dt={t.dt * 1e3:.2f} ms  total_steps={self.total_steps}  "
             f"phases={'+'.join(name for name, _ in self.phase_sequence)}",
             f"  run_dir  : {self.run_dir()}",

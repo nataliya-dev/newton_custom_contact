@@ -309,10 +309,6 @@ def build_scene(config: GraspConfig) -> SceneArtifacts:
         with contact_models.patched_cslc_from_model(handler):
             _ = model.contacts()  # triggers _init_collision_pipeline
 
-        # Per-scene kc recalibration so each pad's aggregate stiffness
-        # matches ke_bulk under the expected contact fraction.
-        contact_models.recalibrate_kc_per_pad(model, config.cslc.contact_fraction)
-
     elif config.contact_model == "hydro":
         # Pre-construct the collision pipeline with
         # ``HydroelasticSDF.Config(output_contact_surface=True)`` so the

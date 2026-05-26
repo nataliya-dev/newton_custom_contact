@@ -159,8 +159,11 @@ def _add_grasp_args(parser: argparse.ArgumentParser) -> None:
                         "Used only under --contact-model hydro; ignored "
                         "under CSLC / point.  See MaterialParams.kh.")
     g.add_argument(
-        "--cslc-contact-fraction", type=float, default=None,
-        help="Override CSLC contact-fraction prior used by kc recalibration.",
+        "--cslc-kc", type=float, default=None,
+        help="Override CSLC per-volume contact stiffness kc_per_volume "
+             "[N/m^3 = Pa/m].  PRIMARY contact knob -- kernels multiply by "
+             "per-sample area A_j and locality kernel to get per-contact "
+             "stiffness.  Default 1.5e7.",
     )
     g.add_argument(
         "--cslc-smoothing-eps", type=float, default=None,
@@ -188,8 +191,8 @@ def _apply_args_to_config(args, config: GraspConfig) -> GraspConfig:
         config.cslc.kl = args.cslc_kl
     if args.cslc_ka is not None:
         config.cslc.ka = args.cslc_ka
-    if args.cslc_contact_fraction is not None:
-        config.cslc.contact_fraction = args.cslc_contact_fraction
+    if args.cslc_kc is not None:
+        config.cslc.kc_per_volume = args.cslc_kc
     if args.cslc_smoothing_eps is not None:
         config.cslc.smoothing_eps = args.cslc_smoothing_eps
     if args.cslc_alpha is not None:

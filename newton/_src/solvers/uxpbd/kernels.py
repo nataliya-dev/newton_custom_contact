@@ -91,6 +91,7 @@ def solve_particle_shape_contacts_uxpbd(
     particle_substrate: wp.array[wp.uint8],
     particle_to_lattice: wp.array[wp.int32],
     lattice_link: wp.array[wp.int32],
+    body_articulation: wp.array[wp.int32],
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_com: wp.array[wp.vec3],
@@ -145,11 +146,21 @@ def solve_particle_shape_contacts_uxpbd(
     shape_index = contact_shape[tid]
     shape_link = shape_body[shape_index]
 
-    # Self-contact guard for the lattice case.
+    # Self-contact guard for the lattice case. Skip same host, and also
+    # skip cross-link pairs on the same articulation: adjacent URDF links
+    # carry placeholder collision shapes that are physically enclosed by
+    # neighbours' lattice spheres, and treating those as contacts launches
+    # the kinematic chain. -1 (free body) is treated as a unique
+    # articulation so two free bodies still collide.
     if is_lattice:
         host_link = lattice_link[particle_to_lattice[particle_index]]
         if shape_link == host_link:
             return
+        if shape_link >= 0:
+            art_host = body_articulation[host_link]
+            art_shape = body_articulation[shape_link]
+            if art_host >= 0 and art_host == art_shape:
+                return
 
     px = particle_x[particle_index]
     pv = particle_v[particle_index]
@@ -259,6 +270,7 @@ def solve_particle_particle_contacts_uxpbd(
     particle_substrate: wp.array[wp.uint8],
     particle_to_lattice: wp.array[wp.int32],
     lattice_link: wp.array[wp.int32],
+    body_articulation: wp.array[wp.int32],
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
     body_m_inv: wp.array[wp.float32],
@@ -276,8 +288,13 @@ def solve_particle_particle_contacts_uxpbd(
     """Cross-substrate particle-particle contact.
 
     For each cross-phase pair: lattice particles route corrections into body
-    wrenches, SM-rigid particles route into particle_deltas. Same-group and
-    same-lattice-host pairs are skipped.
+    wrenches, SM-rigid particles route into particle_deltas. Same-group,
+    same-lattice-host, and same-articulation lattice pairs are skipped — the
+    last guard prevents adjacent links of a URDF-loaded robot (whose lattice
+    spheres overlap by design at every joint) from generating contact
+    wrenches that tear the kinematic chain apart. ``body_articulation``
+    carries per-body articulation IDs (-1 for free bodies); -1 bodies are
+    treated as independent, so two free bodies still collide.
 
     Per UPPFRTA §4.2 constraint averaging: each contact that contributes to
     a body's wrench also increments ``body_contact_count`` by 1. The count
@@ -319,11 +336,18 @@ def solve_particle_particle_contacts_uxpbd(
             continue
         sub_j = particle_substrate[index]
         is_lat_j = sub_j == wp.uint8(0)
-        # Same lattice host -> skip.
+        # Same lattice host or same articulation -> skip.
+        # The articulation guard suppresses cross-link lattice overlaps for
+        # URDF-loaded robots; -1 (free body) is treated as a unique
+        # articulation so two free lattice hosts still collide.
         if is_lat_i and is_lat_j:
             host_i = lattice_link[particle_to_lattice[i]]
             host_j = lattice_link[particle_to_lattice[index]]
             if host_i == host_j:
+                continue
+            art_i = body_articulation[host_i]
+            art_j = body_articulation[host_j]
+            if art_i >= 0 and art_i == art_j:
                 continue
 
         n = x_i - particle_x[index]

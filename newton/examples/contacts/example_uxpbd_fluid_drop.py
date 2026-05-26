@@ -65,8 +65,8 @@ class Example:
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True
         self.viewer.set_camera(
-            pos=wp.vec3(0.35, -0.35, 0.20),
-            pitch=-25.0, yaw=135.0,
+            pos=wp.vec3(0.65, -0.65, 0.35),
+            pitch=-20.0, yaw=135.0,
         )
 
         # Snapshot initial x-extent so test_final can verify spreading.

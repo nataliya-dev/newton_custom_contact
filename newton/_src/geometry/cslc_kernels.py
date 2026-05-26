@@ -241,7 +241,11 @@ def compute_cslc_penetration(
         # the equilibrium force law.
         d_t_vec = diff_qt - wp.dot(diff_qt, n_face_world) * n_face_world
         d_t_mag = wp.length(d_t_vec)
-        kernel_h = 3.0 * r_lat
+        # Kernel half-width = r_pad (Option-2 tiling, no overlap).
+        # Must match jacobi_step and write_cslc_contacts so the
+        # warm-start argmax picks the same sample the iteration kernel
+        # will saturate on.
+        kernel_h = r_lat
         w_tangent = smooth_step(kernel_h - d_t_mag, eps)
         if w_tangent < 1.0e-2:
             continue
@@ -257,10 +261,12 @@ def compute_cslc_penetration(
             n_best = -n_face_world
 
     if found == 1:
-        # DEFENSIVE: the dist < 1e-15 continue above ensures dist_best > 0
-        # here, so smooth_step ~= 1.  Do NOT remove the degenerate-check
-        # continue without re-deriving this gate.
-        phi = smooth_relu(raw_best, eps) * smooth_step(dist_best, eps)
+        # Hertz-like phi = raw^1.5 (matches jacobi_step's force law).
+        # The lattice solver converges on this same scaling; the warm
+        # start has to agree or it bootstraps from the wrong load shape.
+        # DEFENSIVE: dist < 1e-15 was caught above, so smooth_step ~= 1.
+        raw_pos = smooth_relu(raw_best, eps)
+        phi = raw_pos * wp.sqrt(raw_pos + eps) * smooth_step(dist_best, eps)
         raw_penetration[tid] = phi
         contact_normal_out[tid] = n_best
     else:
@@ -659,7 +665,17 @@ def jacobi_step(
             if align_arg < 0.05:
                 t_lerp = wp.clamp(align_arg / 0.05, 0.0, 1.0)
                 align_w = t_lerp * t_lerp * (3.0 - 2.0 * t_lerp)
-            phi_eff = smooth_relu(raw, eps)
+            # phi_eff = raw^1.5 (smooth-relu lifted to power 1.5).
+            # The 1.5 exponent makes per-contact stiffness vanish at
+            # first touch (raw→0): dF/d(raw) ∝ √raw → 0.  Sphere-on-flat
+            # gives F ∝ δ^2.5 (one power stiffer than Hertz's δ^1.5)
+            # because the area-weighted sum adds one power of δ via
+            # the contact-patch area scaling with δ.  Trade-off: the
+            # impulse-on-engagement problem that linear contact had is
+            # eliminated, at the cost that kc no longer equals the
+            # material's Young modulus directly -- see CSLCParams.
+            raw_pos = smooth_relu(raw, eps)
+            phi_eff = raw_pos * wp.sqrt(raw_pos + eps)
             gate = smooth_step(raw, eps)
             # Tangential locality kernel (contract §3.5 eq:w_t).
             # Kernel half-width = 3 · r_pad (covers the typical Hertz
@@ -1047,16 +1063,22 @@ def write_cslc_contacts(
         # algebraically: see kernel docstring.
         out_margin1[buf_idx] = 0.0
         out_tids[buf_idx] = 0
-        # Fold A_j · w_tangent · align into the emitted stiffness so
-        # MuJoCo's per-contact force ``stiffness · solver_pen`` equals
-        # the lattice solver's per-pair force ``kc · A_j · w_tangent
-        # · align · gate · raw``.  ``cslc_kc`` already carries the
-        # (pad ⊕ target) series-spring composition (done upfront in
-        # ``CSLCHandler.from_model_with_lattices``); here we add the
-        # discrete-area + locality + alignment factors that convert
-        # the per-volume stiffness into a per-contact spring constant.
+        # Hertz-like force law: F = kc · A_j · w · α · gate · raw^1.5.
+        # MuJoCo applies F = stiffness · solver_pen = stiffness · raw,
+        # so the stiffness must be the LOCAL derivative of F w.r.t. raw
+        # evaluated at the current depth:
+        #     dF/d(raw) = 1.5 · kc · A_j · w · α · gate · √raw
+        # This goes to ZERO at first touch (raw → 0), eliminating the
+        # constant-stiffness impulse that the previous linear law had,
+        # and growing as √raw at depth — same scaling as Hertz's local
+        # stiffness 2 E* √(R·δ) ∝ √δ.  Couples with the jacobi_step
+        # change above (phi_eff = raw^1.5) so the lattice solver and
+        # MuJoCo agree on the per-contact force.
+        raw_pos = smooth_relu(raw, eps)
+        depth_factor = wp.sqrt(raw_pos + eps)
         out_stiffness[buf_idx] = smooth_relu(
-            kc_emit * area_kernel * align_w * contact_gate, 1.0e-9)
+            1.5 * kc_emit * area_kernel * align_w * contact_gate * depth_factor,
+            1.0e-9)
         # cslc_dc retained in signature.  Writing 0.0 uses MuJoCo's
         # ``kd = 0`` branch ⇒ timeconst = sqrt(imp/ke) ≈ 0.030 s.
         # Setting kd > 0 would trigger timeconst = 2/kd, making

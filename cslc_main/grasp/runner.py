@@ -75,37 +75,11 @@ def _simulate_one_step(
     config: GraspConfig,
     dof_map: dict[str, int],
 ) -> tuple[Any, Any, float, float]:
-    """Advance the simulation by one ``dt`` and return ``(state_a, state_b, dx, dz)``.
-
-    When CSLC auto-tune is enabled (default), recompute ``kc`` after
-    the step from the freshly-emitted active count.  The updated kc
-    takes effect on the NEXT step's ``model.collide()``; the EMA
-    smooths transients across the step boundary.
-    """
+    """Advance the simulation by one ``dt`` and return ``(state_a, state_b, dx, dz)``."""
     dx, dz = trajectory.set_pad_targets(control, step, config, dof_map)
     state_0.clear_forces()
     model.collide(state_0, contacts)
     solver.step(state_0, state_1, control, contacts, config.timing.dt)
-
-    if (config.contact_model == "cslc"
-            and config.cslc.auto_tune_contact_fraction):
-        from .contact_models import auto_tune_kc_per_step
-        cs = read_cslc_state(model)
-        if cs is not None:
-            # Use the strict (pen > eps) count: ``n_active`` includes
-            # the smooth_relu tail and overcounts by ~10x during
-            # APPROACH, biasing the EMA toward cf~0.4 even before
-            # contact engages.  ``n_active_strict`` is the count of
-            # spheres with confidently-positive raw -- the right signal
-            # for the calibration N_contact_per_pad.
-            auto_tune_kc_per_step(
-                model,
-                int(cs.get("n_active_strict", cs["n_active"])),
-                int(cs["n_surface"]),
-                ema_alpha=config.cslc.contact_fraction_ema_alpha,
-                cf_init=config.cslc.contact_fraction,
-            )
-
     return state_1, state_0, dx, dz
 
 

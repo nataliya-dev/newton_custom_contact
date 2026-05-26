@@ -105,12 +105,15 @@ class SceneParams:
     # the world axes.
     pad_curve_depth: float = 0.05      # max body-z of pad_5x.obj == distance
     # from body origin to the curved peak
-    # Pad body spawn height. Centered on the object's equator after
-    # settle (ball center z = obj_radius = 0.04). The pad mesh and
-    # lattice span roughly +/- 5 cm vertically after pre-rotation, so
-    # placing them at the ball center brackets the equator where the
-    # grip has the strongest moment arm.
-    pad_z0: float = 0.04
+    # Pad body spawn height. The pre-rotated lattice spans z ∈ [-0.051,
+    # +0.052] relative to the body origin, so the body must sit at
+    # z >= ~0.06 for the lowest sphere surface to clear the ground.
+    # At z=0.06 the bottom sphere is ~9 mm above z=0 (no dragging) and
+    # the lattice still brackets the ball, which settles with its center
+    # at z=obj_radius=0.04 and surface at z ∈ [0, 0.08]; contact happens
+    # 2 cm above the ball's equator, slightly above the maximum-moment-
+    # arm position but well inside the lattice's vertical band.
+    pad_z0: float = 0.06
 
     # --- Phase timing ---
     # SETTLE:   pads stationary, ball free-falls and settles on the ground.
@@ -245,50 +248,74 @@ class Example:
         builder = newton.ModelBuilder(up_axis="Z")
         builder.add_ground_plane()
 
-        # ----- Object: SM-rigid sphere-packed ball, free-falling -------
-        # Load the MorphIt packing of a unit sphere and rescale so the
-        # outer envelope has radius `obj_radius`. native_envelope is the
-        # furthest reach of any sub-sphere surface from the body origin
-        # (max_i(|c_i| + r_i)); dividing into obj_radius gives the
-        # uniform scale that turns the unit packing into a ball of the
-        # requested radius. This replaces the hand-built n^3 grid +
-        # sphere mask used previously, which produced an asymmetric
-        # bottom layer (4 particles) and exposed a small-scale SM-rigid
-        # instability.
-        #
-        # The ball is spawned ~4 cm above the ground so it free-falls
-        # into contact during the SETTLE phase. A spawn near the ground
-        # is unstable: SM-rigid shape matching fights the ground
-        # constraint at t=0 and the cluster develops m/s-scale internal
-        # velocity dispersion. Working reference: example_uxpbd_particle_drop.
-        with open(_SPHERE_ASSET_DIR / "sphere.json") as f:
-            sphere_data = json.load(f)
-        native_centers = np.asarray(sphere_data["centers"], dtype=np.float32)
-        native_radii = np.asarray(sphere_data["radii"], dtype=np.float32)
-        native_masses = np.asarray(sphere_data["masses"], dtype=np.float32)
-        native_envelope = float(
-            (np.linalg.norm(native_centers, axis=1) + native_radii).max())
-        obj_scale = self.p.obj_radius / native_envelope
-        obj_centers = (native_centers * obj_scale).astype(np.float32)
-        obj_radii = (native_radii * obj_scale).astype(np.float32)
+        # ----- Object: SM-rigid sphere-packed ball OR uniform cube ------
+        # Both variants are spawned ~4 cm above the ground so they free-
+        # fall during SETTLE; a near-ground spawn is unstable for SM-rigid
+        # (shape matching fights ground contact at t=0 and the cluster
+        # develops m/s-scale internal velocity dispersion -- working
+        # reference: example_uxpbd_particle_drop).
         obj_z = self.p.obj_radius + 0.04
-        self.obj_group = builder.add_particle_volume(
-            volume_data={"centers": obj_centers.tolist(),
-                         "radii": obj_radii.tolist()},
-            total_mass=self.p.obj_mass,
-            pos=wp.vec3(0.0, 0.0, obj_z),
-        )
-        # Override add_particle_volume's volume-weighted mass distribution
-        # with MorphIt's physics-optimised per-particle masses from
-        # sphere.json. MorphIt jointly tunes per-sphere mass + position to
-        # minimise the discrepancy between the packing and the true
-        # sphere's mass / COM / inertia; the JSON's masses array carries
-        # that optimisation. Volume weighting (m_i ~ r_i^3) discards it.
-        # We rescale so the total still equals obj_mass.
-        mass_scale = self.p.obj_mass / float(native_masses.sum())
-        obj_masses = (native_masses * mass_scale).astype(np.float32)
-        for idx, m in zip(builder.particle_groups[self.obj_group], obj_masses):
-            builder.particle_mass[idx] = float(m)
+        if args.object == "cube":
+            # Uniform 4x4x4 = 64 particle cube of half-side obj_radius.
+            # Settled centroid lands at z = obj_radius (bottom sphere
+            # surface tangent to z=0), matching the sphere variant so
+            # test_final's rest-height check is unchanged.
+            n = 4
+            sphere_r = self.p.obj_radius / n  # 0.01 m at obj_radius=0.04
+            coords = np.linspace(
+                -self.p.obj_radius + sphere_r,
+                self.p.obj_radius - sphere_r,
+                n,
+            )
+            xs, ys, zs = np.meshgrid(coords, coords, coords, indexing="ij")
+            obj_centers = np.stack(
+                [xs.flatten(), ys.flatten(), zs.flatten()], axis=1
+            ).astype(np.float32)
+            obj_radii = np.full(obj_centers.shape[0], sphere_r,
+                                dtype=np.float32)
+            self.obj_group = builder.add_particle_volume(
+                volume_data={"centers": obj_centers.tolist(),
+                             "radii": obj_radii.tolist()},
+                total_mass=self.p.obj_mass,
+                pos=wp.vec3(0.0, 0.0, obj_z),
+            )
+        else:
+            # MorphIt-packed sphere (current default). Rescale the unit
+            # packing so the outer envelope has radius obj_radius;
+            # native_envelope = max_i(|c_i| + r_i) is the furthest sub-
+            # sphere surface from the body origin.
+            with open(_SPHERE_ASSET_DIR / "sphere.json") as f:
+                sphere_data = json.load(f)
+            native_centers = np.asarray(
+                sphere_data["centers"], dtype=np.float32)
+            native_radii = np.asarray(
+                sphere_data["radii"], dtype=np.float32)
+            native_masses = np.asarray(
+                sphere_data["masses"], dtype=np.float32)
+            native_envelope = float(
+                (np.linalg.norm(native_centers, axis=1) + native_radii).max())
+            obj_scale = self.p.obj_radius / native_envelope
+            obj_centers = (native_centers * obj_scale).astype(np.float32)
+            obj_radii = (native_radii * obj_scale).astype(np.float32)
+            self.obj_group = builder.add_particle_volume(
+                volume_data={"centers": obj_centers.tolist(),
+                             "radii": obj_radii.tolist()},
+                total_mass=self.p.obj_mass,
+                pos=wp.vec3(0.0, 0.0, obj_z),
+            )
+            # Override add_particle_volume's volume-weighted mass
+            # distribution with MorphIt's physics-optimised per-particle
+            # masses from sphere.json. MorphIt jointly tunes per-sphere
+            # mass + position to minimise the discrepancy between the
+            # packing and the true sphere's mass / COM / inertia; the
+            # JSON's masses array carries that optimisation. Volume
+            # weighting (m_i ~ r_i^3) discards it. Rescale so the total
+            # still equals obj_mass.
+            mass_scale = self.p.obj_mass / float(native_masses.sum())
+            obj_masses = (native_masses * mass_scale).astype(np.float32)
+            for idx, m in zip(builder.particle_groups[self.obj_group],
+                              obj_masses):
+                builder.particle_mass[idx] = float(m)
 
         # ----- Two articulated pads -----------------------------------
         # Each pad: world --[prismatic X]--> slider --[prismatic Z]--> pad.
@@ -299,40 +326,58 @@ class Example:
         # Pads start at x = +/- (approach_gap/2 + pad_curve_depth) so the
         # peak of the convex face is at +/- approach_gap/2 at t=0, then
         # prismatic-X moves them inward by `dx` from _pad_target_xz.
-        lx0 = -(self.p.approach_gap / 2.0 + self.p.pad_curve_depth)
-        rx0 = +(self.p.approach_gap / 2.0 + self.p.pad_curve_depth)
+        # Box-pad geometry (used when args.pad == "box"). Sized so the
+        # inward (+X for left) face matches the curved pad's peak position
+        # at t=0; this lets approach_speed / approach_duration carry over
+        # unchanged. hz is matched to the curved lattice's vertical extent
+        # so pad_z0 = 0.06 still gives ground clearance.
+        BOX_HX, BOX_HY, BOX_HZ = 0.025, 0.05, 0.05
+        BOX_LATTICE_N = (2, 4, 4)            # 32 spheres per pad
+        # Uniform cell, so sphere_r = half-cell = half_extent / n_axis on
+        # the limiting axis; equal-cell layout requires hy == hz and
+        # hx == hy * n_x / n_yz, which our chosen sizes satisfy.
+        pad_thickness = BOX_HX if args.pad == "box" else self.p.pad_curve_depth
+        lx0 = -(self.p.approach_gap / 2.0 + pad_thickness)
+        rx0 = +(self.p.approach_gap / 2.0 + pad_thickness)
         pad_z0 = self.p.pad_z0
 
-        # Load the pad scoop mesh and the MorphIt sphere packing baked
-        # from that same mesh. Both arrays live in the same body frame
-        # at native 5x scale (~10 cm wide, 5 cm curve depth); see
-        # pad.json's metadata ("mesh_path": ".../pad_5x.obj").
-        raw_mesh = trimesh.load(_PAD_ASSET_DIR / "pad_5x.obj", force="mesh")
-        pad_mesh_verts = np.asarray(raw_mesh.vertices, dtype=np.float32)
-        pad_mesh_indices = np.asarray(raw_mesh.faces.flatten(), dtype=np.int32)
+        # Curved-pad assets: only loaded if we're actually using them.
+        pad_mesh_verts = pad_mesh_indices = None
+        pad_lattice_centers = pad_lattice_radii = None
+        pad_rotations: dict[str, np.ndarray] = {}
+        if args.pad == "curved":
+            # Load the pad scoop mesh and the MorphIt sphere packing baked
+            # from that same mesh. Both arrays live in the same body frame
+            # at native 5x scale (~10 cm wide, 5 cm curve depth); see
+            # pad.json's metadata ("mesh_path": ".../pad_5x.obj").
+            raw_mesh = trimesh.load(
+                _PAD_ASSET_DIR / "pad_5x.obj", force="mesh")
+            pad_mesh_verts = np.asarray(raw_mesh.vertices, dtype=np.float32)
+            pad_mesh_indices = np.asarray(
+                raw_mesh.faces.flatten(), dtype=np.int32)
+            with open(_PAD_ASSET_DIR / "pad.json") as f:
+                pad_lattice_data = json.load(f)
+            pad_lattice_centers = np.asarray(
+                pad_lattice_data["centers"], dtype=np.float32)
+            pad_lattice_radii = np.asarray(
+                pad_lattice_data["radii"], dtype=np.float32)
 
-        with open(_PAD_ASSET_DIR / "pad.json") as f:
-            pad_lattice_data = json.load(f)
-        pad_lattice_centers = np.asarray(
-            pad_lattice_data["centers"], dtype=np.float32)
-        pad_lattice_radii = np.asarray(
-            pad_lattice_data["radii"], dtype=np.float32)
-
-        # Body-to-world rotations baked into the mesh and lattice. A
-        # rotation of +/- 90 deg about the world Y axis sends the convex-
-        # face normal (body +Z) to world +/- X. Applying the rotation in
-        # NumPy keeps the articulated body itself at identity orientation,
-        # which preserves the prismatic joint axes (world X and Z).
-        #
-        #   R(Y, +90) . (0,0,1) = (+1,0,0)   left pad faces +X (center)
-        #   R(Y, -90) . (0,0,1) = (-1,0,0)   right pad faces -X (center)
-        R_left = np.array(
-            [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]],
-            dtype=np.float32)
-        R_right = np.array(
-            [[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
-            dtype=np.float32)
-        pad_rotations = {"left": R_left, "right": R_right}
+            # Body-to-world rotations baked into the mesh and lattice. A
+            # rotation of +/- 90 deg about the world Y axis sends the
+            # convex-face normal (body +Z) to world +/- X. Applying the
+            # rotation in NumPy keeps the articulated body itself at
+            # identity orientation, which preserves the prismatic joint
+            # axes (world X and Z).
+            #
+            #   R(Y, +90) . (0,0,1) = (+1,0,0)   left pad faces +X (center)
+            #   R(Y, -90) . (0,0,1) = (-1,0,0)   right pad faces -X (center)
+            R_left = np.array(
+                [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]],
+                dtype=np.float32)
+            R_right = np.array(
+                [[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+                dtype=np.float32)
+            pad_rotations = {"left": R_left, "right": R_right}
 
         # Ghost config for the slider's stub geometry (no collision, no mass).
         ghost_cfg = newton.ModelBuilder.ShapeConfig(
@@ -349,15 +394,6 @@ class Example:
         # the spec list rather than wrapping the build loop in an if.
         pad_specs = [("left", lx0), ("right", rx0)][: args.num_pads]
         for label, x0 in pad_specs:
-            R = pad_rotations[label]
-            # Pre-rotate mesh vertices and lattice centers into the body
-            # frame the pad will actually use at runtime. .copy() is
-            # required by newton.Mesh / add_lattice to get contiguous
-            # float32 buffers from the transposed view.
-            verts_rot = (pad_mesh_verts @ R.T).astype(np.float32, copy=True)
-            centers_rot = (pad_lattice_centers @
-                           R.T).astype(np.float32, copy=True)
-
             slider = builder.add_link(
                 xform=wp.transform((x0, 0.0, pad_z0), wp.quat_identity()),
                 mass=0.01,
@@ -365,26 +401,70 @@ class Example:
             )
             builder.add_shape_sphere(slider, radius=0.001, cfg=ghost_cfg)
 
-            # mass=0.0: the shape mesh density carries both mass and
-            # inertia consistently (see example_uxpbd_lattice_stack.py
-            # NOTE for the add_body(mass=m) + add_shape_* double-counting
-            # gotcha).
+            # mass=0.0: the pad's collision shape carries inertia via its
+            # own density, avoiding the add_body(mass=m) + add_shape_*
+            # double-counting gotcha (see example_uxpbd_lattice_stack.py).
             pad = builder.add_link(
                 xform=wp.transform((x0, 0.0, pad_z0), wp.quat_identity()),
                 mass=0.0,
                 label=f"{label}_pad",
             )
-            pad_mesh = newton.Mesh(verts_rot, pad_mesh_indices)
-            builder.add_shape_mesh(pad, mesh=pad_mesh)
-            builder.add_lattice(
-                link=pad,
-                morphit_json={
-                    "centers": centers_rot,
-                    "radii": pad_lattice_radii,
-                },
-                total_mass=0.0,
-                pos=wp.vec3(x0, 0.0, pad_z0),
-            )
+            if args.pad == "box":
+                # Rectangular pad: axis-aligned box centered at the body
+                # origin extends from -BOX_HX (back) to +BOX_HX (inward
+                # face); +x_local always points "inward" because the
+                # left-pad body spawns at -|x| and the right at +|x|, so
+                # the inward face naturally lands on opposite sides of the
+                # ball without per-side rotation.
+                builder.add_shape_box(
+                    pad, hx=BOX_HX, hy=BOX_HY, hz=BOX_HZ)
+                # Uniform sphere lattice filling the box. Equal cell
+                # spacing on each axis (sphere_r = half-cell) so the
+                # spheres tile without overlap on the same host link.
+                nx, ny, nz = BOX_LATTICE_N
+                sphere_r = BOX_HX / nx
+                cx = np.linspace(
+                    -BOX_HX + sphere_r, BOX_HX - sphere_r, nx)
+                cy = np.linspace(
+                    -BOX_HY + sphere_r, BOX_HY - sphere_r, ny)
+                cz = np.linspace(
+                    -BOX_HZ + sphere_r, BOX_HZ - sphere_r, nz)
+                xs, ys, zs = np.meshgrid(cx, cy, cz, indexing="ij")
+                pad_centers = np.stack(
+                    [xs.flatten(), ys.flatten(), zs.flatten()], axis=1
+                ).astype(np.float32)
+                pad_radii = np.full(
+                    pad_centers.shape[0], sphere_r, dtype=np.float32)
+                builder.add_lattice(
+                    link=pad,
+                    morphit_json={
+                        "centers": pad_centers,
+                        "radii": pad_radii,
+                    },
+                    total_mass=0.0,
+                    pos=wp.vec3(x0, 0.0, pad_z0),
+                )
+            else:
+                R = pad_rotations[label]
+                # Pre-rotate mesh vertices and lattice centers into the
+                # body frame the pad will actually use at runtime. .copy()
+                # is required by newton.Mesh / add_lattice to get
+                # contiguous float32 buffers from the transposed view.
+                verts_rot = (pad_mesh_verts @ R.T).astype(
+                    np.float32, copy=True)
+                centers_rot = (pad_lattice_centers @ R.T).astype(
+                    np.float32, copy=True)
+                pad_mesh = newton.Mesh(verts_rot, pad_mesh_indices)
+                builder.add_shape_mesh(pad, mesh=pad_mesh)
+                builder.add_lattice(
+                    link=pad,
+                    morphit_json={
+                        "centers": centers_rot,
+                        "radii": pad_lattice_radii,
+                    },
+                    total_mass=0.0,
+                    pos=wp.vec3(x0, 0.0, pad_z0),
+                )
 
             j_x = builder.add_joint_prismatic(
                 parent=-1, child=slider,
@@ -601,6 +681,33 @@ class Example:
                 "Number of pads to build. Debug helper: 0 = ball only "
                 "(check the SM-rigid object stays put on the ground), "
                 "1 = single inward-pressing pad, 2 = full grasp (default)."
+            ),
+        )
+        parser.add_argument(
+            "--object",
+            choices=("sphere", "cube"),
+            default="sphere",
+            help=(
+                "Grasped object geometry. 'sphere' (default) loads the "
+                "125-particle MorphIt packing of a unit sphere. 'cube' "
+                "swaps in a uniform 4x4x4 (=64) particle cube of matching "
+                "outer extent for faster iteration -- ~30%% fewer particles, "
+                "no MorphIt asset load, otherwise identical add_particle_volume "
+                "path."
+            ),
+        )
+        parser.add_argument(
+            "--pad",
+            choices=("curved", "box"),
+            default="curved",
+            help=(
+                "Pad geometry. 'curved' (default) loads the MorphIt scoop "
+                "mesh + 125-sphere lattice from assets/pad/. 'box' replaces "
+                "each pad with a rectangular collision box + uniform 2x4x4 "
+                "(=32) lattice. The box variant has the same inward face "
+                "position at t=0 as the curved peak, so approach/squeeze "
+                "timing is unchanged, but mesh contact and large lattice "
+                "counts are both eliminated -- expect ~2-3x faster substeps."
             ),
         )
         return parser

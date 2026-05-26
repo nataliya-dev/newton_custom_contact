@@ -206,6 +206,27 @@ class SolverUXPBD(SolverBase):
         self._empty_body_q = wp.zeros(0, dtype=wp.transform, device=dev)
         self._empty_body_qd = wp.zeros(0, dtype=wp.spatial_vector, device=dev)
 
+        # Per-body articulation id used by the cross-substrate PP-contact
+        # kernel to suppress same-articulation lattice pairs. Adjacent links
+        # of a URDF-loaded robot share lattice volume at every joint by
+        # design; treating those overlaps as collisions launches the
+        # kinematic chain (see solve_particle_particle_contacts_uxpbd). Built
+        # once at solver-create from model.joint_articulation + joint_child;
+        # bodies that aren't a joint child remain -1 (independent free body)
+        # and still collide normally with each other.
+        if N_b > 0:
+            body_art = _np.full(N_b, -1, dtype=_np.int32)
+            if N_j > 0 and model.joint_articulation is not None:
+                j_art = model.joint_articulation.numpy()
+                j_child = model.joint_child.numpy()
+                valid = j_child >= 0
+                body_art[j_child[valid]] = j_art[valid]
+            self.body_articulation = wp.array(
+                body_art, dtype=wp.int32, device=dev)
+        else:
+            self.body_articulation = wp.empty(
+                0, dtype=wp.int32, device=dev)
+
     # ------- ping-pong helpers (perf #2) -------------------------------
     def _alt_particle_q(self, state_out):
         """Return the OTHER preallocated particle_q scratch buffer."""
@@ -495,6 +516,7 @@ class SolverUXPBD(SolverBase):
                         model.particle_substrate,
                         model.particle_to_lattice,
                         model.lattice_link,
+                        self.body_articulation,
                         _body_q_stab,
                         _body_qd_stab,
                         model.body_com,
@@ -635,6 +657,7 @@ class SolverUXPBD(SolverBase):
                         model.particle_substrate,
                         model.particle_to_lattice,
                         model.lattice_link,
+                        self.body_articulation,
                         _body_q_ps,
                         _body_qd_ps,
                         model.body_com,
@@ -726,6 +749,7 @@ class SolverUXPBD(SolverBase):
                         model.particle_substrate,
                         model.particle_to_lattice,
                         model.lattice_link,
+                        self.body_articulation,
                         state_out.body_q,
                         model.body_com,
                         self.body_inv_mass_effective,
