@@ -92,18 +92,3 @@ same dir.
 | `runner.py` | `run_headless(config)` + viewer-mode `Example` class. Both share `_simulate_one_step`. |
 | `main.py` | CLI entry. Minimal argparse surface; defaults to headless. |
 
-## Adding things
-
-* **A new pad shape** — add a branch to `pads.build_pad_trimesh` and
-  `pads.pad_shape_xform`, plus a default in `PadParams`. Sampling is
-  shape-agnostic.
-* **A new held object** — add a branch to `objects.add_object` and
-  fields to `ObjectParams`. The rest of the pipeline is object-agnostic.
-* **A new contact model** — add a branch to
-  `contact_models.make_pad_shape_cfg` and to the corresponding
-  `make_object_shape_cfg` in `objects.py`, plus any post-build attach in
-  `scene.build_scene`. Calibration is your responsibility.
-* **A new solver** — add a branch to `solvers.make_solver`.
-* **A new logged quantity** — add a column in `logger.CSVLogger.__init__`
-  and `log_step`; wire the data source through `runner._gather_step_logs`
-  or a new helper.

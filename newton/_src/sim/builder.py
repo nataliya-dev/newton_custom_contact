@@ -10384,14 +10384,24 @@ class ModelBuilder:
                 m.lattice_link = wp.array(self.lattice_link, dtype=wp.int32, device=device)
                 m.lattice_particle_index = wp.array(self.lattice_particle_index, dtype=wp.int32, device=device)
                 # v2 seams initialized to zero or stored defaults.
-                m.lattice_delta = wp.zeros(n_lat, dtype=wp.float32, device=device)
-                m.lattice_delta_prev = wp.zeros(n_lat, dtype=wp.float32, device=device)
+                # vec3 so the Jacobi solver can carry tangential δ for
+                # stick-slip friction; the v1 closed-form populates only
+                # δ_n · n_outward.  See model.lattice_delta docstring.
+                m.lattice_delta = wp.zeros(n_lat, dtype=wp.vec3, device=device)
+                m.lattice_delta_prev = wp.zeros(n_lat, dtype=wp.vec3, device=device)
                 m.lattice_K_diag = wp.zeros(n_lat, dtype=wp.float32, device=device)
                 m.lattice_k_anchor = wp.array(self.lattice_k_anchor, dtype=wp.float32, device=device)
                 m.lattice_k_lateral = wp.array(self.lattice_k_lateral, dtype=wp.float32, device=device)
                 m.lattice_k_bulk = wp.array(self.lattice_k_bulk, dtype=wp.float32, device=device)
                 m.lattice_damping = wp.array(self.lattice_damping, dtype=wp.float32, device=device)
-                # lattice_neighbors_* stay empty until later tasks generate adjacency.
+                # lattice_neighbors_csr (edge list) stays empty until
+                # Step 2 wires MorphIt adjacency through.  Allocate the
+                # per-sphere offset/count arrays as zeros so the Jacobi
+                # solver can read them unconditionally (count=0 ⇒ the
+                # lateral Laplacian contribution is identically zero).
+                m.lattice_neighbors_offset = wp.zeros(n_lat, dtype=wp.int32, device=device)
+                m.lattice_neighbors_count = wp.zeros(n_lat, dtype=wp.int32, device=device)
+                m.lattice_neighbors_csr = wp.empty(0, dtype=wp.int32, device=device)
 
             # Per-link CSR offsets for the lattice arrays.
             if n_lat:

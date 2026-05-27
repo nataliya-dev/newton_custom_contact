@@ -217,6 +217,7 @@ def build_cslc_handler_with_mesh_pads(
     mesh_pads_by_shape: dict[int, CSLCLattice],
     cslc: CSLCParams,
     obj: ObjectParams | None = None,
+    dt: float = 1.0 / 500.0,  # B3 — used to compute c_over_dt at construction
 ) -> CSLCHandler | None:
     """Build a ``CSLCHandler`` from caller-supplied ``CSLCLattice`` objects.
 
@@ -314,9 +315,10 @@ def build_cslc_handler_with_mesh_pads(
     first_cslc = cslc_shape_indices[0]
     ka = float(cslc_ka_arr[first_cslc])
     kl = float(cslc_kl_arr[first_cslc])
-    # dc dropped — emission kernel hardcodes out_damping = 0.0.  Pass
-    # 0.0 to from_lattices so the kernel-signature slot stays a no-op.
-    dc = 0.0
+    # Per-contact damping (A1 experiment).  Sourced from CSLCParams.dc;
+    # see params.py for the tradeoff vs friction-timeconst.  Default 0
+    # preserves the legacy behavior.
+    dc = float(cslc.dc)
     # Single friction coefficient: read from MaterialParams.mu (the
     # pad's shape material), used by BOTH the lattice stick-slip block
     # and MuJoCo's Coulomb cone on emitted contacts.
@@ -355,6 +357,11 @@ def build_cslc_handler_with_mesh_pads(
           f"(r_pad_avg={r_pad_avg*1e3:.2f} mm, A_kernel={A_kernel*1e6:.2f} mm^2 "
           f"-> implied per-pad-sphere = {kc * A_kernel:.3e} N/m at saturation)")
 
+    # B3 — pre-divide c_lattice by dt so the kernel does a multiply
+    # instead of a divide per sphere per iteration.  c_lattice=0 yields
+    # c_over_dt=0 which makes the velocity-damping term a no-op.
+    c_over_dt = float(cslc.c_lattice) / float(dt) if dt > 0 else 0.0
+
     cslc_data = CSLCData.from_lattices(
         lattices,
         ka=ka,
@@ -366,6 +373,7 @@ def build_cslc_handler_with_mesh_pads(
         k_stick=cslc.k_stick,
         mu_friction=mu,
         build_A_inv=cslc.build_A_inv,
+        c_over_dt=c_over_dt,
         device=model.device,
     )
 
@@ -527,5 +535,6 @@ def attach_cslc_handler_to_model(
     construction triggers pipeline creation).
     """
     return build_cslc_handler_with_mesh_pads(
-        model, mesh_pads_by_shape, config.cslc, obj=config.object
+        model, mesh_pads_by_shape, config.cslc, obj=config.object,
+        dt=config.timing.dt,  # B3
     )

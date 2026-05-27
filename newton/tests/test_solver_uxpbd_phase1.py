@@ -19,13 +19,28 @@ from newton.tests.unittest_utils import add_function_test, get_test_devices
 _ASSET_DIR = os.path.join(os.path.dirname(__file__), "assets", "uxpbd")
 
 
-def test_uxpbd_solver_rejects_enable_cslc(test, device):
-    """Phase 1: enable_cslc=True must raise NotImplementedError (reserved for v2)."""
+def test_uxpbd_solver_accepts_cslc_params(test, device):
+    """SolverUXPBD accepts cslc_params=CSLCParams() and exposes it; None leaves rigid."""
     builder = newton.ModelBuilder()
     builder.add_ground_plane()
     model = builder.finalize(device=device)
 
-    with test.assertRaises(NotImplementedError):
+    # None (default) leaves the lattice rigid: cslc_params is stored as None
+    # and compute_compliant_contact_response is a no-op on empty models.
+    rigid_solver = newton.solvers.SolverUXPBD(model)
+    test.assertIsNone(rigid_solver.cslc_params)
+
+    # Passing a CSLCParams instance enables the v1 anchor-only compliant
+    # path. Empty model has no lattice spheres so the hook short-circuits,
+    # but the params are stored and downstream code paths see is-not-None.
+    params = newton.solvers.CSLCParams()
+    compliant_solver = newton.solvers.SolverUXPBD(model, cslc_params=params)
+    test.assertIs(compliant_solver.cslc_params, params)
+
+    # The legacy enable_cslc kwarg was removed in favour of cslc_params;
+    # passing it must raise TypeError so accidental Phase 1 callers fail
+    # loudly rather than silently constructing a rigid solver.
+    with test.assertRaises(TypeError):
         newton.solvers.SolverUXPBD(model, enable_cslc=True)
 
 
@@ -45,8 +60,8 @@ class TestSolverUXPBDPhase1(unittest.TestCase):
 
 add_function_test(
     TestSolverUXPBDPhase1,
-    "test_uxpbd_solver_rejects_enable_cslc",
-    test_uxpbd_solver_rejects_enable_cslc,
+    "test_uxpbd_solver_accepts_cslc_params",
+    test_uxpbd_solver_accepts_cslc_params,
     devices=get_test_devices(),
 )
 add_function_test(
@@ -130,8 +145,7 @@ def test_uxpbd_update_lattice_projects_body_q(test, device):
 
     state = model.state()
     # Set body_q to translation (1.0, 2.0, 3.0), rotation identity.
-    body_q_np = np.array(
-        [[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0]], dtype=np.float32)
+    body_q_np = np.array([[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0]], dtype=np.float32)
     state.body_q.assign(body_q_np)
     state.body_qd.zero_()
 
@@ -175,8 +189,7 @@ def test_uxpbd_update_lattice_handles_rotation(test, device):
     # 90 degree rotation around Z. The sphere at (+0.1, 0, 0) body frame
     # should project to (0, +0.1, 0) in world frame.
     rot = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.5 * np.pi)
-    body_q_np = np.array(
-        [[0.0, 0.0, 0.0, rot[0], rot[1], rot[2], rot[3]]], dtype=np.float32)
+    body_q_np = np.array([[0.0, 0.0, 0.0, rot[0], rot[1], rot[2], rot[3]]], dtype=np.float32)
     state.body_q.assign(body_q_np)
     state.body_qd.zero_()
 
@@ -296,8 +309,7 @@ def test_uxpbd_free_fall_trajectory(test, device):
     body_z = float(body_q[0, 2])
     expected_z = 10.0 - 0.5 * 9.81 * t * t
     relative_err = abs(body_z - expected_z) / expected_z
-    test.assertLess(relative_err, 0.005,
-                    f"free fall z={body_z}, expected={expected_z}")
+    test.assertLess(relative_err, 0.005, f"free fall z={body_z}, expected={expected_z}")
 
 
 add_function_test(
@@ -359,14 +371,12 @@ def test_uxpbd_pendulum_period(test, device):
 
     angles_np = np.array(angles)
     crossings = np.where(np.diff(np.signbit(angles_np)))[0]
-    test.assertGreater(len(crossings), 2,
-                       f"Not enough zero crossings: {len(crossings)}")
+    test.assertGreater(len(crossings), 2, f"Not enough zero crossings: {len(crossings)}")
     half_period_steps = float(crossings[2] - crossings[0]) / 2.0
     measured_T = half_period_steps * dt * 2.0
     expected_T = 2.0 * np.pi * np.sqrt(L / 9.81)
     relative_err = abs(measured_T - expected_T) / expected_T
-    test.assertLess(relative_err, 0.01,
-                    f"T={measured_T:.4f}, expected={expected_T:.4f}")
+    test.assertLess(relative_err, 0.01, f"T={measured_T:.4f}, expected={expected_T:.4f}")
 
 
 add_function_test(
@@ -392,8 +402,7 @@ def test_uxpbd_body_parent_f_revolute_to_world(test, device):
             child=link,
             axis=wp.vec3(0.0, 1.0, 0.0),
             parent_xform=wp.transform_identity(),
-            child_xform=wp.transform(
-                p=wp.vec3(0.0, 0.0, L), q=wp.quat_identity()),
+            child_xform=wp.transform(p=wp.vec3(0.0, 0.0, L), q=wp.quat_identity()),
         )
         builder.add_articulation([j], label="pendulum")
         builder.request_state_attributes("body_parent_f")
@@ -415,8 +424,7 @@ def test_uxpbd_body_parent_f_revolute_to_world(test, device):
     for i in range(6):
         denom = abs(xpbd_wrench[i]) + 1.0e-3
         rel_err = abs(uxpbd_wrench[i] - xpbd_wrench[i]) / denom
-        test.assertLess(
-            rel_err, 0.05, f"body_parent_f[{i}] xpbd={xpbd_wrench[i]} uxpbd={uxpbd_wrench[i]}")
+        test.assertLess(rel_err, 0.05, f"body_parent_f[{i}] xpbd={xpbd_wrench[i]} uxpbd={uxpbd_wrench[i]}")
 
 
 add_function_test(

@@ -194,6 +194,109 @@ class LatticeRenderer:
         )
 
 
+class ContactNormalRenderer:
+    """Visualises the live per-frame contact normals emitted by the solver.
+
+    Each active emitted slot carries the contact location on the pad
+    (``rigid_contact_point0``, in pad body-local frame) and on the
+    target (``rigid_contact_point1``, in target body-local frame), plus
+    the world-frame target outward normal (``rigid_contact_normal``).
+    We transform the two locals to world via the relevant body's
+    ``body_q`` transform, draw the anchor at the world-frame target
+    sample, and the arrow runs ``ARROW_LENGTH_M`` along the target
+    normal (i.e. the direction the target's surface pushes the pad).
+
+    Anchoring at the TARGET sample (point1) is the right choice for
+    "where is the force applied to the object" semantics: the visual
+    sits on the object's surface, not the deformed pad-sphere centre.
+    The pad-side contact point (point0) ends up ~r_lat below the
+    target sample along -normal -- not where the user wants the arrow
+    base to sit.
+
+    Useful for spotting:
+
+    * Tilted contact normals during SQUEEZE (pads not squeezing
+      head-on -> upward component pumps the object up during LIFT).
+    * Normals flipping direction frame-to-frame (lattice tangent
+      oscillation feeding the rigid solver).
+    * Contact emission gaps -- many lattice spheres engaged but few
+      contacts rendered (e.g. ``w_tangent < 1e-2`` cull biting hard on
+      a curved pad).
+
+    Falls back to ``viewer.log_lines`` when the viewer lacks
+    ``log_arrows`` (e.g. the rerun viewer).
+    """
+
+    ARROW_LENGTH_M = 0.008  # 8 mm — visible without obscuring the lattice
+
+    def __init__(self, model, viewer):
+        self.model = model
+        self.viewer = viewer
+        self.enabled = hasattr(viewer, "log_lines") or hasattr(viewer, "log_arrows")
+        # Cache shape→body map once; shapes are static for the run.
+        self._shape_body = model.shape_body.numpy().astype(np.int32)
+
+    def update(self, contacts, state) -> None:
+        if not self.enabled or contacts is None or state is None:
+            return
+        n = int(contacts.rigid_contact_count.numpy()[0])
+        if n == 0:
+            self._clear()
+            return
+        shape0 = contacts.rigid_contact_shape0.numpy()[:n]
+        shape1 = contacts.rigid_contact_shape1.numpy()[:n]
+        active = np.where(shape0 >= 0)[0]
+        if active.size == 0:
+            self._clear()
+            return
+
+        # Body-local contact points (see write_cslc_contacts kernel
+        # cslc_kernels.py: p0_body = X_wb_inv · q_world_def,
+        # p1_body = X_tb_inv · t_world).
+        p1_local = contacts.rigid_contact_point1.numpy()[active]
+        # ``rigid_contact_normal`` IS world-frame (set to -n_face_world).
+        nrm = contacts.rigid_contact_normal.numpy()[active].astype(np.float32)
+
+        body_q = state.body_q.numpy()
+        # Transform each contact's target-side anchor to world.
+        target_body_idx = self._shape_body[shape1[active]]
+        starts = np.empty((len(active), 3), dtype=np.float32)
+        for k, (b_idx, p_local) in enumerate(zip(target_body_idx, p1_local)):
+            X_wb = body_q[b_idx]
+            starts[k] = _quat_rotate(X_wb[3:7], p_local) + X_wb[:3]
+
+        # Defensive normalize -- emitted normals should be unit length.
+        nrm_mag = np.linalg.norm(nrm, axis=1, keepdims=True)
+        safe = nrm_mag > 1e-8
+        nrm_unit = np.where(safe, nrm / np.where(safe, nrm_mag, 1), nrm)
+        # Draw the arrow in the direction the TARGET pushes back on the
+        # pad: that is the target's outward normal at the contact, which
+        # ``write_cslc_contacts`` writes as ``normal_ab = -n_face_world``.
+        # Flip back to +n_face for visualization so the arrow points
+        # outward from the object surface (the physically intuitive
+        # "this is the contact normal" direction).
+        ends = starts + self.ARROW_LENGTH_M * (-nrm_unit)
+        colors = np.tile([1.0, 0.85, 0.0], (len(active), 1)).astype(np.float32)
+
+        starts_wp = wp.array(starts, dtype=wp.vec3)
+        ends_wp = wp.array(ends, dtype=wp.vec3)
+        colors_wp = wp.array(colors, dtype=wp.vec3)
+        if hasattr(self.viewer, "log_arrows"):
+            self.viewer.log_arrows(
+                "/contact_normals", starts_wp, ends_wp, colors_wp,
+            )
+        else:
+            self.viewer.log_lines(
+                "/contact_normals", starts_wp, ends_wp, colors_wp,
+            )
+
+    def _clear(self) -> None:
+        if hasattr(self.viewer, "log_arrows"):
+            self.viewer.log_arrows("/contact_normals", None, None, None)
+        else:
+            self.viewer.log_lines("/contact_normals", None, None, None)
+
+
 class TargetPointsRenderer:
     """Visualises the CSLC box-target (point-set) sample points.
 

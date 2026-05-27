@@ -215,17 +215,29 @@ class Model:
         self.particle_substrate: wp.array[wp.uint8] = wp.empty(0, dtype=wp.uint8, device=device)
         """Per-particle substrate tag (0=lattice, 1=SM-rigid, 2=soft, 3=fluid), shape [particle_count]."""
 
-        # v2 CSLC seams. Present but unused in Phase 1.
-        self.lattice_delta: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
-        """CSLC seam displacement [m], shape [lattice_sphere_count]. Unused in Phase 1."""
-        self.lattice_delta_prev: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
-        """Previous CSLC seam displacement [m], shape [lattice_sphere_count]. Unused in Phase 1."""
+        # v2 CSLC seams.  ``lattice_delta[i]`` is the world-frame
+        # displacement of lattice sphere ``i`` from its rest position
+        # (CSLC contract sign convention ``q_i = p_i - δ_i``; ``δ``
+        # along ``+n_outward`` means compressed inward).  The vec3 form
+        # carries both normal-axis compression and tangential shear, so
+        # downstream stick-slip friction in
+        # :func:`~newton._src.solvers.uxpbd.compliant_lattice.solve_lattice_jacobi_step`
+        # can read off ``δ_t = δ - dot(δ, n_outward)·n_outward``.  The
+        # v1 anchor-only closed-form
+        # (:func:`~newton._src.solvers.uxpbd.compliant_lattice.solve_lattice_anchor_compression`)
+        # writes ``δ_n · n_outward`` so the two solvers share one buffer.
+        self.lattice_delta: wp.array[wp.vec3] = wp.empty(0, dtype=wp.vec3, device=device)
+        """CSLC seam displacement [m], shape [lattice_sphere_count, 3]. Zero unless ``cslc_params`` is set on :class:`~newton.solvers.SolverUXPBD`."""
+        self.lattice_delta_prev: wp.array[wp.vec3] = wp.empty(0, dtype=wp.vec3, device=device)
+        """Previous CSLC seam displacement [m], shape [lattice_sphere_count, 3]. Used by the Hunt-Crossley rate-coupling term in ``update_lattice_world_positions``."""
         self.lattice_K_diag: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
         """Diagonal entries of the lattice stiffness matrix K, K_diag[i] = k_anchor[i] + k_lateral[i] * |N(i)| [N/m]. Computed at finalize from MorphIt adjacency, populated by v2 CSLC; allocated as zeros in Phase 1. Shape [lattice_sphere_count]."""
         self.lattice_neighbors_csr: wp.array[wp.int32] = wp.empty(0, dtype=wp.int32, device=device)
-        """CSR column indices for lattice neighbor adjacency. Unused in Phase 1."""
+        """CSR column indices (neighbor sphere id per edge), shape [lattice_edge_count]. Empty until Step 2 wires MorphIt adjacency."""
         self.lattice_neighbors_offset: wp.array[wp.int32] = wp.empty(0, dtype=wp.int32, device=device)
-        """CSR row offsets for lattice neighbor adjacency. Unused in Phase 1."""
+        """CSR row-start offsets per lattice sphere, shape [lattice_sphere_count]. Zero-filled when adjacency unavailable (the Jacobi solver treats count=0 as "no lateral coupling")."""
+        self.lattice_neighbors_count: wp.array[wp.int32] = wp.empty(0, dtype=wp.int32, device=device)
+        """CSR per-sphere neighbor counts, shape [lattice_sphere_count]. Zero-filled when adjacency unavailable."""
         self.lattice_k_anchor: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)
         """Anchor stiffness per lattice sphere [N/m], shape [lattice_sphere_count]. Unused in Phase 1."""
         self.lattice_k_lateral: wp.array[wp.float32] = wp.empty(0, dtype=wp.float32, device=device)

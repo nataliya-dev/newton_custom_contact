@@ -295,6 +295,15 @@ class CSLCData:
     # normal-axis matrix; ``A_inv_t`` for the tangent.
     A_inv: wp.array | None = None
     A_inv_t: wp.array | None = None
+    # B3 — Lattice velocity-damping state.  ``sphere_delta_prev_step``
+    # holds the converged ``sphere_delta`` from the END of the previous
+    # simulation step (snapshot taken at the START of this step's
+    # CSLCHandler.launch, before any pair runs).  ``c_over_dt`` is the
+    # pre-divided coefficient ``c_lattice / dt`` consumed by
+    # ``jacobi_step`` as the damping rate.  Both default to a zero
+    # state which makes the velocity term a no-op.
+    sphere_delta_prev_step: wp.array | None = None
+    c_over_dt: float = 0.0
     device: str | None = None
 
     @classmethod
@@ -306,6 +315,7 @@ class CSLCData:
         mu_friction: float | None = None,
         build_A_inv: bool = False,
         kl_physical: float | None = None,
+        c_over_dt: float = 0.0,  # B3 — lattice velocity damping rate
         device: Devicelike | None = None,
     ) -> CSLCData:
         """Merge CSLCLattices into GPU-resident CSLCData with global indexing.
@@ -445,8 +455,45 @@ class CSLCData:
             A_n = ka * I_n + kl * L + kc * I_n
             A_inv_np = np.linalg.inv(A_n).astype(np.float32)
             A_inv_wp = wp.array(A_inv_np, dtype=wp.float32, device=device)
-            # Tangent axes: ka·ratio·I + kl·L (no contact spring).
-            A_t = (ka * ka_tangent_ratio) * I_n + kl * L
+            # Tangent axes: ka·ratio·I + kc·I + kl·L.
+            #
+            # The contact spring has stiffness tensor kc·n̂_eff·n̂_eff^T,
+            # where n̂_eff is the CONTACT direction (target's outward
+            # normal at the argmax sample).  Projecting this tensor onto
+            # each pad sphere's local outward-normal frame (axis = n̂_pad,
+            # angle α = ∠(n̂_eff, n̂_pad)) gives:
+            #     normal-axis contribution:  kc·cos²α
+            #     tangent-axis contribution: kc·sin²α
+            # (cross-coupling kc·cosα·sinα is dropped in the per-axis
+            # split; Jacobi iteration absorbs the residual).
+            #
+            # For a flat pad every sphere has n̂_pad parallel to the
+            # contact direction (α = 0), so the tangent-axis contact
+            # contribution is exactly zero -- but the warm-start FORCE
+            # f_t_j = φ_j·(n̂_eff − cosα·n̂_pad) is also exactly zero in
+            # that limit, so adding +kc·I to the tangent matrix does NOT
+            # change the flat-pad warm-start (multiply zero force by
+            # anything = zero).
+            #
+            # For curved pads (dome, sphere) off-apex spheres have α > 0;
+            # without the kc term the tangent matrix has eigenvalues ~ ka
+            # while the normal matrix has eigenvalues ~ ka + kc.  With
+            # production kc/ka ≈ 10^6, even the smoothing-tail φ from
+            # samples at ~22 mm separation generates a tangent warm-start
+            # displacement of order kc·φ/ka ≈ 50 mm -- a phantom δ that
+            # Jacobi cannot damp in 20 iterations (it stalls at ~2-3 mm).
+            # Bracing the tangent axis with the full kc gives δ_t ≈ φ
+            # (saturated by kc, not amplified by kc/ka), which is the
+            # right order of magnitude (≈ 60 nm for φ = 6e-8) and
+            # disappears completely once Jacobi runs.
+            #
+            # This over-braces the tangent axis when α < π/2 (theory says
+            # kc·sin²α, we use kc), but the over-bracing only makes the
+            # linear warm-start CONSERVATIVELY small.  The full nonlinear
+            # equilibrium is recovered by Jacobi refinement which sees
+            # the correct kc·n̂_eff·n̂_eff^T contact-spring tensor in its
+            # per-iter residual.
+            A_t = (ka * ka_tangent_ratio + kc) * I_n + kl * L
             A_inv_t_np = np.linalg.inv(A_t).astype(np.float32)
             A_inv_t_wp = wp.array(A_inv_t_np, dtype=wp.float32, device=device)
 
@@ -459,6 +506,11 @@ class CSLCData:
             outward_normals=wp.array(all_normals, dtype=wp.vec3, device=device),
             sphere_shape=wp.array(all_shape, dtype=wp.int32, device=device),
             sphere_delta=wp.zeros(n_total, dtype=wp.vec3, device=device),
+            # B3 — start snapshot identical to sphere_delta (both zero
+            # at scene construction; the first step's launch sees a
+            # delta_dot of zero, which is correct for "no prior state").
+            sphere_delta_prev_step=wp.zeros(n_total, dtype=wp.vec3, device=device),
+            c_over_dt=c_over_dt,
             ka=ka, kl=kl, kc=kc, dc=dc,
             neighbor_start=wp.array(all_start, dtype=wp.int32, device=device),
             neighbor_count=wp.array(all_count, dtype=wp.int32, device=device),

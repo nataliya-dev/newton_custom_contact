@@ -56,18 +56,38 @@ class ObjectParams:
     radius: float = 0.0335
 
     # Fibonacci-spiral sample count on the sphere surface (Phase 7).
-    # Default 500 ⇒ mean spacing ≈ 6 mm on a 33.5 mm sphere.  The
-    # half-space approximation is fit-for-purpose at R/r_pad ≫ 1
-    # (contract §7.2); at R=33.5 mm, r_pad≈1 mm, R/r_pad ≈ 33, so
-    # spacing-to-r_pad ratio of 6 is still well within the locality
-    # kernel half-width 3·r_pad ≈ 3 mm — every active pad sphere sees
-    # 1-2 target samples within its kernel disc.  Cutting from the
-    # bridge-harness 1500 saves 3× on the inner loop of every CSLC
-    # kernel that iterates target samples (warm-start argmax, jacobi
-    # iteration, emission), trading 3× per-step speed for negligible
-    # change in grip stability.  Raise back to ~1500 if you need
-    # ultra-fine ``F = ∫ kc·phi·n dA`` integration accuracy.
-    sphere_n_samples: int = 100
+    # Default 300 ⇒ mean spacing ≈ sqrt(4π·R² / N) ≈ 7 mm on a 33.5 mm
+    # sphere.  This must be smaller than the pad's tangential kernel
+    # half-width (= r_pad) so each pad sphere can see at least one
+    # target sample inside its contact kernel; without that, the
+    # alignment+gate+w_tangent hard-culls in jacobi_step yield ZERO
+    # active samples and the apex registers no contact force at all.
+    #
+    # Calibration trace: with the Phase 6 w_tangent hard-cull in
+    # jacobi_step (cslc_kernels.py line ~702), the dome pad has
+    # r_pad ≈ 1.4 mm, so target samples > ~1.4 mm tangentially are
+    # culled.  At N=100, mean sphere-sample spacing ≈ 12 mm, so most
+    # apex pad spheres saw NO active samples → the lattice barely
+    # deformed → ball slipped out.  At N=300, spacing ≈ 7 mm and
+    # apex pad spheres reliably see 1-2 active samples → ~1 mm
+    # compression at the apex, ball held cleanly (final_z within
+    # 6 mm of pad target, xy slip < 7 mm vs ~14 mm at N=100).
+    #
+    # Before Phase 6 the w_tangent smoothing-tail accidentally
+    # contributed (often huge) phantom force from samples on the
+    # far side of the ball, so N=100 "worked" by accident -- the
+    # phantom force replaced the missing real contact.  Densifying
+    # didn't help then because the apex still saw few REAL contacts;
+    # the phantom forces dominated and weren't sensitive to N.
+    # With Phase 6 the apex needs real samples in its kernel, so
+    # N=300 is now the production-equivalent default.
+    #
+    # N is the dominant axis of per-step cost on dome grasps
+    # (cost = O(N_pad · N) per Jacobi iter).  Drop to N=100 for
+    # box-pad-only scenes if iteration speed is critical, or raise to
+    # N=500 if you need finer ``F = ∫ kc·phi·n dA`` integration
+    # accuracy at the cost of ~3× per-step cost vs N=300.
+    sphere_n_samples: int = 300
 
     # Box half-extents [m] in body-local frame.  Default 33.5 mm
     # half-side = 67 mm full side, matching the sphere's bounding box
@@ -483,11 +503,25 @@ class CSLCParams:
 
     # Per-step Jacobi refinement iterations.  Each is one
     # ``wp.launch(jacobi_step)``; cost scales linearly.
-    #     3 → under-converged, ball slips out (held=N)
-    # * 15 → converged on this scene (BEST cost/quality)
-    #    40 → no measurable improvement over 15
+    #
+    # Calibration: with the Phase 5a alignment-aware Jacobi diagonal
+    # and Phase 6 w_tangent hard-cull both active, the dome's small
+    # contact patch (r_pad ≈ 1.4 mm, ~10 mm cap on a 67 mm ball)
+    # needs ~40 iterations to converge the lattice δ before MuJoCo
+    # emits constraints.  The pre-Phase-6 box default 20 left the
+    # dome lattice non-converged enough that the emitted contact
+    # pattern flickered per step and the held object oscillated.
+    #
+    #     3 → under-converged on every pad kind
+    #     15 → converged on flat box (legacy default)
+    # *   40 → converged on both box and dome (production default)
+    #    200 → no measurable improvement over 40 (verified via
+    #          step-0 max|δ| sweep on dome SQUEEZE end)
+    #
     # Coupled with ``alpha``: low alpha needs more iters to converge.
-    n_iter: int = 20
+    # Box-only scenes can drop back to 20 to save ~50% step time;
+    # the dome path needs 40 for stable HOLD-phase behavior.
+    n_iter: int = 40
 
     # Damping factor in the Jacobi step.  Coupled with ``n_iter``.
     #   0.2 → too damped, lattice can't reach equilibrium in n_iter=15
@@ -528,6 +562,51 @@ class CSLCParams:
     # If True, build the dense A_inv (= (K + kc·I)^-1) for the
     # closed-form linear warm-start before the Jacobi refinement.
     build_A_inv: bool = True
+
+    # B3 — Lattice-level velocity damping coefficient [N·s/m].
+    # Adds an explicit ``-c_lattice · (δ - δ_prev_step) / dt`` term to
+    # each pad sphere's force balance in jacobi_step (alongside anchor,
+    # lateral, contact, friction).  Default 0.0 disables the term
+    # entirely (multiply by zero); pass ``--cslc-c-lat <value>`` to
+    # enable.  Dissipates energy from oscillatory lattice modes BEFORE
+    # the contact emission, complementary to A1's MuJoCo-side damping
+    # ``dc`` which acts AFTER emission.
+    #
+    # Easy-removal: every B3 site is tagged with ``# B3`` -- grep for
+    # that comment and delete those blocks to revert.  The default
+    # value 0.0 makes the change a no-op when disabled.
+    c_lattice: float = 0.0
+
+    # Per-contact damping coefficient written to MuJoCo's
+    # ``rigid_contact_damping`` slot.  MuJoCo's parametrisation:
+    #   dc = 0      → timeconst ≈ √(imp/ke) ≈ 30 ms (stiffness-derived)
+    #   dc > 0      → timeconst = 2 / dc  (explicit)
+    #
+    # **TRAP**: there is a "dead zone" 0 < dc < ~67 where the explicit
+    # branch gives a LARGER timeconst than the default (e.g. dc = 10 →
+    # timeconst = 200 ms, dc = 50 → 40 ms).  In this region the
+    # contact becomes SOFTER than dc=0 and the dome sim diverges
+    # catastrophically (ball flies away at 100+ m, max_z literally
+    # hundreds of metres).  Never use dc values below ~67.
+    #
+    # Sweep results on the production dome scene (lift+hold, 6.5 s):
+    #     dc =    0  → tail σz =  1.16 mm, slip =  6.1 mm (oscillates)
+    #     dc =   10  → DIVERGES (timeconst 200 ms is softer than default)
+    #     dc =   50  → DIVERGES on some seeds
+    #     dc =  200  → tail σz =  0.12 mm, slip =  3.6 mm (3× better)
+    # *   dc = 1000  → tail σz = 0.011 mm, slip = 0.18 mm (60× better,
+    #                  final_z lands within 0.1 mm of pad target)
+    #     dc = 5000  → tail σz =  0.14 mm, slip =  7.7 mm (over-damped,
+    #                  friction starts creeping during HOLD)
+    #
+    # The friction-timeconst coupling (cslc_kernels.py:1170) warns
+    # that high dc softens Coulomb friction — visible at dc=5000.
+    # ``dc = 1000`` (timeconst = 2 ms) is the production-default
+    # recommended value: stiff contacts that don't bounce, while the
+    # friction is still tight enough that the held object doesn't
+    # creep.  Default kept at 0 for legacy-compat; pass
+    # ``--cslc-dc 1000`` from the CLI to enable.
+    dc: float = 1000.0
 
 
 # ── Hydroelastic (PFC) parameters ────────────────────────────────────────

@@ -120,6 +120,15 @@ def _add_grasp_args(parser: argparse.ArgumentParser) -> None:
 
     # Hot CSLC overrides — not strictly minimal, but they save a lot of
     # round-trips while tuning grip behaviour.
+    # B3 — lattice-level velocity damping
+    g.add_argument("--cslc-c-lat", type=float, default=None,
+                   help="Lattice velocity damping coefficient [N·s/m] "
+                        "in jacobi_step (B3).  Default 0 = no-op.")
+    g.add_argument("--cslc-dc", type=float, default=None,
+                   help="Per-contact damping coefficient (MuJoCo "
+                        "rigid_contact_damping).  0 = use stiffness-derived "
+                        "timeconst ~30ms.  >0 = explicit timeconst = 2/dc, "
+                        "i.e. dc=200 → 10ms.  See CSLCParams.dc.")
     g.add_argument("--cslc-kl", type=float, default=None,
                    help="Override CSLC lateral stiffness kl [N/m].")
     g.add_argument("--cslc-ka", type=float, default=None,
@@ -187,6 +196,11 @@ def _apply_args_to_config(args, config: GraspConfig) -> GraspConfig:
         config.logging.run_label = args.run_label
     if args.no_timestamp:
         config.logging.use_timestamp = False
+    # B3
+    if args.cslc_c_lat is not None:
+        config.cslc.c_lattice = args.cslc_c_lat
+    if args.cslc_dc is not None:
+        config.cslc.dc = args.cslc_dc
     if args.cslc_kl is not None:
         config.cslc.kl = args.cslc_kl
     if args.cslc_ka is not None:

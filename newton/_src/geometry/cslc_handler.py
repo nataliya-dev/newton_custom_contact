@@ -505,6 +505,18 @@ class CSLCHandler:
             contacts: Contacts buffer to write to.
             contact_offset: Starting index in contacts buffer for CSLC slots.
         """
+        # B3 — Snapshot the previous step's converged sphere_delta into
+        # sphere_delta_prev_step ONCE before any pair runs.  cslc_copy_active
+        # at the end of each pair's _launch overwrites sphere_delta in
+        # place, so we must capture the previous step's state here, before
+        # the pair loop, to give the lattice velocity-damping term in
+        # jacobi_step a consistent reference for δ̇ ≈ (δ - δ_prev)/dt.
+        # When c_over_dt == 0 the kernel ignores delta_prev_step but the
+        # copy still runs (one wp.copy of n_spheres·vec3, ~µs, negligible
+        # vs the Jacobi launches).
+        if self.cslc_data.sphere_delta_prev_step is not None:
+            wp.copy(self.cslc_data.sphere_delta_prev_step, self.cslc_data.sphere_delta)
+
         pair_offset = contact_offset
         truncation_pairs: list[tuple[int, int]] = []  # (pair_idx, K_max)
         for pair_idx, pair in enumerate(self.shape_pairs):
@@ -661,6 +673,9 @@ class CSLCHandler:
                     # (apex_idx = -1 is the no-op sentinel).
                     int(-1), wp.vec3(0.0, 0.0, 0.0),
                     eps,
+                    # B3 — lattice velocity damping inputs.
+                    data.sphere_delta_prev_step,
+                    data.c_over_dt,
                 ],
                 device=self.device,
             )

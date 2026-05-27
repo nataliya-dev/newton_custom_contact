@@ -28,6 +28,7 @@ from .params import GraspConfig
 from .scene import SceneArtifacts, build_scene
 from .solvers import make_solver
 from .visualization import (
+    ContactNormalRenderer,
     LatticeRenderer,
     StatsPanel,
     TargetPointsRenderer,
@@ -255,6 +256,7 @@ class Example:
 
         self.lattice = LatticeRenderer(self.model, self.viewer)
         self.target_points = TargetPointsRenderer(self.model, self.viewer)
+        self.contact_normals = ContactNormalRenderer(self.model, self.viewer)
         self.stats = StatsPanel(config)
         self.viewer.set_model(self.model)
         self.viewer.set_camera(
@@ -312,6 +314,7 @@ class Example:
         self.viewer.log_contacts(self.contacts, self.state_0)
         self.lattice.update(self.state_0)
         self.target_points.update(self.state_0)
+        self.contact_normals.update(self.contacts, self.state_0)
         self.viewer.end_frame()
 
     def gui(self, ui) -> None:

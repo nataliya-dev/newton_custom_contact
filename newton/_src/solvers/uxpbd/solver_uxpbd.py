@@ -23,6 +23,12 @@ from ..xpbd.kernels import (
     copy_kinematic_body_state_kernel,
     solve_body_joints,
 )
+from .compliant_lattice import (
+    accumulate_cslc_body_wrench,
+    solve_lattice_anchor_compression,
+    solve_lattice_jacobi_step,
+)
+from .cslc_params import CSLCParams
 from .fluid import (
     apply_cohesion_forces,
     apply_xsph_viscosity,
@@ -46,8 +52,9 @@ class SolverUXPBD(SolverBase):
     Phase 1 implements articulated rigid bodies with a kinematic lattice
     shell. Subsequent phases add free shape-matched rigid (PBD-R), soft bodies
     (springs / bending / FEM tet), and liquids (PBF density constraint).
-    The class preserves architectural seams for v2 CSLC (compliant sphere
-    lattice contact); see :meth:`compute_compliant_contact_response`.
+    Compliant Sphere Lattice Contact (CSLC) is opt-in via
+    ``cslc_params=CSLCParams(...)``; see
+    :meth:`compute_compliant_contact_response`.
 
     Args:
         model: The :class:`~newton.Model` to simulate.
@@ -69,10 +76,13 @@ class SolverUXPBD(SolverBase):
         fluid_iterations: Number of PBF sub-iterations per main iteration for
             incompressibility enforcement on fluid particles (Macklin and Muller
             2013). Default 4.
-        enable_cslc: Must be False in Phase 1. Reserved for v2.
-
-    Raises:
-        NotImplementedError: If ``enable_cslc=True``.
+        cslc_params: Optional :class:`CSLCParams` configuration. ``None``
+            (default) leaves the lattice rigid (Phase 1 behaviour). Pass
+            an instance to enable the v1 anchor-only compliant contact
+            hook; per-sphere stiffnesses come from the
+            ``model.lattice_*`` arrays (populated by
+            ``builder.add_lattice``). New CSLC knobs get added to
+            :class:`CSLCParams`, not to this constructor.
     """
 
     def __init__(
@@ -87,14 +97,10 @@ class SolverUXPBD(SolverBase):
         joint_linear_relaxation: float = 0.7,
         shock_propagation_k: float = 0.0,
         fluid_iterations: int = 4,
-        enable_cslc: bool = False,
+        cslc_params: CSLCParams | None = None,
     ):
         super().__init__(model=model)
-        if enable_cslc:
-            raise NotImplementedError(
-                "CSLC compliant contact is reserved for UXPBD v2. "
-                "See docs/superpowers/specs/2026-05-13-uxpbd-design.md section 5.5."
-            )
+        self.cslc_params: CSLCParams | None = cslc_params
         self.iterations = iterations
         self.stabilization_iterations = stabilization_iterations
         self.soft_contact_relaxation = soft_contact_relaxation
@@ -221,11 +227,26 @@ class SolverUXPBD(SolverBase):
                 j_child = model.joint_child.numpy()
                 valid = j_child >= 0
                 body_art[j_child[valid]] = j_art[valid]
-            self.body_articulation = wp.array(
-                body_art, dtype=wp.int32, device=dev)
+            self.body_articulation = wp.array(body_art, dtype=wp.int32, device=dev)
         else:
-            self.body_articulation = wp.empty(
-                0, dtype=wp.int32, device=dev)
+            self.body_articulation = wp.empty(0, dtype=wp.int32, device=dev)
+
+        # CSLC Jacobi ping-pong scratches.  Allocated only when the
+        # Jacobi solver is enabled and lattice spheres exist.
+        # ``compute_compliant_contact_response`` writes the converged δ
+        # into ``model.lattice_delta`` via wp.copy at the end of the
+        # sweep loop, so these scratches stay solver-internal.
+        N_lat = model.lattice_sphere_count
+        if (
+            self.cslc_params is not None
+            and self.cslc_params.use_jacobi
+            and N_lat > 0
+        ):
+            self._cslc_delta_a = wp.zeros(N_lat, dtype=wp.vec3, device=dev)
+            self._cslc_delta_b = wp.zeros(N_lat, dtype=wp.vec3, device=dev)
+        else:
+            self._cslc_delta_a = None
+            self._cslc_delta_b = None
 
     # ------- ping-pong helpers (perf #2) -------------------------------
     def _alt_particle_q(self, state_out):
@@ -360,10 +381,18 @@ class SolverUXPBD(SolverBase):
         if model.particle_count:
             self.integrate_particles(model, state_in, state_out, dt)
 
-        # 2. Project body_q onto lattice particles.
-        self.update_lattice_world_positions(state_out)
+        # 2. Project body_q onto lattice particles. dt=0 here suppresses the
+        # Hunt-Crossley delta_dot term for the first projection of the
+        # substep: lattice_delta still holds the previous substep's value
+        # and lattice_delta_prev has not yet been snapshotted, so a
+        # finite-difference rate is meaningless. The in-loop projections
+        # below pass dt and pick up the rate term after
+        # compute_compliant_contact_response has refreshed both arrays.
+        self.update_lattice_world_positions(state_out, dt=0.0)
 
-        # 3. v2 CSLC hook (no-op in v1).
+        # 3. CSLC hook (no-op when cslc_params is None). Snapshots
+        # lattice_delta -> lattice_delta_prev and writes the new
+        # per-sphere compression delta_n into lattice_delta.
         self.compute_compliant_contact_response(state_in, state_out, contacts, dt)
 
         # 4. Main iteration loop.
@@ -485,19 +514,9 @@ class SolverUXPBD(SolverBase):
         # corrections converge regardless of stabilization. A future
         # apply_body_deltas_position_only kernel would extend §4.4 to the
         # lattice path and is left as a follow-up.
-        if (self.stabilization_iterations > 0
-                and contacts is not None
-                and model.particle_count > 0):
-            _body_q_stab = (
-                state_out.body_q
-                if state_out.body_q is not None
-                else self._empty_body_q
-            )
-            _body_qd_stab = (
-                state_out.body_qd
-                if state_out.body_qd is not None
-                else self._empty_body_qd
-            )
+        if self.stabilization_iterations > 0 and contacts is not None and model.particle_count > 0:
+            _body_q_stab = state_out.body_q if state_out.body_q is not None else self._empty_body_q
+            _body_qd_stab = state_out.body_qd if state_out.body_qd is not None else self._empty_body_qd
             for _stab_iter in range(self.stabilization_iterations):
                 body_deltas.zero_()
                 body_contact_count.zero_()
@@ -571,8 +590,7 @@ class SolverUXPBD(SolverBase):
                 # position_only passes them through unchanged).
                 # Required to make SM-rigid + fluid scenes (Macklin '14 Fig. 1
                 # bunnies-in-water) stable in PBD-R-updated UXPBD.
-                if (self._num_dynamic_groups > 0
-                        and model.particle_count > 0):
+                if self._num_dynamic_groups > 0 and model.particle_count > 0:
                     self._particle_deltas.zero_()
                     self._P_b4.zero_()
                     self._L_b4.zero_()
@@ -615,7 +633,7 @@ class SolverUXPBD(SolverBase):
 
                 # Re-sync lattice particle positions from the (unchanged)
                 # body_q so the next stabilization iter sees consistent state.
-                self.update_lattice_world_positions(state_out)
+                self.update_lattice_world_positions(state_out, dt=dt)
 
         for _ in range(self.iterations):
             if body_deltas is not None:
@@ -632,16 +650,8 @@ class SolverUXPBD(SolverBase):
             # writes to them are gated by is_lattice (needs bodies) or
             # shape_link >= 0 (needs bodies), so no real writes hit the dummy.
             if contacts is not None and model.particle_count > 0:
-                _body_q_ps = (
-                    state_out.body_q
-                    if state_out.body_q is not None
-                    else self._empty_body_q
-                )
-                _body_qd_ps = (
-                    state_out.body_qd
-                    if state_out.body_qd is not None
-                    else self._empty_body_qd
-                )
+                _body_q_ps = state_out.body_q if state_out.body_q is not None else self._empty_body_q
+                _body_qd_ps = state_out.body_qd if state_out.body_qd is not None else self._empty_body_qd
                 # Reuse the shared particle-deltas accumulator (perf #2).
                 self._particle_deltas.zero_()
                 particle_deltas_contact = self._particle_deltas
@@ -691,7 +701,7 @@ class SolverUXPBD(SolverBase):
                 _apply_deltas_flip(constraint_inv_weights=body_contact_count)
 
                 # Re-sync lattice after body update so next iter sees consistent state.
-                self.update_lattice_world_positions(state_out)
+                self.update_lattice_world_positions(state_out, dt=dt)
 
                 # Apply particle-side deltas from shape contact (SM-rigid path).
                 # Uses apply_particle_deltas_uxpbd which passes through v for
@@ -735,6 +745,11 @@ class SolverUXPBD(SolverBase):
                 # Reuse the shared particle-deltas accumulator (perf #2).
                 self._particle_deltas.zero_()
                 pp_particle_deltas = self._particle_deltas
+                # Flag: when CSLC is active, the pp contact kernel skips
+                # the lattice-side body_delta write and the CSLC anchor
+                # reaction kernel below provides the body wrench instead.
+                # See contract_v2 §4-§5 and the kernel docstring.
+                cslc_owns_lattice_wrench = 1 if self.cslc_params is not None else 0
                 wp.launch(
                     kernel=solve_particle_particle_contacts_uxpbd,
                     dim=model.particle_count,
@@ -759,10 +774,33 @@ class SolverUXPBD(SolverBase):
                         model.particle_max_radius,
                         dt,
                         self.soft_contact_relaxation,
+                        cslc_owns_lattice_wrench,
                     ],
                     outputs=[pp_particle_deltas, body_deltas, body_contact_count],
                     device=model.device,
                 )
+                # CSLC body wrench: per-sphere anchor reaction F = -k_a*delta_n*n
+                # accumulated into body_delta. Replaces the lattice-side PBD
+                # constraint-resolution wrench that the pp kernel just skipped.
+                if self.cslc_params is not None and model.lattice_sphere_count > 0:
+                    wp.launch(
+                        kernel=accumulate_cslc_body_wrench,
+                        dim=model.lattice_sphere_count,
+                        inputs=[
+                            state_out.body_q,
+                            model.body_com,
+                            model.lattice_link,
+                            model.lattice_p_rest,
+                            model.lattice_normal,
+                            model.lattice_is_surface,
+                            model.lattice_k_anchor,
+                            model.lattice_delta,
+                            float(self.cslc_params.ka_tangent_ratio),
+                            dt,
+                        ],
+                        outputs=[body_deltas],
+                        device=model.device,
+                    )
                 _apply_deltas_flip(constraint_inv_weights=body_contact_count)
                 # PP-contact body apply moved bodies, so lattice particles
                 # (whose x/qd are body-derived) are now stale. The post-apply
@@ -789,7 +827,7 @@ class SolverUXPBD(SolverBase):
                 )
                 state_out.particle_q = new_q
                 state_out.particle_qd = new_qd
-                self.update_lattice_world_positions(state_out)
+                self.update_lattice_world_positions(state_out, dt=dt)
 
             # Position-Based Fluids pipeline (Macklin and Muller 2013).
             # Runs fluid_iterations sub-iterations per main iteration.
@@ -967,7 +1005,7 @@ class SolverUXPBD(SolverBase):
                     device=model.device,
                 )
                 _apply_deltas_flip()
-                self.update_lattice_world_positions(state_out)
+                self.update_lattice_world_positions(state_out, dt=dt)
 
             # SM-rigid groups: shape matching + momentum-conservation post-pass.
             if self._num_dynamic_groups > 0 and model.particle_count > 0:
@@ -1089,20 +1127,36 @@ class SolverUXPBD(SolverBase):
                 device=model.device,
             )
 
-    def update_lattice_world_positions(self, state: State) -> None:
+    def update_lattice_world_positions(self, state: State, dt: float = 0.0) -> None:
         """Project ``body_q``/``body_qd`` onto every lattice particle.
 
         Updates ``state.particle_q``, ``state.particle_qd``, and
         ``model.particle_radius`` in place for all lattice particles. Non-lattice
-        particles are left untouched.
+        particles are left untouched. When ``cslc_params`` is set,
+        :attr:`Model.lattice_delta` (populated by
+        :meth:`compute_compliant_contact_response`) physically shifts
+        the projected particle inward along the lattice's outward
+        normal, and the per-substep finite difference
+        :math:`(\\delta - \\delta_{prev}) / dt` contributes a
+        Hunt-Crossley term to the particle's world velocity.
 
         Args:
             state: The :class:`~newton.State` whose body_q drives the projection
                 and whose particle_q is written.
+            dt: Substep duration [s], used for the Hunt-Crossley
+                :math:`\\dot{\\delta}` term. Pass ``0.0`` to suppress
+                the rate coupling (the kernel will then only do the
+                position shift); the in-loop call sites pass the
+                solver's ``sim_dt``.
         """
         model = self.model
         if model.lattice_sphere_count == 0:
             return
+        # Pull the velocity-coupling clamp from CSLCParams if set; the
+        # sentinel -1.0 disables the clamp inside the kernel.
+        clamp_dot = -1.0
+        if self.cslc_params is not None and self.cslc_params.clamp_delta_dot_max is not None:
+            clamp_dot = float(self.cslc_params.clamp_delta_dot_max)
         wp.launch(
             kernel=update_lattice_world_positions_kernel,
             dim=model.lattice_sphere_count,
@@ -1112,9 +1166,13 @@ class SolverUXPBD(SolverBase):
                 model.body_com,
                 model.lattice_link,
                 model.lattice_p_rest,
+                model.lattice_normal,
                 model.lattice_delta,
+                model.lattice_delta_prev,
                 model.lattice_r,
                 model.lattice_particle_index,
+                float(dt),
+                clamp_dot,
             ],
             outputs=[
                 state.particle_q,
@@ -1131,12 +1189,166 @@ class SolverUXPBD(SolverBase):
         contacts: Contacts | None,
         dt: float,
     ) -> None:
-        """v2 CSLC hook. No-op in Phase 1.
+        """CSLC hook: solve per-sphere lattice compression :math:`\\delta`.
 
-        v2 will solve the lattice compression vector :math:`\\delta` from the
-        quasistatic equilibrium :math:`K\\delta = k_c (\\phi^{rest} - \\delta)_+`
-        and write it into ``model.lattice_delta``, which the
-        ``update_lattice_world_positions`` kernel then propagates into the
-        per-particle effective radius.
+        No-op unless ``cslc_params`` was passed to the constructor.
+        When enabled this runs **once per substep**, before the
+        constraint iteration loop:
+
+        1. Snapshot the current ``model.lattice_delta`` into
+           ``model.lattice_delta_prev`` (so the Hunt-Crossley
+           :math:`\\dot{\\delta}` term in
+           ``update_lattice_world_positions`` sees the correct
+           per-substep finite difference).
+        2. Rebuild ``model.particle_grid`` from
+           ``state_out.particle_q`` so the kernel sees the
+           post-projection lattice positions.
+        3. Run the v1 anchor-only series-spring solve
+           (:func:`solve_lattice_anchor_compression`) over every
+           surface lattice sphere; writes :math:`\\delta_{n,i}` into
+           ``model.lattice_delta``.
+
+        Two downstream consumers read ``model.lattice_delta`` every
+        iteration of the constraint loop:
+
+        * ``update_lattice_world_positions`` physically displaces each
+          lattice particle inward by :math:`\\delta_{n,i} \\hat
+          n_{world,i}` (and adds the Hunt-Crossley
+          :math:`-\\dot{\\delta} \\hat n` term to its world velocity),
+          exposing the compressed-skin geometry to the contact
+          kernels.
+        * :func:`accumulate_cslc_body_wrench` (launched in the
+          iteration loop after the pp contact pass) accumulates the
+          per-sphere anchor reaction :math:`F_i = -k_a \\delta_{n,i}
+          \\hat n_{world,i}` into ``body_delta``, replacing the
+          lattice-side PBD constraint wrench that the pp contact
+          kernel skips when ``cslc_owns_lattice_wrench`` is set.
+
+        v2 will replace the per-sphere closed form with the
+        contract_v2 damped-Jacobi solve over the graph Laplacian +
+        per-pair half-space contact integral; see
+        ``cslc_main/theory/contract_v2.md`` §6 and the TODO list at
+        the top of ``compliant_lattice.py``.
         """
-        return
+        if self.cslc_params is None:
+            return
+        model = self.model
+        if model.lattice_sphere_count == 0:
+            return
+        # The CSLC solvers query model.particle_grid for per-pair
+        # overlap; without a populated grid the load is always 0 and
+        # the kernel writes delta = 0 -- no visible compliance.
+        if model.particle_count <= 1 or model.particle_grid is None:
+            return
+
+        # Snapshot delta -> delta_prev so the next update_lattice_world_positions
+        # call sees a meaningful (delta - delta_prev)/dt.
+        wp.copy(model.lattice_delta_prev, model.lattice_delta)
+
+        clamp_delta = -1.0
+        if self.cslc_params.clamp_delta_max is not None:
+            clamp_delta = float(self.cslc_params.clamp_delta_max)
+
+        # Build the hash grid from the post-projection particle positions
+        # (state_out.particle_q reflects the rigid-lattice projection from
+        # the previous update_lattice_world_positions call). Search radius
+        # matches the contact pass (kernels.py:742) so the same pair set
+        # is enumerated.
+        search_radius = model.particle_max_radius * 2.0 + model.particle_cohesion
+        with wp.ScopedDevice(model.device):
+            model.particle_grid.build(state_out.particle_q, radius=search_radius)
+
+        if not self.cslc_params.use_jacobi:
+            # v1 anchor-only closed-form (single launch, no iteration).
+            wp.launch(
+                kernel=solve_lattice_anchor_compression,
+                dim=model.lattice_sphere_count,
+                inputs=[
+                    model.particle_grid.id,
+                    state_out.particle_q,
+                    model.particle_radius,
+                    model.particle_flags,
+                    model.particle_substrate,
+                    model.particle_to_lattice,
+                    state_out.body_q,
+                    self.body_articulation,
+                    model.lattice_link,
+                    model.lattice_normal,
+                    model.lattice_is_surface,
+                    model.lattice_k_anchor,
+                    model.lattice_k_bulk,
+                    model.lattice_particle_index,
+                    model.particle_max_radius,
+                    clamp_delta,
+                ],
+                outputs=[model.lattice_delta],
+                device=model.device,
+            )
+            return
+
+        # ─── Jacobi sweep path ─────────────────────────────────────────
+        # Loop solve_lattice_jacobi_step ``jacobi_iterations`` times with
+        # ping-pong src/dst scratches; copy the converged buffer into
+        # model.lattice_delta at the end so downstream consumers
+        # (update_lattice_world_positions, accumulate_cslc_body_wrench)
+        # read uniformly without caring which path produced δ.  Seed
+        # the first src buffer with the previous substep's converged δ
+        # (warm-start), already in lattice_delta after the snapshot above.
+        src = self._cslc_delta_a
+        dst = self._cslc_delta_b
+        wp.copy(src, model.lattice_delta)
+
+        eps = float(self.cslc_params.smoothing_eps)
+        alpha = float(self.cslc_params.alpha)
+        ka_ratio = float(self.cslc_params.ka_tangent_ratio)
+        k_stick = float(self.cslc_params.k_stick)
+        mu_friction = float(self.cslc_params.mu_friction)
+
+        # The Jacobi kernel reads ``lattice_neighbor_*`` for the lateral
+        # Laplacian.  Until that topology is populated (Step 2), the
+        # neighbor_count array is empty and each sphere sees zero
+        # neighbours — equivalent to ``kl = 0`` per sphere.  Pass the
+        # arrays through unconditionally; an empty CSR is a valid
+        # "no-edges" graph that the kernel handles via the
+        # ``n_neighbors == 0`` early-out on f_lateral.
+        for _it in range(self.cslc_params.jacobi_iterations):
+            wp.launch(
+                kernel=solve_lattice_jacobi_step,
+                dim=model.lattice_sphere_count,
+                inputs=[
+                    src,
+                    dst,
+                    model.particle_grid.id,
+                    state_out.particle_q,
+                    model.particle_radius,
+                    model.particle_flags,
+                    model.particle_substrate,
+                    model.particle_to_lattice,
+                    state_out.body_q,
+                    self.body_articulation,
+                    model.lattice_link,
+                    model.lattice_p_rest,
+                    model.lattice_normal,
+                    model.lattice_is_surface,
+                    model.lattice_k_anchor,
+                    model.lattice_k_lateral,
+                    model.lattice_k_bulk,
+                    model.lattice_neighbors_offset,
+                    model.lattice_neighbors_count,
+                    model.lattice_neighbors_csr,
+                    model.lattice_particle_index,
+                    model.particle_max_radius,
+                    eps,
+                    alpha,
+                    ka_ratio,
+                    k_stick,
+                    mu_friction,
+                    clamp_delta,
+                ],
+                device=model.device,
+            )
+            src, dst = dst, src
+
+        # After the loop, ``src`` holds the latest converged δ
+        # (last-swap leaves the just-written buffer in src).
+        wp.copy(model.lattice_delta, src)

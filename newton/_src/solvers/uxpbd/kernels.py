@@ -20,26 +20,46 @@ def update_lattice_world_positions(
     body_com: wp.array[wp.vec3],
     lattice_link: wp.array[wp.int32],
     lattice_p_rest: wp.array[wp.vec3],
-    lattice_delta: wp.array[float],
+    lattice_normal: wp.array[wp.vec3],
+    lattice_delta: wp.array[wp.vec3],
+    lattice_delta_prev: wp.array[wp.vec3],
     lattice_r: wp.array[float],
     lattice_particle_index: wp.array[wp.int32],
+    dt: float,
+    clamp_delta_dot_max: float,  # < 0 disables (uses sentinel)
     # outputs
     particle_q: wp.array[wp.vec3],
     particle_qd: wp.array[wp.vec3],
     particle_radius: wp.array[float],
 ):
-    """Project body_q onto lattice particles.
+    """Project body_q onto lattice particles, with CSLC compliance applied.
 
     For lattice sphere ``i`` with body-frame offset ``p_rest`` hosted by
-    ``link``, set:
+    ``link``:
 
-    ``particle_q[pidx] = body_q[link] x p_rest``,
-    ``particle_qd[pidx] = v_lin + omega x (R . (p_rest - com))``,
-    ``particle_radius[pidx] = lattice_r[i] - lattice_delta[i]``  (delta == 0 in v1).
+    - ``p_pin = body_q[link] x p_rest``  (rigid-lattice "kinematic pin")
+    - ``particle_q[pidx] = p_pin - lattice_delta[sid]``  (CSLC contract
+      sign convention :math:`q_i = p_i - \\delta_i`; ``δ`` along
+      ``+n_outward`` corresponds to compression inward)
+    - ``particle_qd[pidx] = v_lin + omega x r_world  -  delta_dot``
+      where ``delta_dot = (lattice_delta - lattice_delta_prev) / dt``
+      is the per-substep vec3 finite difference (Hunt-Crossley rate
+      coupling).
+    - ``particle_radius[pidx] = lattice_r[sid]``  (rest radius unchanged;
+      compliance is in the position shift, not a radius shrink, so
+      downstream contact sees the same sphere geometry just translated)
 
-    The ``particle_radius`` write is the load-bearing CSLC v2 seam: v2 writes
-    nonzero ``lattice_delta`` and downstream contact kernels automatically
-    see the compressed effective radius.
+    ``δ`` is a vec3 so it can carry tangential shear (used by the
+    stick-slip friction term in the Jacobi solver) in addition to normal
+    compression.  The v1 closed-form solver writes ``δ_n · n_outward``;
+    the Jacobi solver writes the full vec3.
+
+    ``clamp_delta_dot_max`` (in [m/s]) bounds ``|delta_dot|`` per-axis
+    against the warmup spike on first contact when ``lattice_delta_prev
+    = 0`` and ``lattice_delta`` jumps to a finite value in one substep.
+    Pass a negative sentinel to disable.  ``dt <= 0`` suppresses the
+    rate term entirely (used for the pre-step projection where
+    ``lattice_delta_prev`` is stale).
     """
     sid = wp.tid()
     link = lattice_link[sid]
@@ -47,19 +67,54 @@ def update_lattice_world_positions(
     tf = body_q[link]
     pidx = lattice_particle_index[sid]
 
-    # World position
-    particle_q[pidx] = wp.transform_point(tf, p_local)
+    # CSLC seam displacement for this substep (already populated by
+    # compute_compliant_contact_response; v1 anchor-only closed-form or
+    # v2 Jacobi solve, indistinguishable here).
+    delta = lattice_delta[sid]
 
-    # World velocity at offset
+    # Rigid-lattice pin + inward CSLC displacement.
+    p_pin = wp.transform_point(tf, p_local)
+    particle_q[pidx] = p_pin - delta
+
+    # World velocity at offset (rigid-lattice term).
     rot = wp.transform_get_rotation(tf)
     r_world = wp.quat_rotate(rot, p_local - body_com[link])
     twist = body_qd[link]
     v_lin = wp.spatial_top(twist)
     omega = wp.spatial_bottom(twist)
-    particle_qd[pidx] = v_lin + wp.cross(omega, r_world)
+    v_rigid = v_lin + wp.cross(omega, r_world)
 
-    # Effective contact radius. v1: delta == 0 so radius == rest radius.
-    particle_radius[pidx] = lattice_r[sid] - lattice_delta[sid]
+    # Hunt-Crossley velocity coupling: per-substep finite difference of
+    # δ contributes to the particle's world velocity.  Skip when dt<=0
+    # (caller signals "no rate term", e.g. pre-step initialization).
+    delta_dot = wp.vec3(0.0, 0.0, 0.0)
+    if dt > 0.0:
+        delta_dot = (delta - lattice_delta_prev[sid]) / dt
+        if clamp_delta_dot_max >= 0.0:
+            # Per-axis symmetric clamp.  A magnitude-based clamp would
+            # change the direction at the threshold; per-axis preserves
+            # it (each component independently saturated).
+            dx = delta_dot[0]
+            dy = delta_dot[1]
+            dz = delta_dot[2]
+            if dx > clamp_delta_dot_max:
+                dx = clamp_delta_dot_max
+            elif dx < -clamp_delta_dot_max:
+                dx = -clamp_delta_dot_max
+            if dy > clamp_delta_dot_max:
+                dy = clamp_delta_dot_max
+            elif dy < -clamp_delta_dot_max:
+                dy = -clamp_delta_dot_max
+            if dz > clamp_delta_dot_max:
+                dz = clamp_delta_dot_max
+            elif dz < -clamp_delta_dot_max:
+                dz = -clamp_delta_dot_max
+            delta_dot = wp.vec3(dx, dy, dz)
+    particle_qd[pidx] = v_rigid - delta_dot
+
+    # Geometric radius is preserved; compliance is expressed through the
+    # particle position shift, not a radius shrink.
+    particle_radius[pidx] = lattice_r[sid]
 
 
 @wp.func
@@ -280,6 +335,7 @@ def solve_particle_particle_contacts_uxpbd(
     max_radius: float,
     dt: float,
     relaxation: float,
+    cslc_owns_lattice_wrench: int,
     # outputs
     particle_deltas: wp.array[wp.vec3],
     body_delta: wp.array[wp.spatial_vector],
@@ -301,6 +357,18 @@ def solve_particle_particle_contacts_uxpbd(
     is consumed by ``apply_body_deltas`` via its ``constraint_inv_weights``
     parameter to divide the accumulated wrench, preventing redundant
     co-located lattice contacts from compounding into a launch impulse.
+
+    When ``cslc_owns_lattice_wrench != 0``, the lattice-side ``body_delta``
+    write is suppressed: the body wrench from pad/object contact is
+    instead produced by the CSLC anchor reactions
+    (:func:`accumulate_cslc_body_wrench` in
+    ``newton._src.solvers.uxpbd.compliant_lattice``). The SM-rigid /
+    object-side ``particle_delta`` write is unaffected -- the ball
+    still gets pushed away from the (compressed) lattice spheres. The
+    pad gets pushed back by integrated CSLC anchor reactions instead
+    of by raw position-constraint resolution; this is what makes the
+    spheres visibly deform under load instead of the body absorbing
+    the entire overlap.
     """
     tid = wp.tid()
     i = wp.hash_grid_point_id(grid, tid)
@@ -413,9 +481,11 @@ def solve_particle_particle_contacts_uxpbd(
             delta_acc += d_total * w_i
 
     if is_lat_i:
-        host_i = lattice_link[particle_to_lattice[i]]
-        wp.atomic_add(body_delta, host_i, wp.spatial_vector(body_delta_lin, body_delta_ang))
-        wp.atomic_add(body_contact_count, host_i, body_contact_n)
+        if cslc_owns_lattice_wrench == 0:
+            host_i = lattice_link[particle_to_lattice[i]]
+            wp.atomic_add(body_delta, host_i, wp.spatial_vector(body_delta_lin, body_delta_ang))
+            wp.atomic_add(body_contact_count, host_i, body_contact_n)
+        # else: CSLC anchor-reaction kernel writes the lattice body wrench.
     else:
         wp.atomic_add(particle_deltas, i, delta_acc)
 

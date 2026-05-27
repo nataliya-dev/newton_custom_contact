@@ -130,7 +130,9 @@ def compute_cslc_penetration(
           (back-side AND perpendicular samples hard-culled; literal
           0.05 MUST match ``EPS_ALIGN_DEFAULT``),
       (3) tangential locality ``w_tangent ≥ 1e-2`` where ``w_tangent =
-          smooth_step(3·r_i − d_t, eps)`` and ``d_t`` is the tangential
+          smooth_step(r_i − d_t, eps)`` (Option-2 tiling, kernel
+          half-width = r_pad — DIVERGES from contract §3.5 which
+          specifies 3·r_pad) and ``d_t`` is the tangential
           distance from the pad centre to the sample in the sample's
           face plane.  Without this cull the argmax can pick samples
           where ``n_face`` is steeply tilted relative to (q − t),
@@ -149,7 +151,10 @@ def compute_cslc_penetration(
     saturate on.
 
     Outputs:
-      * ``raw_penetration[i] = smooth_relu(raw_ij*, eps) * smooth_step(L*, eps)``
+      * ``raw_penetration[i] = σ_ε(raw_ij*) · √(σ_ε(raw_ij*) + ε)
+        · smooth_step(L*, eps)``  (Hertz-like δ^1.5 lift; matches
+        :func:`jacobi_step`'s force law — DIVERGES from contract §4
+        eq:phi-eff which specifies linear ``σ_ε(raw)``)
       * ``contact_normal_out[i] = -n_face_world_j*``  (load direction)
 
     Pad spheres with no target sample passing the gates get phi = 0
@@ -538,6 +543,13 @@ def jacobi_step(
     f_ext_apex_idx: int,
     f_ext_apex: wp.vec3,
     eps: float,
+    # B3 — lattice velocity damping.  ``delta_prev_step`` is a snapshot
+    # of ``sphere_delta`` taken at the start of this simulation step;
+    # ``c_over_dt = c_lattice / dt`` is the damping rate.  Setting
+    # ``c_over_dt = 0`` makes the damping force identically zero and
+    # the kernel reduces to the pre-B3 form.
+    delta_prev_step: wp.array(dtype=wp.vec3),
+    c_over_dt: float,
 ):
     """One damped Jacobi sweep for the ACTIVE lattice against a PointSetTarget.
 
@@ -553,10 +565,16 @@ def jacobi_step(
 
     where for each target sample m (contract §3.2, §3.4, §3.5, §3.6):
        raw_im      = r_lat_i − n_face_m · (q_i − t_m)               (half-space)
-       phi_eff_im  = smooth_relu(raw_im, eps)
+       phi_eff_im  = σ_ε(raw_im) · √(σ_ε(raw_im) + ε)               (Hertz-like δ^1.5;
+                                                                     DIVERGES from contract §4
+                                                                     eq:phi-eff which specifies
+                                                                     linear σ_ε(raw))
        gate_im     = smooth_step(raw_im, eps)
        d_t_im      = ‖(q_i − t_m) − n_face_m · (q_i − t_m) · n_face_m‖
-       w_t_im      = smooth_step(3 r_lat_i − d_t_im, eps)
+       w_t_im      = smooth_step(r_lat_i − d_t_im, eps)             (Option-2 tiling,
+                                                                     kernel half-width = r_pad;
+                                                                     DIVERGES from contract §3.5
+                                                                     eq:w_t which specifies 3·r_pad)
        a_im        = smoothstep(α_im / EPS_ALIGN, 0, 1) on [0, +EPS_ALIGN]
                    = 0 if α_im ≤ 0 (back-side / perpendicular hard-cull)
                    = 1 if α_im ≥ +EPS_ALIGN (face-on)
@@ -606,7 +624,34 @@ def jacobi_step(
 
     # Point-set CONTACT: sum over target samples.
     f_contact_vec = wp.vec3(0.0, 0.0, 0.0)
-    sum_gate = float(0.0)
+    # Per-axis contact-spring diagonal stabilisers (Phase 5a fix).  The
+    # contact spring acts along n_eff = -n_face with stiffness kc; its
+    # per-sphere stiffness tensor is kc · n_eff·n_eff^T.  Projecting
+    # onto pad sphere i's local outward-normal frame (axis = n_pad,
+    # angle α = ∠(n_eff, n_pad)) gives:
+    #     normal-axis diag contribution: kc · cos²α
+    #     tangent-axis diag contribution: kc · sin²α
+    # where cos α = -(n_face · n_pad) = align_arg (already computed for
+    # the alignment gate).
+    #
+    # The pre-Phase-5a kernel accumulated a single sum_gate and used it
+    # for the normal axis only (S_t had no kc term).  For flat pads
+    # cos²α ≈ 1 everywhere so the bug was silent; for curved pads
+    # (dome) off-apex spheres have α up to ~70°, so sin²α ≈ 0.9 of the
+    # contact stiffness was MISSING from S_t -- letting the per-iter
+    # tangent update over-relax against the under-braced denominator
+    # k_diag_t = ka·ratio + kl·deg ≈ 4·10⁴.  With the true contact
+    # stiffness kc ≈ 3·10¹⁰ on the tangent axis, the iteration
+    # amplifies tangent residuals by ~10⁶ per step and the lattice
+    # cannot settle.
+    #
+    # Splitting the accumulator into sum_gate_n / sum_gate_t and using
+    # both on the Jacobi diagonal restores the contraction property on
+    # curved pads while leaving flat-pad behaviour bit-identical
+    # (cos²α = 1 ⇒ sum_gate_n = sum_gate_old, sum_gate_t = 0, exactly
+    # matching the pre-Phase-5a formulation).
+    sum_gate_n = float(0.0)
+    sum_gate_t = float(0.0)
     f_friction_vec = wp.vec3(0.0, 0.0, 0.0)
 
     if is_surface[tid] == 1:
@@ -677,25 +722,48 @@ def jacobi_step(
             raw_pos = smooth_relu(raw, eps)
             phi_eff = raw_pos * wp.sqrt(raw_pos + eps)
             gate = smooth_step(raw, eps)
-            # Tangential locality kernel (contract §3.5 eq:w_t).
-            # Kernel half-width = 3 · r_pad (covers the typical Hertz
-            # patch + several sample spacings; under-sampling at
-            # ``r_pad ≈ pitch`` would otherwise give an empty active
-            # set).  The (A_j · w_tangent) factor reconstructs the
-            # surface integral F = ∫ kc · phi · n_face dA from the
-            # discrete sample set; without it the coherent face-normal
-            # sum overcounts by a factor of (face_area_in_reach /
-            # contact_patch_area).
+            # Tangential locality kernel (Option-2 tiling, no overlap).
+            # Kernel half-width = r_pad — DIVERGES from contract §3.5
+            # eq:w_t which specifies 3·r_pad.  The (A_j · w_tangent)
+            # factor reconstructs the surface integral
+            # F = ∫ kc · phi · n_face dA from the discrete sample set;
+            # without it the coherent face-normal sum overcounts by a
+            # factor of (face_area_in_reach / contact_patch_area).
+            # Must match compute_cslc_penetration and write_cslc_contacts.
             d_t_vec = diff_qt - wp.dot(diff_qt, n_face_world) * n_face_world
             d_t_mag = wp.length(d_t_vec)
             kernel_h = r_i
             w_tangent = smooth_step(kernel_h - d_t_mag, eps)
+            # Phase 6 fix: HARD CULL on w_tangent (parity with
+            # compute_cslc_penetration line ~250 and write_cslc_contacts
+            # line ~1054).  Without this cull, the smooth_step tail at
+            # d_t > kernel_h evaluates to ~eps/(2·d_t) -- e.g.
+            # ≈ 6e-4 at d_t = 10·r_pad.  For a curved pad sphere whose
+            # outward normal is tilted from the apex direction, target
+            # samples on the FAR side of the convex object (sphere /
+            # box) pass the alignment cull because their face normals
+            # align with the pad sphere's tilted normal.  The half-
+            # space raw for those far samples is unbounded
+            # (raw = r_lat - n_face·(q - t) grows with object scale),
+            # so phi_eff = raw^1.5 is HUGE.  Multiplied by kc and the
+            # nonzero w_tangent tail, each far-side sample contributes
+            # tens of N of phantom contact force to a pad sphere that
+            # isn't actually touching the object.  Empirically: a single
+            # rim sphere on the production dome had 25 out of 50 sphere
+            # samples passing align+gate but with d_t > kernel_h, summing
+            # to 157 N of spurious force in the load buffer.  The other
+            # two kernels in the CSLC pipeline already cull this tail
+            # at w_tangent < 1e-2; jacobi_step diverged from them.
+            # See cslc_main/grasp/scripts/probe_failure.py (dome rim
+            # diagnostic) for the discovery trace.
+            if w_tangent < 1.0e-2:
+                continue
             A_j = target_areas_local[j]
             area_kernel = A_j * w_tangent
             # Load form: load = -∂E_contact/∂δ.  Physical force on the
             # pad sphere is +kc · A_j · w_tangent · align · phi_eff
             # · gate · n_face (face's outward normal); load form is
-            # the negative of that.  ``phi_eff = smooth_relu(raw, eps)``
+            # the negative of that.  ``phi_eff = σ_ε(raw) · √(σ_ε(raw) + ε)``
             # is always ≥ 0, so the contact force never reverses sign
             # near the smooth-cull boundary — critical for the
             # no-bulge regression on multi-sphere lattices (contract
@@ -703,9 +771,15 @@ def jacobi_step(
             n_eff = -n_face_world
             f_contact_vec = f_contact_vec + kc * \
                 area_kernel * align_w * phi_eff * gate * n_eff
-            # Diagonal stabilisation needs the same area+kernel+align
-            # weights so the contraction bound matches the actual operator.
-            sum_gate = sum_gate + area_kernel * align_w * gate
+            # Diagonal stabilisation -- split per-axis by alignment angle.
+            # align_arg = -(n_face · n_pad) = (n_eff · n_pad) = cos α.
+            # cos²α goes to S_n, sin²α = 1 - cos²α goes to S_t.  For flat
+            # pads cos²α = 1 ⇒ S_t contribution = 0 ⇒ bit-identical to
+            # the pre-Phase-5a sum_gate path on the normal axis.
+            cos2 = align_arg * align_arg
+            contrib = area_kernel * align_w * gate
+            sum_gate_n = sum_gate_n + contrib * cos2
+            sum_gate_t = sum_gate_t + contrib * (1.0 - cos2)
 
         # Stick-slip friction.  Aggregate normal-axis magnitude used as
         # the cone reference; tangent decomposition done in pad outward
@@ -743,12 +817,30 @@ def jacobi_step(
     if tid == f_ext_apex_idx:
         f_ext_vec = -f_ext_apex
 
+    # B3 — Lattice velocity-damping (IMPLICIT formulation).
+    # Continuum equation: c · δ̇ + ka · δ = forces  (quasi-static).
+    # Backward-Euler: δ̇ ≈ (δ_new - δ_prev_step)/dt, so:
+    #     (c/dt + ka) · δ_new = forces + (c/dt) · δ_prev_step
+    # The (c/dt) coefficient appears on BOTH sides.  In our Jacobi
+    # update that means:
+    #   * EXPLICIT part: ``+ c_over_dt · δ_prev_step`` added to rhs
+    #     (constant within the iteration, evaluated below as f_damping)
+    #   * IMPLICIT part: ``+ c_over_dt`` added to k_diag_n and k_diag_t
+    #     (handled where those are assembled below)
+    # The pre-fix version put the entire damping force into the rhs as
+    # ``-c_over_dt·(δ_old - δ_prev_step)`` which made the iteration
+    # explicit in δ_old and unstable when c_over_dt > k_diag (ball
+    # ejected on production sweeps).  The implicit form below is
+    # unconditionally stable: increasing c_over_dt monotonically pulls
+    # δ_new toward δ_prev_step.
+    f_damping = c_over_dt * delta_prev_step[tid]
+
     # Anisotropic block-Jacobi in pad sphere's local rest-normal frame
     # (contract §6.5).  S_n picks up the SUM of contact gates × area
     # × align over the target samples.  This sum upper-bounds
     # |d(f_contact·n)/d(δ_n)| over the active set, so the iteration's
     # contraction property holds.
-    rhs_explicit = f_contact_vec + f_lateral + f_friction_vec + f_ext_vec
+    rhs_explicit = f_contact_vec + f_lateral + f_friction_vec + f_ext_vec + f_damping  # B3
     rhs_n_scalar = wp.dot(rhs_explicit, out_n_world)
     rhs_t_vec = rhs_explicit - rhs_n_scalar * out_n_world
 
@@ -756,10 +848,19 @@ def jacobi_step(
     delta_old_t = delta_old - delta_old_n * out_n_world
 
     ka_t = ka * ka_tangent_ratio
-    S_n = kl * float(n_neighbors) + kc * sum_gate
-    S_t = kl * float(n_neighbors)
-    k_diag_n = ka + S_n
-    k_diag_t = ka_t + S_t
+    # Phase 5a: split kc·sum_gate into per-axis contributions weighted
+    # by cos²α / sin²α (see initialisation comment above).  On flat
+    # pads sum_gate_t = 0 so S_t reduces to the pre-Phase-5a value
+    # exactly; on curved pads S_t now carries the missing
+    # kc·sin²α·sum(area·align·gate) so the iteration's contraction
+    # property holds along the tangent axis too.
+    S_n = kl * float(n_neighbors) + kc * sum_gate_n
+    S_t = kl * float(n_neighbors) + kc * sum_gate_t
+    # B3 — implicit-Euler damping adds c/dt to the diagonal on BOTH
+    # axes.  Pairs with the (c/dt)·δ_prev_step term added to rhs_explicit
+    # above.  When c_over_dt = 0 this collapses to the pre-B3 form.
+    k_diag_n = ka + S_n + c_over_dt
+    k_diag_t = ka_t + S_t + c_over_dt
 
     rhs_n_total = rhs_n_scalar + S_n * delta_old_n
     rhs_t_total = rhs_t_vec + S_t * delta_old_t
@@ -783,11 +884,17 @@ def jacobi_step(
 #    normal    = -n_face_world                       (target outward -> pad)
 #    margin0   = r_i
 #    margin1   = 0                                   (v2: was R_j in v1)
-#    stiffness = cslc_kc · A_j · w_tangent · align · gate
-#                (cslc_kc already carries the (pad ⊕ target) series-spring
-#                composition, done up front in
-#                CSLCHandler.from_model_with_lattices)
-#    friction  = μ
+#    stiffness = 1.5 · cslc_kc · A_j · w_tangent · align · gate · √raw_pos
+#                (DIVERGES from contract §8 which specifies
+#                cslc_kc · A_j · w_tangent · gate; the extra
+#                1.5·√raw factor encodes the Hertz-like phi_eff = raw^1.5
+#                force law used in jacobi_step.  cslc_kc already carries
+#                the (pad ⊕ target) series-spring composition, done up
+#                front in CSLCHandler.from_model_with_lattices)
+#    friction  = 1.0                                 (DIVERGES from contract §8
+#                which specifies μ; MuJoCo treats rigid_contact_friction
+#                as a SCALE on the geom pair base friction (= μ).
+#                Writing μ would give effective μ² — bug fix 2026-04-19)
 #
 #  MuJoCo reconstructs
 #    solver_pen = margin0 + margin1 - (point1 - point0) · normal
@@ -795,9 +902,9 @@ def jacobi_step(
 #               = r_i - n_face · (q_def - t_j)
 #               = raw                                              ✓
 #  so the per-contact force MuJoCo applies, ``stiffness · solver_pen``,
-#  equals ``cslc_kc · A_j · w_tangent · align · gate · raw`` --
-#  matches ``jacobi_step``'s per-pair force in the deep-saturated
-#  limit (``phi_eff ≈ raw`` when ``raw ≫ ε``).  Contract §8.
+#  equals ``1.5 · cslc_kc · A_j · w_tangent · align · gate · raw^1.5`` --
+#  matches ``jacobi_step``'s per-pair Hertz-like force law exactly
+#  (jacobi_step uses phi_eff = raw^1.5 internally).
 #
 #  Buffer layout
 #  -------------
@@ -864,14 +971,13 @@ def write_cslc_contacts(
     out_margin0: wp.array(dtype=wp.float32),
     out_margin1: wp.array(dtype=wp.float32),
     out_tids: wp.array(dtype=wp.int32),
-    # shape_material_mu: no longer read inside this kernel.  Previously
-    # used as ``out_friction = mu`` (the lattice body's friction
-    # coefficient), which caused a double-count: the MuJoCo conversion
-    # kernel multiplies rigid_contact_friction onto the geom pair base
-    # friction (already = mu), giving effective_mu = mu² instead of mu.
-    # Fix writes out_friction = 1.0 (no scale), so geom friction is
-    # used as-is.  Kept in the signature to avoid breaking the handler
-    # call; remove in a future cleanup.
+    # UNUSED.  Previously written to ``out_friction = mu``, which
+    # double-counted: MuJoCo's conversion kernel treats
+    # rigid_contact_friction as a SCALE on the geom pair base friction
+    # (= mu), so writing mu gave effective_mu = mu².  Fix (2026-04-19)
+    # writes out_friction = 1.0 below; this arg is retained in the
+    # signature only to match the handler call site.  TODO: drop from
+    # both the kernel signature and the handler launch in a follow-up.
     shape_material_mu: wp.array(dtype=wp.float32),
     cslc_kc: float,
     target_ke: float,
@@ -894,17 +1000,24 @@ def write_cslc_contacts(
         (b) ``align_arg = -(n_face · n_pad) > 0``  -- one-sided
             alignment cull (back-side + perpendicular hard-culled);
             literal 0.05 below MUST match EPS_ALIGN_DEFAULT.
-    Plus the production emission threshold:
-        (c) ``contact_gate >= 1e-4``  -- deep tail is sub-nN force,
-            machine-zero gradient; emitting these slots measurably
-            degrades MuJoCo's soft-constraint solver via the per-slot
-            compliance leak (verified against the lift test).
+    Plus two production emission thresholds NOT in the contract:
+        (c) ``contact_gate >= 0.5`` (equivalent to ``raw >= 0``) -- only
+            slots with positive half-space penetration are emitted to
+            MuJoCo.  Lattice solver still uses the full smooth-tail
+            internally; this cull only controls MuJoCo solver slots.
+            Emitting the negative-raw tail flooded MuJoCo CG with
+            ~5–15k near-zero constraints, turning a 2ms step into a
+            45ms step.
+        (d) ``w_tangent >= 1e-2`` -- sample is tangentially within the
+            contact kernel.  See in-body comment for the threshold
+            derivation.
 
     Each emitted contact carries margin0 = r_lat[i], margin1 = 0;
     MuJoCo reconstructs solver_pen = r_lat - n_face · (q_def - t_j) =
     raw_ij per pair, so per-contact force = stiffness · solver_pen
-    = kc_series · A_j · w_tangent · align · gate · raw -- the same
-    series-spring law that ``jacobi_step`` converges on.
+    = 1.5 · kc_series · A_j · w_tangent · align · gate · raw^1.5 --
+    the Hertz-like force law that ``jacobi_step`` uses (DIVERGES from
+    contract §8 which specifies linear ``kc · A_j · w_t · gate · raw``).
     """
     tid = wp.tid()
     base_slot = surface_slot_map[tid]
@@ -986,15 +1099,17 @@ def write_cslc_contacts(
         # Tangential locality kernel -- folded into emitted stiffness
         # below so MuJoCo applies per-contact force
         #     stiffness · solver_pen
-        #     = kc_series · A_j · w_tangent · align · gate · raw
-        # matching the lattice solver's per-pair force exactly.
+        #     = 1.5 · kc_series · A_j · w_tangent · align · gate · raw^1.5
+        # matching the lattice solver's Hertz-like per-pair force exactly
+        # (DIVERGES from contract §8 linear form; see kernel 3 header).
         d_t_vec = diff_qt - wp.dot(diff_qt, n_face_world) * n_face_world
         d_t_mag = wp.length(d_t_vec)
         # Kernel half-width = r_pad (Option-2 tiling, no overlap).
+        # DIVERGES from contract §3.5 eq:w_t which specifies 3·r_pad.
         # Must match jacobi_step's kernel reach; the emitted contact
         # stiffness uses the same area_kernel so MuJoCo's per-contact
         # force = stiffness · solver_pen equals the lattice solver's
-        # per-pair force exactly.
+        # per-pair Hertz-like force exactly.
         kernel_h = r_i
         w_tangent = smooth_step(kernel_h - d_t_mag, eps)
         A_j = target_areas_local[j]
@@ -1015,17 +1130,16 @@ def write_cslc_contacts(
         #       step (per HOLD-phase diagnostic), turning a 2ms step
         #       into a 45ms step.  Tightening to ``raw >= 0`` drops
         #       MuJoCo's active constraint count by ~20× at HOLD with
-        #       no change to grasp stability.  The negative-raw tail
-        #       was also slightly unphysical: emission applied force
-        #       ``kc·A·w·α·gate·raw`` which is NEGATIVE when raw < 0
-        #       (an attractive "adhesion" force), while the lattice
-        #       solver uses ``kc·A·w·α·phi_eff·gate`` where
-        #       phi_eff = smooth_relu(raw) ≈ 0 for raw < 0 (no
-        #       attraction).  Hard-culling raw < 0 in emission removes
-        #       this asymmetry.
+        #       no change to grasp stability.  The lattice solver uses
+        #       ``kc·A·w·α·phi_eff·gate`` with
+        #       ``phi_eff = σ_ε(raw) · √(σ_ε(raw) + ε)`` (Hertz-like
+        #       δ^1.5; see jacobi_step), which is ≈ 0 for raw ≪ −ε —
+        #       so hard-culling raw < 0 in emission removes only the
+        #       negligible smooth-tail contribution and keeps lattice
+        #       equilibrium δ unchanged.
         #   (b) ``w_tangent < 1e-2`` -- sample is tangentially far
-        #       outside the contact kernel.  1e-2 corresponds to d_t ≈
-        #       3·r_pad + 3·eps (the physical contact patch boundary);
+        #       outside the contact kernel.  With kernel_h = r_pad
+        #       (Option-2 tiling), 1e-2 corresponds to d_t ≈ r_pad + 5·eps;
         #       samples past this contribute < 1% of a central sample's
         #       force, well below MuJoCo's solver resolution.
         if contact_gate < 0.5 or w_tangent < 1.0e-2:
@@ -1079,12 +1193,17 @@ def write_cslc_contacts(
         out_stiffness[buf_idx] = smooth_relu(
             1.5 * kc_emit * area_kernel * align_w * contact_gate * depth_factor,
             1.0e-9)
-        # cslc_dc retained in signature.  Writing 0.0 uses MuJoCo's
-        # ``kd = 0`` branch ⇒ timeconst = sqrt(imp/ke) ≈ 0.030 s.
-        # Setting kd > 0 would trigger timeconst = 2/kd, making
-        # friction constraints 250× softer than the standard contact
-        # and causing excessive Coulomb creep in the HOLD phase.
-        out_damping[buf_idx] = 0.0
+        # Per-contact damping (A1: was hardcoded 0.0 in v2).
+        # MuJoCo's solref/solimp branch logic:
+        #   kd = 0   ⇒ timeconst = sqrt(imp/ke) ≈ 0.030 s (stiffness-derived)
+        #   kd > 0   ⇒ timeconst = 2 / kd     (explicit, tighter)
+        # Tradeoff: tightening contact timeconst also tightens the
+        # friction-constraint timeconst (same MuJoCo solref slot), so
+        # excessive ``cslc_dc`` makes Coulomb friction softer and the
+        # held object can creep down during HOLD.  Caller sets via
+        # ``CSLCParams.dc`` (params.py); default 0 preserves legacy
+        # behavior.
+        out_damping[buf_idx] = cslc_dc
         # FRICTION SCALE: the MuJoCo conversion kernel treats
         # rigid_contact_friction as a SCALE FACTOR multiplied onto the
         # geom pair's base friction:
