@@ -471,5 +471,106 @@ add_function_test(
 )
 
 
+def test_uxpbd_body_wrench_tangent_sign(test, device):
+    """``accumulate_cslc_body_wrench`` produces F_body = -k·δ on both axes
+    (Newton's 3rd of F_sphere = +k·δ from Hooke's law with q = p − δ).
+
+    Pre-2026-05-28 the tangent axis was sign-inverted in the kernel
+    (``+ k_a_t · δ_t`` instead of ``- k_a_t · δ_t``), which under
+    sustained tangential shear inverted the anchor's reaction wrench on
+    the body.  This regression test locks down the correct sign on both
+    the normal axis (pure compression) and the tangent axis (pure
+    shear).
+    """
+    from newton._src.solvers.uxpbd.compliant_lattice import accumulate_cslc_body_wrench
+
+    # Single body at world origin (identity transform), single lattice
+    # sphere with rest position p = (0, 0, 0) and outward normal +X.
+    body_q = wp.array(
+        [wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity())],
+        dtype=wp.transform,
+        device=device,
+    )
+    body_com = wp.array([wp.vec3(0.0, 0.0, 0.0)], dtype=wp.vec3, device=device)
+    lattice_link = wp.array([0], dtype=wp.int32, device=device)
+    lattice_p_rest = wp.array([wp.vec3(0.0, 0.0, 0.0)], dtype=wp.vec3, device=device)
+    lattice_normal = wp.array([wp.vec3(1.0, 0.0, 0.0)], dtype=wp.vec3, device=device)
+    lattice_is_surface = wp.array([1], dtype=wp.uint8, device=device)
+    k_a = 100.0
+    lattice_k_anchor = wp.array([k_a], dtype=wp.float32, device=device)
+    ka_tangent_ratio = 1.0  # isotropic anchor
+    dt = 1.0  # impulse == force
+
+    # ── Case 1: pure tangential shear ──
+    # External force has pushed the sphere from p = (0, 0, 0) to
+    # q = (0, +eps, 0), so δ = p − q = (0, −eps, 0).  Newton's 3rd of
+    # the spring's pull-back-toward-p on the sphere is a +Y push on
+    # the body, so F_body = -k_a · δ = (0, +k_a · eps, 0).
+    eps_shear = 0.01
+    lattice_delta = wp.array(
+        [wp.vec3(0.0, -eps_shear, 0.0)], dtype=wp.vec3, device=device
+    )
+    body_delta = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+
+    wp.launch(
+        kernel=accumulate_cslc_body_wrench,
+        dim=1,
+        inputs=[
+            body_q, body_com, lattice_link, lattice_p_rest,
+            lattice_normal, lattice_is_surface, lattice_k_anchor,
+            lattice_delta, ka_tangent_ratio, dt,
+        ],
+        outputs=[body_delta],
+        device=device,
+    )
+
+    got = body_delta.numpy()
+    # spatial_vector layout: [linear_xyz, angular_xyz].  Lever arm = 0
+    # because sphere is at body COM, so angular component is 0.
+    np.testing.assert_allclose(
+        got[0, :3], [0.0, k_a * eps_shear, 0.0], atol=1e-5,
+        err_msg="Tangent-axis body wrench has wrong sign (pre-fix bug)",
+    )
+    np.testing.assert_allclose(got[0, 3:], [0.0, 0.0, 0.0], atol=1e-5)
+
+    # ── Case 2: pure normal compression ──
+    # Sphere compressed inward by eps along +X (its outward normal):
+    # q = p − (eps, 0, 0), so δ = (eps, 0, 0).  Spring pushes body
+    # in -X (away from the compression source).
+    # F_body = -k_a · δ = (-k_a · eps, 0, 0).
+    eps_compress = 0.005
+    lattice_delta_n = wp.array(
+        [wp.vec3(eps_compress, 0.0, 0.0)], dtype=wp.vec3, device=device
+    )
+    body_delta_n = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+
+    wp.launch(
+        kernel=accumulate_cslc_body_wrench,
+        dim=1,
+        inputs=[
+            body_q, body_com, lattice_link, lattice_p_rest,
+            lattice_normal, lattice_is_surface, lattice_k_anchor,
+            lattice_delta_n, ka_tangent_ratio, dt,
+        ],
+        outputs=[body_delta_n],
+        device=device,
+    )
+
+    got_n = body_delta_n.numpy()
+    np.testing.assert_allclose(
+        got_n[0, :3], [-k_a * eps_compress, 0.0, 0.0], atol=1e-5,
+        err_msg="Normal-axis body wrench has wrong sign",
+    )
+    np.testing.assert_allclose(got_n[0, 3:], [0.0, 0.0, 0.0], atol=1e-5)
+
+
+add_function_test(
+    TestSolverUXPBDPhase1,
+    "test_uxpbd_body_wrench_tangent_sign",
+    test_uxpbd_body_wrench_tangent_sign,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()

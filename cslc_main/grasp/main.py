@@ -64,11 +64,12 @@ def _add_grasp_args(parser: argparse.ArgumentParser) -> None:
 
     # C2e: held-object kind + box-target sampling.
     g.add_argument(
-        "--object-kind", choices=["sphere", "box"], default=None,
+        "--object-kind", choices=["sphere", "box", "bunny"], default=None,
         help="Held-object kind (default: sphere).  'box' uses the v2 "
              "unified CSLC contact path -- each box face is uniformly "
              "sampled at --box-face-pitch and routed through the single "
-             "CSLCHandler._launch.",
+             "CSLCHandler._launch.  'bunny' loads a mesh object "
+             "(--bunny-obj) and Lloyd-samples its surface for CSLC.",
     )
     g.add_argument(
         "--box-side", type=float, default=None,
@@ -82,6 +83,28 @@ def _add_grasp_args(parser: argparse.ArgumentParser) -> None:
         help="Target-point pitch [m] on each box face when --object-kind "
              "box (default 0.001 = 1mm).  Pitch sets target-sphere "
              "radius (= pitch/2) and the per-pair K_max budget.",
+    )
+    g.add_argument(
+        "--bunny-obj", type=str, default=None,
+        help="Path to the bunny mesh OBJ when --object-kind bunny "
+             "(default: assets/bunny/bunny.obj).",
+    )
+    g.add_argument(
+        "--bunny-height", type=float, default=None,
+        help="Upright height [m] the bunny is scaled to when "
+             "--object-kind bunny (default 0.10 = 100 mm).",
+    )
+    g.add_argument(
+        "--bunny-n-samples", type=int, default=None,
+        help="Lloyd surface-sample count for the bunny's CSLC target "
+             "(default 0 = auto: match the sphere's point density).",
+    )
+    g.add_argument(
+        "--squeeze-depth-mm", type=float, default=None,
+        help="Commanded SQUEEZE penetration depth [mm] (default ~1 mm).  "
+             "Sets squeeze_duration = depth / squeeze_speed.  Heavier or "
+             "irregular objects (e.g. --object-kind bunny) need a firmer "
+             "grip: pair --pad-kind box with --squeeze-depth-mm 2.",
     )
     g.add_argument(
         "--object-spawn-y-offset", type=float, default=None,
@@ -238,6 +261,18 @@ def _apply_args_to_config(args, config: GraspConfig) -> GraspConfig:
         config.object.box_half_extents = (half, half, half)
     if args.box_face_pitch is not None:
         config.object.box_face_pitch = args.box_face_pitch
+    if args.bunny_obj is not None:
+        from pathlib import Path as _Path
+        config.object.bunny_obj = _Path(args.bunny_obj)
+    if args.bunny_height is not None:
+        config.object.bunny_height = args.bunny_height
+    if args.bunny_n_samples is not None:
+        config.object.bunny_n_samples = args.bunny_n_samples
+    if args.squeeze_depth_mm is not None:
+        config.timing.squeeze_duration = max(
+            args.squeeze_depth_mm * 1e-3 / config.timing.squeeze_speed,
+            config.timing.dt,
+        )
     if args.object_spawn_y_offset is not None:
         config.object.spawn_y_offset = args.object_spawn_y_offset
     if args.object_density is not None:
@@ -245,7 +280,7 @@ def _apply_args_to_config(args, config: GraspConfig) -> GraspConfig:
     if args.pad_n_samples is not None:
         config.pad.n_samples = args.pad_n_samples
 
-    # C2e geometric-constraint warning: dome contact patch must fit
+    # geometric-constraint warning: dome contact patch must fit
     # inside one box face (with a 3mm margin per side) -- otherwise the
     # patch overflows the edge, mixes face normals, and creates a local
     # wedge that confounds the ke-sweep falsification.

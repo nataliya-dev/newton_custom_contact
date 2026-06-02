@@ -62,6 +62,58 @@ def smooth_step(x: float, eps: float) -> float:
     return 0.5 * (1.0 + x / wp.sqrt(x * x + eps * eps))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  smooth_blend: a one-sided polynomial blend of max(x, 0)
+#
+#  Theory issue (cslc theory §smoothing): the analytic surrogate
+#  smooth_relu(x, ε) = 0.5·(x + √(x² + ε²)) does not pass through (0, 0):
+#  smooth_relu(0, ε) = ε/2.  Plugged into φ_eff = σ(raw)·√(σ(raw) + ε)
+#  this yields φ_eff(raw = 0) ≈ 0.61·ε^1.5, a non-zero force baseline
+#  whose magnitude scales as ε^1.5 and cannot be tuned away without
+#  losing C¹ smoothness (no analytic C^∞ approximation of max(x, 0)
+#  passes through 0 while staying non-negative — by IVT, f'(0) ∈ (0, 1)
+#  forces f < 0 for some x < 0).
+#
+#  smooth_blend trades C^∞ regularity for an EXACT zero floor and an
+#  EXACT raw^1.5 regime at depth, accepting C² regularity instead.  The
+#  Hermite quintic H₅(t) = t³·(10 − 15t + 6t²) is C² at both endpoints
+#  (H₅(0) = H₅'(0) = H₅''(0) = 0, H₅(1) = 1, H₅'(1) = H₅''(1) = 0), so
+#  the blend
+#
+#      smooth_blend(x, ε) = 0           if x ≤ 0
+#                          x · H₅(x/ε)  if 0 < x < ε
+#                          x            if x ≥ ε
+#
+#  is C² everywhere.  Composed with the existing Hertz lift
+#  φ_eff = blend · √(blend + ε), the floor vanishes (blend = 0 ⇒ φ_eff =
+#  0) and at depth the +ε inside the sqrt is dwarfed by blend → raw, so
+#  φ_eff → raw^1.5 cleanly (TRUE Hertz, not the raw·√ε linear regime
+#  that smooth_relu's ε/2 floor produced near raw ≈ ε).
+#
+#  C² is sufficient for reverse-mode autodiff through the lattice solve
+#  (∇F = ∂F/∂δ is C¹, which is what wp.Tape backward needs).  Tradeoff:
+#  loses C^∞ relative to smooth_relu, but in exchange:
+#    1. φ_eff(raw=0) = 0 exactly — no force baseline (theory issue #1)
+#    2. φ_eff = raw^1.5 above raw=ε exactly — true Hertz (issue #2)
+#    3. Active set is sharper (exactly 0 below 0 instead of an ε-scaled
+#       smooth tail), which speeds Jacobi convergence as a side effect.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@wp.func
+def smooth_blend(x: float, eps: float) -> float:
+    if x <= 0.0:
+        return 0.0
+    if x >= eps:
+        return x
+    t = x / eps
+    t2 = t * t
+    t3 = t2 * t
+    # H₅(t) = t³·(10 − 15t + 6t²); C² at t=0 and t=1.
+    h = t3 * (10.0 - 15.0 * t + 6.0 * t2)
+    return x * h
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Kernel 1: Argmax-overlap warm-start penetration (point-set target)
 #
@@ -195,9 +247,12 @@ def compute_cslc_penetration(
     # Argmax search over target points.  ``found`` distinguishes "no
     # target passed both gates" (phi := 0) from "at least one active
     # pair".  Track dist_best separately for the smooth_step output
-    # factor.
+    # factor.  Theory fix D1: argmax is over raw_face = raw - r_lat
+    # (signed distance from sphere centre to target plane along
+    # outward normal), so the warm-start phi reads off the face-
+    # penetration scalar — zero at face contact, positive at depth.
     found = int(0)
-    raw_best = float(0.0)
+    raw_face_best = float(0.0)
     dist_best = float(0.0)
     n_best = wp.vec3(0.0, 0.0, 0.0)
 
@@ -215,9 +270,41 @@ def compute_cslc_penetration(
         # Half-space raw (v2): monotone in penetration depth at any
         # depth, doesn't flip sign at face crossing.  Contract eq:raw.
         raw_j = r_lat - wp.dot(diff_qt, n_face_world)
-        # Raw active-set gate (contract §3.6 eq:inactive).  MUST match
-        # INACTIVE_RAW_EPS_FACTOR = -50.0 in cslc_main/theory/cslc_theory.py.
-        if raw_j < -50.0 * eps:
+        # Theory fix D1 — face-penetration form.  ``raw_j`` carries an
+        # r_lat shelf (raw_j = r_lat at first face contact for a flat
+        # lattice surface) which contributes φ ≈ r_lat^1.5 per sphere at
+        # δ=0, summing to ~84 N on box/box pre-fix-D1 (the "shelf"
+        # diagnosed in the t2_box_box_shelf probe).  ``raw_face`` is
+        # the signed distance from the lattice sphere centre to the
+        # target plane along the OUTWARD target normal, zero at face
+        # contact, positive at face penetration.  All downstream uses
+        # of raw for the force law and active-set gates now consume
+        # raw_face so phi(face contact) = 0 exactly.
+        raw_face_j = raw_j - r_lat
+        # Active-set gate now on face penetration (contract §3.6 eq:
+        # inactive, post-fix-D1).  MUST match INACTIVE_RAW_EPS_FACTOR
+        # = -50.0 in cslc_main/theory/cslc_theory.py.
+        if raw_face_j < -50.0 * eps:
+            continue
+        # Theory fix D2 — distance-magnitude cull.  The half-space
+        # form (raw_face, gates) is LOCAL: it assumes the target's
+        # tangent plane approximates the target surface near the
+        # sample.  For a curved target (sphere, dome, etc.) this
+        # breaks down for pad spheres far from the target sample on
+        # the OPPOSITE side of the target body.  Such pairs can pass
+        # alignment (both outward normals end up antiparallel in
+        # world frame), tangential locality (d_t = 0 when on the same
+        # axis through the body), and the raw_face cull (the half-
+        # space form sees them as 50-100 mm "penetrating"), producing
+        # phantom contacts with huge phi^1.5 force.  Discovered on the
+        # dome scene where a dome-rim sphere paired with a ball back-
+        # side target across the scene.  Bound the pair distance to
+        # ``3·r_lat + 5·ε`` (well above legitimate ||q-t|| ≤ √5·r_lat
+        # at the deepest typical penetration; well below scene-scale
+        # phantom distances of 50-100×r_lat).  MUST match jacobi_step,
+        # compute_target_W, write_cslc_contacts so the active set is
+        # parity-locked across the pipeline.
+        if dist > 3.0 * r_lat + 5.0 * eps:
             continue
         # One-sided alignment gate (contract §3.6, amended Phase 4b):
         #     align_arg = -(n_face · n_pad)        (+1 face-on, -1 back, 0 perp)
@@ -254,9 +341,14 @@ def compute_cslc_penetration(
         w_tangent = smooth_step(kernel_h - d_t_mag, eps)
         if w_tangent < 1.0e-2:
             continue
-        if (found == 0) or (raw_j > raw_best):
+        # argmax over face-penetration form (theory fix D1).  Since
+        # raw_face_j = raw_j - r_lat is monotone in raw_j (r_lat is the
+        # SAME pad sphere's radius across the search), argmax(raw_face)
+        # = argmax(raw); we just track the face-form value so the warm-
+        # start phi reads off the right shelf-free quantity below.
+        if (found == 0) or (raw_face_j > raw_face_best):
             found = 1
-            raw_best = raw_j
+            raw_face_best = raw_face_j
             dist_best = dist
             # Warm-start contact direction is the load-form -n_face
             # (matches ``jacobi_step``'s n_eff).  The downstream
@@ -266,11 +358,22 @@ def compute_cslc_penetration(
             n_best = -n_face_world
 
     if found == 1:
-        # Hertz-like phi = raw^1.5 (matches jacobi_step's force law).
-        # The lattice solver converges on this same scaling; the warm
-        # start has to agree or it bootstraps from the wrong load shape.
-        # DEFENSIVE: dist < 1e-15 was caught above, so smooth_step ~= 1.
-        raw_pos = smooth_relu(raw_best, eps)
+        # Hertz-like phi = raw_face^1.5 (matches jacobi_step's force
+        # law post-fix-D1).  The lattice solver converges on this same
+        # scaling; the warm start has to agree or it bootstraps from
+        # the wrong load shape.  DEFENSIVE: dist < 1e-15 was caught
+        # above, so smooth_step ~= 1.
+        #
+        # Theory fix #1+#2 (Hertz floor + low-raw shape): smooth_blend
+        # replaces smooth_relu so phi(raw_face≤0) = 0 EXACTLY (no
+        # ε^1.5 baseline) and phi(raw_face≥ε) = raw_face^1.5 EXACTLY
+        # (true Hertz at depth).  The √(blend + ε) inside is retained
+        # as a gradient-safety regularizer; since blend = 0 for raw_face
+        # ≤ 0, the floor it would otherwise create is multiplicatively
+        # killed.  Theory fix D1 (face-penetration form): input is
+        # raw_face, not raw, so phi vanishes at FACE contact, not at
+        # lattice-sphere-centre contact (which had an r_lat shelf).
+        raw_pos = smooth_blend(raw_face_best, eps)
         phi = raw_pos * wp.sqrt(raw_pos + eps) * smooth_step(dist_best, eps)
         raw_penetration[tid] = phi
         contact_normal_out[tid] = n_best
@@ -443,6 +546,211 @@ def compute_outward_normals_world(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Kernel 2a'': Per-sphere world-frame rest-position precompute
+#
+#  Body poses ``X_wb`` and ``X_ws`` are constant during the quasi-static
+#  Jacobi sweep (n_iter = 40 sweeps at fixed body_q).  Hoisting the rest-
+#  position transform
+#
+#      p_world_i = X_wb · X_ws · p_local_i
+#
+#  out of ``jacobi_step``'s per-iter inner loop saves
+#  ``n_spheres × (n_iter − 1)`` transform_point pairs per pair launch.
+#  Mirror of ``compute_outward_normals_world`` (which already precomputes
+#  the per-sphere world-frame normal); both are launched once per pair
+#  before the Jacobi loop.  See cslc_handler._launch.
+#
+#  Fidelity: this is an algebraic refactor — the precomputed world-frame
+#  position is the same value the inner loop computed every iteration, so
+#  the converged ``δ`` is bit-identical (modulo fp non-associativity).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@wp.kernel
+def compute_pad_pos_world(
+    sphere_pos_local: wp.array(dtype=wp.vec3),
+    sphere_shape: wp.array(dtype=wp.int32),
+    body_q: wp.array(dtype=wp.transform),
+    shape_body: wp.array(dtype=wp.int32),
+    shape_transform: wp.array(dtype=wp.transform),
+    pad_pos_world: wp.array(dtype=wp.vec3),
+):
+    """Transform each lattice sphere's rest centre into world frame."""
+    tid = wp.tid()
+    s_idx = sphere_shape[tid]
+    b_idx = shape_body[s_idx]
+    X_ws = shape_transform[s_idx]
+    X_wb = body_q[b_idx]
+    p_local = sphere_pos_local[tid]
+    pad_pos_world[tid] = wp.transform_point(
+        X_wb, wp.transform_point(X_ws, p_local))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Kernel 2a''': Per-target world-frame pose precompute
+#
+#  The target body's pose ``X_tb = body_q[target_body_idx]`` is constant
+#  during the Jacobi sweep, so the per-sample world-frame position and
+#  face-normal can be hoisted out of jacobi_step's inner loop:
+#
+#      t_world_j  = X_tb · t_local_j         (transform_point)
+#      n_face_world_j = X_tb · n_local_j     (transform_vector)
+#
+#  This saves ``target_count × n_iter`` transform ops per pair launch
+#  (the per-iter inner-loop hot path).  For a 50-target pair at n_iter =
+#  40 that's 4000 transform_point/_vector pairs per sphere, all wasted
+#  recomputation of the same values.
+#
+#  Fidelity: algebraic refactor — same values, fewer ops.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@wp.kernel
+def compute_target_world_state(
+    target_positions_local: wp.array(dtype=wp.vec3),
+    target_normals_local: wp.array(dtype=wp.vec3),
+    body_q: wp.array(dtype=wp.transform),
+    target_body_idx: int,
+    target_pos_world: wp.array(dtype=wp.vec3),
+    target_normal_world: wp.array(dtype=wp.vec3),
+):
+    """Transform target samples into world frame."""
+    tid = wp.tid()
+    X_tb = body_q[target_body_idx]
+    target_pos_world[tid] = wp.transform_point(X_tb, target_positions_local[tid])
+    target_normal_world[tid] = wp.transform_vector(X_tb, target_normals_local[tid])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Kernel 2a'''': Target-side partition-of-unity normalizer
+#
+#  Theory issue #3 + #4 — the pre-Fix-B force law summed per pair
+#
+#      F_i = Σ_j  kc · A_j · w_t_ij · α_ij · phi_eff_ij · gate · n_face
+#
+#  with ``w_t_ij = smooth_step(r_pad − d_t_ij, ε)`` a smooth indicator
+#  ∈ [0, 1] — NOT a partition-of-unity weight.  Each target sample j is
+#  reached by ~π·r_pad²/h² pad spheres at Option-2 tiling (kernel half-
+#  width = r_pad = lattice spacing h), so its Voronoi area A_j is
+#  counted ~π× across the lattice.  Total force scales with lattice
+#  density rather than physical contact-patch area — refining the pad
+#  lattice at fixed r_pad multiplies F by ~(h_old/h_new)², the
+#  resolution-knob #7 finding in the handoff.
+#
+#  The fix is to renormalize:
+#
+#      W_j = Σ_i  w_t_ij · α_ij        (sum over reaching pad spheres)
+#      share_ij = w_t_ij · α_ij / W_j
+#
+#  Then ``Σ_i share_ij = 1`` for every target j (proper partition of
+#  unity), and the total force becomes
+#
+#      Σ_i F_i = Σ_j  kc · A_j · ⟨phi_eff⟩_j · n_face_j
+#
+#  — a Riemann sum over target Voronoi cells, lattice-density-invariant,
+#  matching hydroelastic's ∫_Ω k_h·φ·n dA structure (Elandt 2019 §3.2).
+#
+#  W is computed ONCE per pair launch on the warm-start delta (between
+#  ``lattice_solve_equilibrium`` and the Jacobi loop).  Rationale: the
+#  δ corrections during Jacobi sweeps are sub-mm; target spacing is mm–
+#  cm; so d_t = ‖tangential separation‖ barely moves across iterations,
+#  and W ≈ const.  If lift fidelity drifts vs the per-iter reduction,
+#  promote W to per-iter (~2× kernel launches inside the Jacobi loop).
+#
+#  Active-set gates here MUST mirror ``jacobi_step`` exactly so the
+#  numerator (w_t_ij · α_ij used in jacobi_step) and the denominator
+#  (W_j summed here) include / exclude the same pairs.  Any divergence
+#  breaks the partition-of-unity property.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@wp.kernel
+def compute_target_W(
+    delta_src: wp.array(dtype=wp.vec3),
+    sphere_radii: wp.array(dtype=wp.float32),
+    is_surface: wp.array(dtype=wp.int32),
+    sphere_shape: wp.array(dtype=wp.int32),
+    active_cslc_shape_idx: int,
+    n_spheres: int,
+    pad_pos_world: wp.array(dtype=wp.vec3),
+    out_normal_world_in: wp.array(dtype=wp.vec3),
+    target_pos_world: wp.array(dtype=wp.vec3),
+    target_normal_world: wp.array(dtype=wp.vec3),
+    eps: float,
+    W_out: wp.array(dtype=wp.float32),
+):
+    """For each target j, sum w_tangent_ij · align_w_ij over all active
+    surface pad spheres i in the active lattice.
+
+    Gates are bit-identical to ``jacobi_step``'s inner loop so the
+    numerator there and the denominator here cover the same pairs.
+    """
+    j = wp.tid()
+    t_j_world = target_pos_world[j]
+    n_face_world = target_normal_world[j]
+
+    W = float(0.0)
+    for i in range(n_spheres):
+        # Lattice filter
+        if sphere_shape[i] != active_cslc_shape_idx:
+            continue
+        if is_surface[i] == 0:
+            continue
+
+        r_i = sphere_radii[i]
+        p_i_world = pad_pos_world[i]
+        q_i_world = p_i_world - delta_src[i]
+        out_n_world = out_normal_world_in[i]
+
+        diff_qt = q_i_world - t_j_world
+        dist = wp.length(diff_qt)
+        if dist < 1.0e-15:
+            continue
+
+        # Raw cull (contract §3.6; literal must match
+        # INACTIVE_RAW_EPS_FACTOR = -50.0).  Theory fix D1: cull on
+        # raw_face = raw - r_i (face-penetration form), parity-locked
+        # with jacobi_step.  If this cull and jacobi_step's cull
+        # disagree, partition-of-unity (Σ_i share_ij = 1) breaks and
+        # the per-pair force divides by a stale W.
+        raw = r_i - wp.dot(diff_qt, n_face_world)
+        raw_face = raw - r_i
+        if raw_face < -50.0 * eps:
+            continue
+        # Theory fix D2 — distance-magnitude cull (mirror of
+        # jacobi_step).  W_j sums over active pad spheres for target
+        # j; this cull MUST match jacobi_step's so the numerator there
+        # and denominator here cover the same pairs (otherwise
+        # share_ij = w_t·α/W_j doesn't sum to 1 and per-pair force
+        # divides by a wrong W).
+        if dist > 3.0 * r_i + 5.0 * eps:
+            continue
+
+        # One-sided alignment cull (contract §3.6, EPS_ALIGN_DEFAULT
+        # = 0.05).  Mirror of jacobi_step.
+        align_arg = -wp.dot(n_face_world, out_n_world)
+        if align_arg <= 0.0:
+            continue
+        align_w = float(1.0)
+        if align_arg < 0.05:
+            t_lerp = wp.clamp(align_arg / 0.05, 0.0, 1.0)
+            align_w = t_lerp * t_lerp * (3.0 - 2.0 * t_lerp)
+
+        # Tangential locality.  kernel_h = r_i (Option-2 tiling), hard
+        # cull at w_tangent < 1e-2 — mirrors jacobi_step.
+        d_t_vec = diff_qt - wp.dot(diff_qt, n_face_world) * n_face_world
+        d_t_mag = wp.length(d_t_vec)
+        kernel_h = r_i
+        w_tangent = smooth_step(kernel_h - d_t_mag, eps)
+        if w_tangent < 1.0e-2:
+            continue
+
+        W += w_tangent * align_w
+
+    W_out[j] = W
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Kernel 2b: Active-lattice-selective copy
 #
 #  When `lattice_solve_equilibrium` runs for one pair (active lattice P), it
@@ -505,7 +813,6 @@ def jacobi_step(
     delta_src: wp.array(dtype=wp.vec3),
     delta_dst: wp.array(dtype=wp.vec3),
     sphere_radii: wp.array(dtype=wp.float32),
-    sphere_pos_local: wp.array(dtype=wp.vec3),
     is_surface: wp.array(dtype=wp.int32),
     neighbor_start: wp.array(dtype=wp.int32),
     neighbor_count: wp.array(dtype=wp.int32),
@@ -516,28 +823,43 @@ def jacobi_step(
     alpha: float,
     sphere_shape: wp.array(dtype=wp.int32),
     active_cslc_shape_idx: int,
-    sphere_outward_normal: wp.array(dtype=wp.vec3),
-    body_q: wp.array(dtype=wp.transform),
-    shape_body: wp.array(dtype=wp.int32),
-    shape_transform: wp.array(dtype=wp.transform),
+    # Per-sphere world-frame rest centre, precomputed once per pair by
+    # ``compute_pad_pos_world``.  Hoisted out of the n_iter Jacobi loop
+    # because the underlying transforms (X_ws, X_wb) are constant during
+    # the quasi-static solve.
+    pad_pos_world: wp.array(dtype=wp.vec3),
+    # Per-sphere world-frame outward normal, precomputed once per pair
+    # by ``compute_outward_normals_world``.  Hoisted out of the n_iter
+    # Jacobi loop for the same reason.
+    out_normal_world_in: wp.array(dtype=wp.vec3),
     ka_tangent_ratio: float,
     k_stick: float,
     mu_friction: float,
-    # Point-set target.  v2: no per-sample radius (raw = r_i − n̂·(q−t)).
-    target_positions_local: wp.array(dtype=wp.vec3),
-    # Per-target outward face normal (target body-local).  The contact
-    # direction is the target surface's outward normal at the sample;
-    # half-space raw = r_lat − n_face · (q − t) is monotone in
-    # penetration depth at any depth (no sign flip past face crossing).
-    target_normals_local: wp.array(dtype=wp.vec3),
+    # Per-target world-frame position and outward face normal,
+    # precomputed once per pair by ``compute_target_world_state``.
+    # Replace the in-loop ``transform_point`` / ``transform_vector``
+    # of ``target_positions_local`` / ``target_normals_local`` -- the
+    # target body's pose ``X_tb`` is constant during the Jacobi sweep.
+    target_pos_world: wp.array(dtype=wp.vec3),
+    target_normal_world: wp.array(dtype=wp.vec3),
     # Per-target Voronoi area on the underlying surface [m^2].  Folded
     # into the contact force with a tangential locality kernel
     # w_tangent to reconstruct the surface integral
     #     F = ∫_{contact_patch} kc · phi · n_face dA
     # from the discrete sample set (contract §5).
     target_areas_local: wp.array(dtype=wp.float32),
+    # Per-target partition-of-unity normalizer
+    # ``W_j = Σ_i w_tangent_ij · align_w_ij`` (theory fix #3+#4).  Each
+    # per-pair contribution is divided by W_j so the share weights sum
+    # to 1 across pad spheres reaching target j; total force becomes a
+    # Riemann sum over target Voronoi cells, lattice-density-invariant
+    # and matching hydroelastic's ∫_Ω k_h·φ·n dA structure.  Computed
+    # once per pair launch by ``compute_target_W`` on the warm-start δ
+    # (see CSLCHandler._launch).  Targets with W_j ≈ 0 (no pad sphere
+    # reaches them) are skipped — their share is undefined and their
+    # phi_eff would be 0 anyway.
+    W_targets: wp.array(dtype=wp.float32),
     target_count: int,
-    target_body_idx: int,
     # External tangential load (bridge / experiment driver only).
     # ``f_ext_apex_idx = -1`` is the no-op sentinel (production).
     f_ext_apex_idx: int,
@@ -597,18 +919,15 @@ def jacobi_step(
     delta_old = delta_src[tid]
     n_neighbors = neighbor_count[tid]
 
-    s_idx = sphere_shape[tid]
-    b_idx = shape_body[s_idx]
-    X_ws = shape_transform[s_idx]
-    X_wb = body_q[b_idx]
-
-    p_i_local = sphere_pos_local[tid]
-    p_i_world = wp.transform_point(X_wb, wp.transform_point(X_ws, p_i_local))
+    # Per-sphere world-frame rest centre and outward normal are
+    # precomputed once per pair launch (compute_pad_pos_world,
+    # compute_outward_normals_world) -- they don't change across the
+    # n_iter Jacobi sweeps because X_wb / X_ws are constant during the
+    # quasi-static solve.  Hoisting them out of the per-iter inner loop
+    # saves n_iter-1 transform_point/_vector pairs per sphere.
+    p_i_world = pad_pos_world[tid]
     q_i_world = p_i_world - delta_old
-
-    out_n_local = sphere_outward_normal[tid]
-    out_n_world = wp.transform_vector(
-        X_wb, wp.transform_vector(X_ws, out_n_local))
+    out_n_world = out_normal_world_in[tid]
 
     # Graph-Laplacian lateral force (contract §6.2):
     #     f_lat_i = -k_l · Σ_{j∈N(i)} (δ_i − δ_j)
@@ -656,17 +975,22 @@ def jacobi_step(
 
     if is_surface[tid] == 1:
         r_i = sphere_radii[tid]
-        X_tb = body_q[target_body_idx]
+        # Target body pose ``X_tb`` is constant during the quasi-static
+        # Jacobi sweep, so ``t_j_world`` and ``n_face_world`` are
+        # precomputed once per pair launch (compute_target_world_state)
+        # instead of recomputed every inner-loop iter.
         for j in range(target_count):
-            t_j_world = wp.transform_point(X_tb, target_positions_local[j])
+            t_j_world = target_pos_world[j]
             # Degenerate centres-coincide check.  1e-15 is numerical
             # zero (NOT ``eps``, the smooth-gate width); skipping pairs
             # at the smooth-gate radius would silently drop deeply-
-            # overlapping contacts.
+            # overlapping contacts.  ``dist`` is reused below for the
+            # theory-fix-D2 distance-magnitude cull.
             diff_qt = q_i_world - t_j_world
-            if wp.length(diff_qt) < 1.0e-15:
+            dist = wp.length(diff_qt)
+            if dist < 1.0e-15:
                 continue
-            n_face_world = wp.transform_vector(X_tb, target_normals_local[j])
+            n_face_world = target_normal_world[j]
             # Half-space raw (v2, contract eq:raw):
             #     raw = r_i − n_face · (q − t)
             # Monotone in penetration depth at any depth, doesn't flip
@@ -674,9 +998,28 @@ def jacobi_step(
             # form which assumed a single sphere target with radius
             # R and used (r_i + R) − ‖q − t‖).
             raw = r_i - wp.dot(diff_qt, n_face_world)
+            # Theory fix D1 — face-penetration form.  ``raw`` carries
+            # an r_i shelf (= r_i at face contact for flat lattice
+            # surfaces), summing to a 84 N spurious force at face
+            # contact on a 490-sphere box pad.  raw_face = raw - r_i =
+            # -n_face · (q - t) is zero at face contact, positive at
+            # face penetration; the active-set gate and phi below
+            # consume raw_face so phi(face contact) = 0 exactly.
+            raw_face = raw - r_i
             # Half-space gate (literal MUST match INACTIVE_RAW_EPS_FACTOR
-            # = -50.0 in cslc_main/theory/cslc_theory.py).
-            if raw < -50.0 * eps:
+            # = -50.0 in cslc_main/theory/cslc_theory.py).  Gate is on
+            # raw_face post-fix-D1: cull pad spheres whose surface has
+            # separated by more than 50·ε from face contact.
+            if raw_face < -50.0 * eps:
+                continue
+            # Theory fix D2 — distance-magnitude cull (mirror of
+            # compute_cslc_penetration).  Drops phantom pairs where
+            # the pad sphere is on the OPPOSITE side of the target
+            # body from the target sample but where alignment +
+            # tangential locality + raw_face all happen to pass.
+            # Discovered on the dome scene; see compute_cslc_penetration
+            # for the full diagnosis.  Threshold parity-locked.
+            if dist > 3.0 * r_i + 5.0 * eps:
                 continue
             # Smooth alignment gate (contract §3.6, amended Phase 4b
             # after finding #11).  Closed convex targets (sphere, box,
@@ -710,18 +1053,37 @@ def jacobi_step(
             if align_arg < 0.05:
                 t_lerp = wp.clamp(align_arg / 0.05, 0.0, 1.0)
                 align_w = t_lerp * t_lerp * (3.0 - 2.0 * t_lerp)
-            # phi_eff = raw^1.5 (smooth-relu lifted to power 1.5).
+            # phi_eff = raw_face^1.5 (smooth-blend lifted to power 1.5).
             # The 1.5 exponent makes per-contact stiffness vanish at
-            # first touch (raw→0): dF/d(raw) ∝ √raw → 0.  Sphere-on-flat
-            # gives F ∝ δ^2.5 (one power stiffer than Hertz's δ^1.5)
-            # because the area-weighted sum adds one power of δ via
-            # the contact-patch area scaling with δ.  Trade-off: the
-            # impulse-on-engagement problem that linear contact had is
-            # eliminated, at the cost that kc no longer equals the
-            # material's Young modulus directly -- see CSLCParams.
-            raw_pos = smooth_relu(raw, eps)
+            # first touch (raw_face→0): dF/d(raw_face) ∝ √raw_face → 0.
+            # Sphere-on-flat gives F ∝ δ^2.5 (one power stiffer than
+            # Hertz's δ^1.5) because the area-weighted sum adds one
+            # power of δ via the contact-patch area scaling with δ.
+            # Trade-off: the impulse-on-engagement problem that linear
+            # contact had is eliminated, at the cost that kc no longer
+            # equals the material's Young modulus directly -- see
+            # CSLCParams.
+            #
+            # Theory fix #1+#2 (Hertz floor + low-raw shape): swapped
+            # smooth_relu → smooth_blend.  smooth_blend is exactly 0
+            # for raw_face ≤ 0 (kills the ε^1.5 force baseline),
+            # exactly raw_face for raw_face ≥ ε (so phi_eff →
+            # raw_face·√raw_face = raw_face^1.5, TRUE Hertz at depth),
+            # C² blend in between.  smooth_step(raw_face, eps) gate
+            # below is now structurally redundant for the FORCE (phi_eff
+            # already vanishes at raw_face=0) but retained for the
+            # diagonal stabiliser via sum_gate_{n,t} weighting so the
+            # iteration's contraction proof carries over unchanged.
+            #
+            # Theory fix D1 (face-penetration form): both phi_eff and
+            # gate consume raw_face = raw - r_i so they vanish at FACE
+            # contact rather than at lattice-sphere-centre contact.
+            # The pre-D1 form left an r_i shelf at face onset that
+            # summed to ~84 N spurious force on box/box (every engaged
+            # sphere saw raw = r_i ≈ 0.3 mm at δ=0).
+            raw_pos = smooth_blend(raw_face, eps)
             phi_eff = raw_pos * wp.sqrt(raw_pos + eps)
-            gate = smooth_step(raw, eps)
+            gate = smooth_step(raw_face, eps)
             # Tangential locality kernel (Option-2 tiling, no overlap).
             # Kernel half-width = r_pad — DIVERGES from contract §3.5
             # eq:w_t which specifies 3·r_pad.  The (A_j · w_tangent)
@@ -758,7 +1120,16 @@ def jacobi_step(
             # diagnostic) for the discovery trace.
             if w_tangent < 1.0e-2:
                 continue
-            A_j = target_areas_local[j]
+            # Theory fix #3+#4 — target-side partition of unity:
+            # divide A_j by W_j = Σ_i w_t_ij · α_ij so the per-pair area
+            # share sums to 1 across pad spheres reaching target j.  The
+            # 1e-30 floor protects targets that survive the gates here
+            # but have W_j ≈ 0 from upstream-launch parity issues; in
+            # practice such targets contribute zero force because their
+            # numerator (w_tangent · align_w) is also ≈ 0.
+            W_j = W_targets[j]
+            inv_W = 1.0 / (W_j + 1.0e-30)
+            A_j = target_areas_local[j] * inv_W
             area_kernel = A_j * w_tangent
             # Load form: load = -∂E_contact/∂δ.  Physical force on the
             # pad sphere is +kc · A_j · w_tangent · align · phi_eff
@@ -840,7 +1211,8 @@ def jacobi_step(
     # × align over the target samples.  This sum upper-bounds
     # |d(f_contact·n)/d(δ_n)| over the active set, so the iteration's
     # contraction property holds.
-    rhs_explicit = f_contact_vec + f_lateral + f_friction_vec + f_ext_vec + f_damping  # B3
+    rhs_explicit = f_contact_vec + f_lateral + \
+        f_friction_vec + f_ext_vec + f_damping  # B3
     rhs_n_scalar = wp.dot(rhs_explicit, out_n_world)
     rhs_t_vec = rhs_explicit - rhs_n_scalar * out_n_world
 
@@ -983,6 +1355,13 @@ def write_cslc_contacts(
     target_ke: float,
     cslc_dc: float,
     eps: float,
+    # Theory fix #3+#4 — partition-of-unity normalizer (see jacobi_step
+    # docstring).  Same W computed once per pair launch and consumed by
+    # both jacobi_step (during the Jacobi sweep) and here (when
+    # emitting contacts).  Sharing W keeps the lattice solver's
+    # per-pair force and MuJoCo's emitted per-contact force bit-
+    # identical: both divide A_j by the same W_j.
+    W_targets: wp.array(dtype=wp.float32),
     out_stiffness: wp.array(dtype=wp.float32),
     out_damping: wp.array(dtype=wp.float32),
     out_friction: wp.array(dtype=wp.float32),
@@ -1070,16 +1449,30 @@ def write_cslc_contacts(
     for j in range(target_count):
         t_world = wp.transform_point(X_tb, target_positions_local[j])
         diff_qt = q_world_def - t_world
-        if wp.length(diff_qt) < 1.0e-15:
+        dist = wp.length(diff_qt)
+        if dist < 1.0e-15:
             continue
 
         n_face_world = wp.transform_vector(X_tb, target_normals_local[j])
         # Half-space raw (v2, contract eq:raw):
         #     raw = r_i − n_face · (q_def − t)
         raw = r_i - wp.dot(diff_qt, n_face_world)
+        # Theory fix D1 — face-penetration form (mirror of jacobi_step).
+        # raw carries an r_i shelf at face contact; raw_face zeroes
+        # the shelf so phi(face contact) = 0 and MuJoCo's emitted
+        # constraint goes inactive at the geometric face onset rather
+        # than r_i below it.
+        raw_face = raw - r_i
         # Half-space gate (literal MUST match INACTIVE_RAW_EPS_FACTOR
-        # = -50.0 in cslc_main/theory/cslc_theory.py).
-        if raw < -50.0 * eps:
+        # = -50.0 in cslc_main/theory/cslc_theory.py).  Cull on
+        # raw_face post-fix-D1, parity-locked with jacobi_step.
+        if raw_face < -50.0 * eps:
+            continue
+        # Theory fix D2 — distance-magnitude cull (mirror of
+        # jacobi_step).  Prevents phantom contacts from being emitted
+        # to MuJoCo where the pad sphere is on the opposite side of
+        # the target body.  Parity-locked threshold.
+        if dist > 3.0 * r_i + 5.0 * eps:
             continue
         # One-sided alignment gate (contract §3.6).  Literal 0.05 MUST
         # match EPS_ALIGN_DEFAULT in cslc_main/theory/cslc_theory.py.
@@ -1095,7 +1488,12 @@ def write_cslc_contacts(
             align_w = t_lerp * t_lerp * (3.0 - 2.0 * t_lerp)
 
         normal_ab = -n_face_world
-        contact_gate = smooth_step(raw, eps)
+        # Theory fix D1: contact_gate on raw_face so the emission cull
+        # ``contact_gate < 0.5`` is equivalent to ``raw_face < 0``
+        # (face has not penetrated) rather than ``raw < 0`` (sphere
+        # centre has not crossed the target plane, which was r_i
+        # earlier than face contact).
+        contact_gate = smooth_step(raw_face, eps)
         # Tangential locality kernel -- folded into emitted stiffness
         # below so MuJoCo applies per-contact force
         #     stiffness · solver_pen
@@ -1112,7 +1510,15 @@ def write_cslc_contacts(
         # per-pair Hertz-like force exactly.
         kernel_h = r_i
         w_tangent = smooth_step(kernel_h - d_t_mag, eps)
-        A_j = target_areas_local[j]
+        # Theory fix #3+#4 — partition-of-unity normalizer (parity with
+        # jacobi_step).  Divide A_j by W_j so the per-pair emitted
+        # stiffness encodes the same share = w_t · α / W_j the lattice
+        # solver applied during the Jacobi sweep.  1e-30 floor protects
+        # the (W_j → 0) degenerate; in that regime w_tangent → 0 anyway
+        # so the cull below drops the contact.
+        W_j = W_targets[j]
+        inv_W = 1.0 / (W_j + 1.0e-30)
+        A_j = target_areas_local[j] * inv_W
         area_kernel = A_j * w_tangent
 
         # Hard cull below the production gate threshold.  Two
@@ -1171,10 +1577,22 @@ def write_cslc_contacts(
         out_offset0[buf_idx] = offset0_body
         out_offset1[buf_idx] = offset1_body
         out_normal[buf_idx] = normal_ab
-        out_margin0[buf_idx] = r_i
+        # Theory fix D1: margin0 = 0 (was r_i) so MuJoCo's
+        #     solver_pen = margin0 + margin1 − (point1 − point0)·normal
+        #                = 0 + 0 − (t_j − q_def)·(−n_face)
+        #                = −n_face · (q_def − t_j)
+        #                = raw − r_i
+        #                = raw_face
+        # reconstructs the FACE-PENETRATION scalar, not the half-space
+        # raw with its r_i shelf.  The emitted stiffness below is
+        # likewise tied to raw_face (depth_factor = √(raw_face_pos +
+        # ε)), so MuJoCo's per-contact force ``stiffness · solver_pen``
+        # = 1.5 · kc · A · w · α · gate · raw_face^1.5 matches
+        # jacobi_step's per-pair Hertz-like force at the converged δ.
+        out_margin0[buf_idx] = 0.0
         # Contract §8: v2 sets margin1 = 0 (v1 used R_j).  MuJoCo's
-        # reconstructed solver_pen then reduces to the half-space raw
-        # algebraically: see kernel docstring.
+        # reconstructed solver_pen now reduces to raw_face (= raw - r_i),
+        # not raw — see margin0 fix above.
         out_margin1[buf_idx] = 0.0
         out_tids[buf_idx] = 0
         # Hertz-like force law: F = kc · A_j · w · α · gate · raw^1.5.
@@ -1188,10 +1606,24 @@ def write_cslc_contacts(
         # stiffness 2 E* √(R·δ) ∝ √δ.  Couples with the jacobi_step
         # change above (phi_eff = raw^1.5) so the lattice solver and
         # MuJoCo agree on the per-contact force.
-        raw_pos = smooth_relu(raw, eps)
+        #
+        # Theory fix #1+#2: smooth_blend in place of smooth_relu so the
+        # emitted stiffness vanishes EXACTLY for raw_face ≤ 0 (matching
+        # jacobi_step's phi_eff) and equals √raw_face EXACTLY at depth.
+        # This site is only reached when raw_face passes the
+        # contact_gate ≥ 0.5 cull above (raw_face ≥ 0 in practice).
+        #
+        # Theory fix D1: smooth_blend consumes raw_face = raw - r_i so
+        # the depth_factor — and therefore the emitted stiffness —
+        # zeroes at FACE contact, not r_i below it.  Paired with the
+        # margin0 = 0 change above so MuJoCo's solver_pen = raw_face,
+        # the per-contact force ``stiffness · solver_pen`` is
+        # 1.5 · kc · A · w · α · gate · raw_face^1.5, matching the
+        # lattice solver's per-pair force exactly post-fix-D1.
+        raw_pos = smooth_blend(raw_face, eps)
         depth_factor = wp.sqrt(raw_pos + eps)
         out_stiffness[buf_idx] = smooth_relu(
-            1.5 * kc_emit * area_kernel * align_w * contact_gate * depth_factor,
+            kc_emit * area_kernel * align_w * contact_gate * depth_factor,
             1.0e-9)
         # Per-contact damping (A1: was hardcoded 0.0 in v2).
         # MuJoCo's solref/solimp branch logic:

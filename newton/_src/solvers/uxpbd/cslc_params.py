@@ -90,7 +90,13 @@ class CSLCParams:
     # path also enables (when their per-sphere stiffnesses are non-zero)
     # the graph-Laplacian lateral coupling and stick-slip friction terms
     # from the CSLC kernel.
-    use_jacobi: bool = False
+    #
+    # Default flipped to True (2026-05-28) -- v1 anchor-only path is
+    # retained for reference but should not be used in production: its
+    # ``lattice_k_bulk`` consumes a different unit convention than the
+    # Jacobi path (N/m vs N·m^(-3.5)) and it lacks per-pair area
+    # weighting + multi-contact summing.
+    use_jacobi: bool = True
     jacobi_iterations: int = 4
     # Scalar stick-slip friction parameters used by the Jacobi kernel
     # (``f_t = -K·M·s / (K·s + M)`` with ``K = k_stick``,
@@ -99,3 +105,41 @@ class CSLCParams:
     # scenarios where stick-slip dominates.
     k_stick: float = 0.0
     mu_friction: float = 0.0
+    # Lattice velocity-damping rate [N·s/m].  When > 0, the Jacobi
+    # kernel adds an implicit-Euler ``-c_lattice · δ̇`` term to each
+    # pad sphere's per-substep update, where
+    # ``δ̇ ≈ (δ_new − δ_prev_step) / dt`` and ``δ_prev_step`` is the
+    # snapshot taken at the start of the contact substep (=
+    # ``model.lattice_delta_prev`` after the snapshot in
+    # :meth:`SolverUXPBD.compute_compliant_contact_response`).
+    # Concretely the kernel adds ``c_lattice / dt`` to both
+    # ``k_diag_n`` and ``k_diag_t`` (the per-axis Jacobi diagonal)
+    # AND adds ``(c_lattice / dt) · δ_prev_step`` to ``rhs_explicit``.
+    # The form is unconditionally stable -- raising ``c_lattice``
+    # monotonically pulls ``δ_new`` toward ``δ_prev_step``, damping
+    # lattice oscillatory modes.
+    #
+    # Default ``0.0`` makes the damping force identically zero and the
+    # Jacobi kernel reduces to its pre-B3 form bit-for-bit (no
+    # behaviour change unless this knob is opted into).
+    c_lattice: float = 0.0
+    # When True (the default and current behaviour), the pp contact
+    # kernel SKIPS the lattice-side body wrench
+    # (``cslc_owns_lattice_wrench=1`` in ``kernels.py``) and the CSLC
+    # anchor reaction in ``accumulate_cslc_body_wrench`` is the SOLE
+    # body-wrench source for lattice-vs-object contact.  This matches
+    # the production CSLC contract: the pad body should feel only the
+    # compliance term, not the rigid PP impulse.
+    #
+    # When False, the pp kernel ALSO writes the lattice-side body
+    # wrench in addition to the anchor reaction.  This double-counts
+    # the normal direction (anchor + pp both push the body), but adds
+    # back the tangential (friction-drag) wrench on the body, which
+    # the anchor-only path cannot capture (anchor encodes compression
+    # along the rest normal, not friction along the contact tangent).
+    # For grasp scenes where torque resistance from distributed
+    # friction matters more than exact normal-stiffness calibration,
+    # this is the right trade-off; for single-pair CSLC validation
+    # tests where the contact normal force is the load-bearing
+    # quantity, keep the default True.
+    enable_lattice_pp_body_wrench: bool = False

@@ -158,6 +158,15 @@ def run_headless(config: GraspConfig) -> Metrics:
             left_pad_z, right_pad_z, n_contacts, cslc_state, t_step,
         )
 
+        # Capture per-step actuator-torque normal force (3rd-law magnitude
+        # of contact reaction along X) and commanded inward pad
+        # displacement.  Together these give the steady-state (F_n, δ)
+        # operating point during HOLD.
+        qfrc_np = state_0.mujoco.qfrc_actuator.numpy()
+        metrics.F_n_left.append(float(qfrc_np[artifacts.dof_map["left_x"]]))
+        metrics.F_n_right.append(float(qfrc_np[artifacts.dof_map["right_x"]]))
+        metrics.dx_left.append(float(dx))
+
         metrics.object_z.append(obj_xyz[2])
         if len(metrics.object_z) == 1:
             metrics._x0 = obj_xyz[0]  # type: ignore[attr-defined]

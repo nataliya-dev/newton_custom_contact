@@ -2,22 +2,59 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ###########################################################################
-# Example UXPBD Pick and Place (Scenario A)
+# Example UXPBD Pick and Place (CSLC gripper grasp)
 #
-# A spherical Franka arm — each link is shelled by a sphere lattice attached
-# via add_lattice — near a free shape-matched rigid cube (mass 0.3 kg,
-# mu=0.7). The robot loads from assets/panda/urdfs/10/sphere_panda.urdf:
-# the articulated 7-DOF chain (fingers fixed) is loaded as rigid bodies, and
-# each link's child collision spheres are stripped from the URDF and
-# re-attached as a UXPBD lattice (substrate 0, anchored to the link).
-# Phase machine: APPROACH -> SQUEEZE (placeholder) -> LIFT -> HOLD.
+# A spherical Franka arm reaches a small free object, closes its two
+# fingers around it, and lifts it. The two fingertips
+# (panda_leftfinger / panda_rightfinger) are shelled with a COMPLIANT
+# sphere lattice (CSLC) so the gripper "skin" physically deforms around
+# the object during the grasp; nothing else carries a collision lattice,
+# so the only contact -- and the only lattice compression we measure --
+# is the fingertip grip.
 #
-# Phase 2 demo: validates the cross-substrate lattice <-> SM-rigid contact
-# path. Requires Phase 2 PBD-R kernels (CUDA only).
+# Pipeline:
+#   1. Load assets/panda/urdfs/25/sphere_panda.urdf, strip the per-link
+#      collision-sphere children, and re-actuate the two finger prismatic
+#      joints (see _prepare_sphere_panda_urdf). That URDF stores the robot's
+#      whole visible shell in those children, so the stripped arm/hand spheres
+#      are re-added as VISUAL-ONLY shapes (no collision, zero mass) -- without
+#      this only the fingertip lattice would render and the arm is invisible.
+#   2. INVERSE KINEMATICS (newton.ik): solve the 7-DOF arm for two hand
+#      poses -- the grasp pose at the object and a lifted pose -- both with
+#      the hand pointing straight down. FK then (a) verifies the solved
+#      configs put the hand on target (self._ik_max_err), (b) locates the
+#      finger midpoint so the object spawns exactly between the fingers,
+#      and (c) checks the fingertip lattice clears the ground at the grasp.
+#   3. Attach a COMPLIANT lattice (CSLCParams on the solver + per-sphere
+#      k_anchor / k_bulk on add_lattice) to each fingertip.
+#   4. Phase machine SETTLE -> GRASP -> LIFT -> HOLD holds the arm at the
+#      IK grasp pose (PD position control) while the object settles between
+#      the open fingers, then closes the fingers (the CSLC skin compresses
+#      around the object -- model.lattice_delta), then raises the arm to
+#      the lifted pose so the friction grip carries the object up.
 #
-# Command: python -m newton.examples uxpbd_pick_and_place
+# The grasped object is a TALL sphere-packed column resting on the ground:
+# the Franka fingers are ~8 cm long, so to grip a ground object without
+# the fingertips jamming into the floor the object must extend up into the
+# fingers' contact band. A short ball would force the fingertips below the
+# ground plane (a violent ground-vs-fingertip contact that destabilises
+# the arm), so we use a column that the fingers grip on its sides at
+# mid-height while the fingertips stay well above z=0.
+#
+# NOTE on telemetry: SolverUXPBD is position-based -- it integrates body
+# poses (state.body_q), not generalized joint coordinates, and does NOT
+# write joint_q back after a step. So state.joint_q for the finger DOFs
+# stays at its initial value even as the finger BODIES close. We therefore
+# report grip state from the finger body poses, the lattice<->object
+# surface gap, and model.lattice_delta -- never from joint_q.
+#
+# Requires the Phase 2 CSLC kernels (CUDA only).
+#
+# Command:  python -m newton.examples uxpbd_pick_and_place
+#   --no-compliant   run the rigid-lattice baseline for A/B comparison
 ###########################################################################
 
+from __future__ import annotations
 
 import tempfile
 import xml.etree.ElementTree as ET
@@ -28,6 +65,9 @@ import warp as wp
 
 import newton
 import newton.examples
+import newton.ik as ik
+from newton import JointTargetMode
+from newton.solvers import CSLCParams
 
 _ASSETS_DIR = Path(__file__).resolve().parents[3] / "assets"
 SPHERE_PANDA_URDF = _ASSETS_DIR / "panda" / "urdfs" / "25" / "sphere_panda.urdf"
@@ -41,13 +81,101 @@ FRANKA_HOME_Q = [
     np.pi / 2.0,
     np.pi / 4.0,
 ]
-FINGER_OPEN = 0.04
-FINGER_CLOSED = 0.01
+FINGER_OPEN = 0.04    # finger prismatic joint at full open [m]
+# Commanded grip target. NOT 0 (full closure): position-driving the fingers
+# fully shut makes them crush straight through the compliant skin, so we
+# command a target that lets the pads balance the PD drive at a firm,
+# bounded squeeze. The grasp is BISTABLE in finger_closed (mapped by sweep,
+# k_anchor=1.5e3, 0.08 kg / 28 mm-thick column; self.finger_closed overrides
+# it for re-sweeping):
+#   * LOOSE  (~0.020-0.023 m): the fingers settle against the lattice at
+#     fsep ~47 mm and gently but STABLY hold the faces. The column lifts in
+#     near-lockstep (climbs only ~1 cm in the grip), the pads stay engaged
+#     through HOLD, and the hold is ROBUST + near-deterministic (6/6 runs).
+#     Skin compression is gentle (~0.3 mm) but sustained.
+#   * dead zone (~0.014-0.018 m): the column drops out during the lift.
+#   * TIGHT  (~0.012-0.013 m): the fingers race toward full closure and
+#     either seat the column high (climbs ~5 cm) with a large ~2 mm
+#     compression, OR -- nondeterministically -- crush through and EJECT it
+#     mid-lift. Flaky (~1 in 5 runs drops), so unfit for a reliable demo.
+# We use the LOOSE regime: a reliable grasp matters more than a dramatic
+# squeeze. (For a deliberately large, controlled deformation, force/impedance
+# control or softer pads + a heavier object would be the right lever -- the
+# gentle ~0.3 mm here is the honest cost of a position-controlled stable hold.)
+FINGER_CLOSED = 0.0205
 
-PHASE_APPROACH = 0
-PHASE_SQUEEZE = 1
-PHASE_LIFT = 2
-PHASE_HOLD = 3
+# ----- Grasped object: sphere-packed box column ------------------------
+# A vertical box column, rotated about Z at build time so a flat FACE meets
+# each finger pad (perpendicular to the gripper's actual closing axis, which
+# the ~45 deg IK wrist tilts off the world axes). Flat-pad-on-flat-face is
+# FORM CLOSURE: the object cannot squirt out sideways the way a round object
+# does when squeezed between flat pads.
+#   OBJ_HX = half-thickness along the closing axis (gripped faces 2*HX apart)
+#   OBJ_HY = half-width along the face
+#   OBJ_HZ = half-height
+# HEIGHT is a tight trade-off set by the gripper geometry. The 8 cm fingers
+# put the pinch zone high (~z=0.05), so the ground-resting column must be
+# TALL enough to stand up into it -- too short and it sits below the pads and
+# slips out (verified: OBJ_HZ<=0.032 never grips). 2*OBJ_HZ ~ 76 mm gives
+# enough face to grip robustly (OBJ_HZ=0.038, 4/4 holds) while keeping the
+# lifted top as low as possible. NOTE: because the hand is rendered in full
+# (its sphere shell fills the inter-finger volume) and is collision-free, the
+# gripped column's top still visually overlaps the palm -- inherent to this
+# gripper, not a grasp failure.
+OBJ_HX = 0.014
+OBJ_HY = 0.018
+OBJ_HZ = 0.038
+OBJ_GRID = (3, 3, 7)  # spheres per axis (63 total), 3D-distributed so the
+#                       shape-matching covariance is well-conditioned
+#                       (collinear/planar packings make the SVD rotation
+#                       extraction unstable; see the SceneParams.obj_radius
+#                       note in example_uxpbd_lift_test).
+OBJ_MASS = 0.08       # [kg]  (weight ~0.78 N)
+MU = 1.0              # Coulomb friction (kernel mu_eff = 0.5*(particle+shape))
+
+# Hand grasp target, world frame. X/Y put the object in front of the robot.
+# Z is high enough that the downward-pointing fingers grip the column's
+# upper-middle with the fingertip lattice band staying above the ground
+# (verified by an assertion in __init__).
+GRASP_X = 0.45
+GRASP_Y = 0.0
+GRASP_HAND_Z = 0.13
+LIFT_DZ = 0.10        # how far the lifted hand pose sits above the grasp [m]
+
+# Hand-down orientation: quaternion (x,y,z,w) = (1,0,0,0) is a 180 deg
+# rotation about world X, sending the hand's body +Z (palm/approach axis,
+# pointing out toward the fingers) to world -Z so the fingers point down.
+DOWN_QUAT_XYZW = (1.0, 0.0, 0.0, 0.0)
+
+# ----- Compliant fingertip lattice (CSLC) ------------------------------
+# Per-sphere stiffnesses passed to add_lattice. The fingertip spheres are
+# small (r ~ 4-11 mm) so k_anchor is much softer than the lift-test pad
+# (1e5 N/m, driven by a 5e4-stiff prismatic) to keep the visible
+# compression in the sub-mm-to-mm band: equilibrium delta ~
+# F_grip / (N_active * k_anchor). k_bulk is the per-volume Jacobi contact
+# stiffness k_c.
+PAD_K_ANCHOR = 1.5e3   # N/m per sphere (anchor spring) -- soft enough that
+#                        the gentle (position-controlled, loose-regime) lifting
+#                        grip shows a sub-mm skin compression (peak delta
+#                        ~0.3 mm, all pads lightly engaged) rather than microns.
+#                        Softening it further mostly recruits MORE spheres
+#                        rather than deepening any one, so deformation stays
+#                        sub-mm; a dramatic squeeze needs force control or a
+#                        heavier object, not just softer pads (see FINGER_CLOSED).
+PAD_K_BULK = 1.0e8     # Pa.m^-1/2 (Jacobi per-volume contact stiffness)
+PAD_K_LATERAL = 5.0e2  # N/m (reserved lateral coupling)
+PAD_DAMPING = 2.0      # s/m (reserved Hunt-Crossley)
+
+# Finger drive: firm enough to load the grip, soft enough not to crush the
+# compliant skin past the sphere radius (which would pop the object out).
+FINGER_KE = 800.0
+FINGER_KD = 40.0
+
+# Phase durations [s].
+SETTLE_T = 0.5
+GRASP_T = 1.0
+LIFT_T = 2.0
+HOLD_T = 0.5
 
 
 def _find_body(builder, label):
@@ -126,8 +254,9 @@ def _prepare_sphere_panda_urdf(urdf_path):
             if origin_el is not None:
                 origin_el.set("rpy", fix["rpy"])
             axis_el = joint.find("axis")
-            if axis_el is not None:
-                axis_el.set("xyz", fix["axis"])
+            if axis_el is None:
+                axis_el = ET.SubElement(joint, "axis")
+            axis_el.set("xyz", fix["axis"])
             # Remove any existing <limit> (shouldn't exist, but be defensive)
             # and add a fresh one with the documented gripper limits.
             for existing in list(joint.findall("limit")):
@@ -171,24 +300,90 @@ def _prepare_sphere_panda_urdf(urdf_path):
     return tree, link_lattices
 
 
+def _build_box_column(builder, *, hx, hy, hz, grid, theta, mass, pos_xy,
+                      ground_z=0.0, drop=0.005):
+    """Add a sphere-packed SM-rigid box column standing on the ground at
+    ``pos_xy``, yaw-rotated by ``theta`` [rad] about Z so its X-faces face the
+    gripper.
+
+    A ``grid = (nx, ny, nz)`` lattice of equal-radius spheres fills the box of
+    half-extents (hx, hy, hz); the sphere radius is the largest per-axis
+    half-spacing scaled up slightly so the emitted faces are gap-free.
+
+    The column is spawned so its LOWEST sphere SURFACE sits ``drop`` above
+    ``ground_z`` (a short free-fall to settle; a tangent-to-ground spawn is
+    unstable for SM-rigid bodies). The lowest sphere centre is ``hz`` below the
+    centroid and its surface another ``r`` below that, so the spawn centroid is
+    ``ground_z + hz + r + drop`` -- NOT ``ground_z + hz`` (forgetting the +r
+    spawns the bottom sphere ~r below the ground, and the resulting penetration
+    launches short columns sideways during settle).
+
+    Returns ``(group_id, rest_centroid_z)`` where ``rest_centroid_z =
+    ground_z + hz + r`` is the settled centroid height (bottom surface on the
+    ground).
+    """
+    nx, ny, nz = grid
+
+    def _axis(h, n):
+        return np.array([0.0]) if n <= 1 else np.linspace(-h, h, n)
+
+    sp = max((2 * hx) / max(nx - 1, 1),
+             (2 * hy) / max(ny - 1, 1),
+             (2 * hz) / max(nz - 1, 1))
+    r = float(0.5 * sp * 1.2)
+    cx, cy, cz = _axis(hx, nx), _axis(hy, ny), _axis(hz, nz)
+    xs, ys, zs = np.meshgrid(cx, cy, cz, indexing="ij")
+    centers = np.stack([xs.ravel(), ys.ravel(), zs.ravel()], axis=1)
+    # Yaw the box so its X-axis (thickness / gripped faces) aligns with the
+    # gripper closing direction.
+    c, s = np.cos(theta), np.sin(theta)
+    rot_z = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    centers = (centers @ rot_z.T).astype(np.float32)
+    radii = np.full(centers.shape[0], r, dtype=np.float32)
+    rest_centroid_z = ground_z + hz + r
+    spawn_z = rest_centroid_z + drop
+    group = builder.add_particle_volume(
+        volume_data={"centers": centers.tolist(), "radii": radii.tolist()},
+        total_mass=mass,
+        pos=wp.vec3(float(pos_xy[0]), float(pos_xy[1]), spawn_z),
+    )
+    return group, rest_centroid_z
+
+
+def _smoothstep(s: float) -> float:
+    """Cubic smoothstep 3s^2 - 2s^3 clamped to [0, 1]. Eases the arm and
+    fingers between targets so the PD drive never sees a target-velocity
+    step (which would impulse-load the compliant fingertip lattice)."""
+    s = min(max(s, 0.0), 1.0)
+    return s * s * (3.0 - 2.0 * s)
+
+
 class Example:
     def __init__(self, viewer, args):
         self.fps = 100
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 10
+        self.sim_substeps = 16
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.viewer = viewer
         self.args = args
-        self.phase = PHASE_APPROACH
-        self.phase_t0 = 0.0
+        self.use_cslc = not getattr(args, "no_compliant", False)
+        # Phase durations [s] (instance attrs so a debug runner can shorten
+        # the sequence for fast iteration).
+        self.settle_t = SETTLE_T
+        self.grasp_t = GRASP_T
+        self.lift_t = LIFT_T
+        self.hold_t = HOLD_T
+        # Grip-close target (tunable; the runner sweeps this to land the grip).
+        self.finger_closed = getattr(args, "finger_closed", None) or FINGER_CLOSED
 
         builder = newton.ModelBuilder(up_axis="Z")
         builder.add_ground_plane()
 
-        # Spherical Panda: 7-DOF revolute chain with fixed hand/fingers.
-        # The URDF's per-link collision spheres are stripped here and
-        # re-attached below as UXPBD lattices anchored to each link.
+        # Spherical Panda: 7-DOF revolute chain + 2 prismatic fingers. The
+        # URDF's per-link collision spheres are stripped here; we re-attach
+        # only the fingertip lattices below (the arm/hand stay collision
+        # free -- nothing touches them in this grasp).
         cleaned_tree, link_lattices = _prepare_sphere_panda_urdf(SPHERE_PANDA_URDF)
         with tempfile.NamedTemporaryFile(
                 suffix=".urdf", delete=False, mode="wb") as _tmp:
@@ -202,45 +397,130 @@ class Example:
             collapse_fixed_joints=False,
         )
 
-        # Set arm home pose + open-gripper width (9 DOFs: 7 arm revolutes
-        # plus the 2 prismatic finger joints re-actuated above). The target
-        # gains replicate the PD-gravity-comp tuning from robot_lift.py;
-        # finger gains are softer so a future SQUEEZE doesn't launch the
-        # cube on contact.
-        builder.joint_q[:7] = FRANKA_HOME_Q
-        builder.joint_q[7:9] = [FINGER_OPEN, FINGER_OPEN]
-        builder.joint_target_pos[:9] = builder.joint_q[:9]
-        builder.joint_target_ke[:9] = [4500, 4500,
-                                       3500, 3500, 2000, 2000, 2000, 500, 500]
+        # Arm/finger PD gains. Position mode on every DOF: the arm joints
+        # arrive from add_urdf already actuated, but the two finger joints
+        # were re-actuated from <fixed> and need ke/kd set explicitly.
+        builder.joint_target_ke[:9] = [
+            4500, 4500, 3500, 3500, 2000, 2000, 2000, FINGER_KE, FINGER_KE]
         builder.joint_target_kd[:9] = [
-            450, 450, 350, 350, 200, 200, 200, 50, 50]
+            450, 450, 350, 350, 200, 200, 200, FINGER_KD, FINGER_KD]
+        for d in range(9):
+            builder.joint_target_mode[d] = int(JointTargetMode.POSITION)
 
-        # Probe FK to read each link's home-pose world position. The lattice
-        # anchor is rigid (mass-0 particles) and starts in world space at
-        # ``pos + p_local``; if ``pos`` does not match the link's home-pose
-        # world position the anchor sees a huge initial error and the
-        # solver diverges to NaN within a couple of steps.
-        _probe_model = builder.finalize()
-        _probe_state = _probe_model.state()
-        newton.eval_fk(_probe_model, _probe_model.joint_q,
-                       _probe_model.joint_qd, _probe_state)
-        _probe_bq = _probe_state.body_q.numpy()
+        # ----- Probe model + INVERSE KINEMATICS -----------------------
+        # Finalize an arm-only probe (no lattices/object added yet -- those
+        # only add particles, not bodies, so the panda_hand/finger body
+        # indices are identical in the final model). Solve IK on it for the
+        # hand poses. eval_fk then verifies the solutions and measures the
+        # finger geometry for object placement + ground clearance.
+        probe_model = builder.finalize()
+        probe_state = probe_model.state()
+        self.hand_idx = _find_body(builder, "panda_hand")
+        self.lf_idx = _find_body(builder, "panda_leftfinger")
+        self.rf_idx = _find_body(builder, "panda_rightfinger")
 
-        # Attach a sphere lattice to each Panda link that carried spheres in
-        # the source URDF. Each lattice's particles are anchored to the link
-        # via add_lattice's mass-0 rigid anchor constraint, so the robot moves
-        # rigidly while its collision surface is a particle lattice that
-        # participates in cross-substrate UXPBD contact. Both the link's
-        # world position AND rotation must be passed; add_lattice places each
-        # particle at ``rot * p_local + pos`` at t=0 and any mismatch with the
-        # link's actual world pose injects a huge initial constraint error
-        # (most Panda links have non-trivial rotation at home pose).
-        for link_name, spheres in link_lattices.items():
-            link_idx = _find_body(builder, link_name)
-            bq = _probe_bq[link_idx]
+        def solve_ik(target_xyz):
+            """Solve the 7-DOF arm so panda_hand reaches target_xyz with the
+            hand pointing straight down. Returns (q_arm[7], pos_err)."""
+            jq = probe_model.joint_q.numpy().copy().reshape(
+                (1, probe_model.joint_coord_count))
+            jq[0, :7] = FRANKA_HOME_Q  # warm start from home each solve
+            jq_wp = wp.array(jq, dtype=wp.float32)
+            pos_obj = ik.IKObjectivePosition(
+                link_index=self.hand_idx, link_offset=wp.vec3(0.0, 0.0, 0.0),
+                target_positions=wp.array([wp.vec3(*target_xyz)], dtype=wp.vec3))
+            rot_obj = ik.IKObjectiveRotation(
+                link_index=self.hand_idx,
+                link_offset_rotation=wp.quat_identity(),
+                target_rotations=wp.array(
+                    [wp.vec4(*DOWN_QUAT_XYZW)], dtype=wp.vec4))
+            lim_obj = ik.IKObjectiveJointLimit(
+                joint_limit_lower=probe_model.joint_limit_lower,
+                joint_limit_upper=probe_model.joint_limit_upper, weight=10.0)
+            solver = ik.IKSolver(
+                model=probe_model, n_problems=1,
+                objectives=[pos_obj, rot_obj, lim_obj],
+                lambda_initial=0.1, jacobian_mode=ik.IKJacobianType.ANALYTIC)
+            solver.step(jq_wp, jq_wp, iterations=64)
+            q_arm = jq_wp.numpy()[0, :7].copy()
+            probe_model.joint_q.assign(
+                np.concatenate([q_arm, [FINGER_OPEN, FINGER_OPEN]]).astype(np.float32))
+            newton.eval_fk(probe_model, probe_model.joint_q,
+                           probe_model.joint_qd, probe_state)
+            hand_pos = probe_state.body_q.numpy()[self.hand_idx, :3]
+            err = float(np.linalg.norm(hand_pos - np.asarray(target_xyz)))
+            return q_arm, err
+
+        grasp_xyz = (GRASP_X, GRASP_Y, GRASP_HAND_Z)
+        lift_xyz = (GRASP_X, GRASP_Y, GRASP_HAND_Z + LIFT_DZ)
+        self.q_grasp, e_g = solve_ik(grasp_xyz)
+        self.q_lift, e_l = solve_ik(lift_xyz)
+        self._ik_max_err = max(e_g, e_l)
+        print(f"[IK] reach errors (mm): grasp={e_g*1e3:.2f} lift={e_l*1e3:.2f}")
+
+        # ----- Start the arm AT the grasp config (fingers open) --------
+        # The arm holds this IK-reached pose while the object settles
+        # between the open fingers; then the fingers close and the arm
+        # lifts. The lattice anchors are seeded in world space at t=0 from
+        # the link pose at this config, so the builder joint_q MUST match.
+        builder.joint_q[:7] = self.q_grasp
+        builder.joint_q[7:9] = [FINGER_OPEN, FINGER_OPEN]
+        builder.joint_target_pos[:7] = self.q_grasp
+        builder.joint_target_pos[7:9] = [FINGER_OPEN, FINGER_OPEN]
+
+        # FK at the grasp config (fingers open): finger lattice world poses
+        # for the anchor placement, the finger midpoint for object spawn,
+        # and the lowest fingertip-lattice sphere z for the ground-clearance
+        # check. We use the actual lattice sphere world positions (rigidly
+        # bound to each finger body) rather than the body origins, because
+        # the lattice hangs ~p_local.z below the body origin along the
+        # downward hand axis.
+        probe_model.joint_q.assign(
+            np.concatenate([self.q_grasp, [FINGER_OPEN, FINGER_OPEN]]).astype(np.float32))
+        newton.eval_fk(probe_model, probe_model.joint_q,
+                       probe_model.joint_qd, probe_state)
+        bq_grasp = probe_state.body_q.numpy()
+
+        def _lattice_world(link_name, link_idx):
+            spheres = link_lattices[link_name]
+            c = np.asarray(spheres["centers"], dtype=np.float64)
+            rr = np.asarray(spheres["radii"], dtype=np.float64)
+            p = bq_grasp[link_idx, :3].astype(np.float64)
+            q = bq_grasp[link_idx, 3:7].astype(np.float64)  # xyzw
+            qv = q[:3]
+            world = np.array([ci + 2.0 * q[3] * np.cross(qv, ci)
+                              + 2.0 * np.cross(qv, np.cross(qv, ci)) + p
+                              for ci in c])
+            return world, rr
+
+        lfw, lfr = _lattice_world("panda_leftfinger", self.lf_idx)
+        rfw, rfr = _lattice_world("panda_rightfinger", self.rf_idx)
+        finger_mid = 0.5 * (lfw.mean(axis=0) + rfw.mean(axis=0))
+        obj_xy = (float(finger_mid[0]), float(finger_mid[1]))
+        lattice_bottom_z = float(min((lfw[:, 2] - lfr).min(),
+                                     (rfw[:, 2] - rfr).min()))
+        print(f"[place] finger-lattice midpoint at grasp = {np.round(finger_mid, 4)} "
+              f"-> object spawn xy = {np.round(obj_xy, 4)}")
+        print(f"[clearance] lowest fingertip-lattice sphere z = "
+              f"{lattice_bottom_z*1e3:.1f} mm (must be > 0)")
+        # Hard guard: if the fingertips dip below the ground at the grasp
+        # pose, the ground-vs-fingertip contact would explode the arm.
+        assert lattice_bottom_z > 0.002, (
+            f"Fingertip lattice penetrates the ground at the grasp pose "
+            f"(lowest sphere z={lattice_bottom_z*1e3:.1f} mm); raise "
+            f"GRASP_HAND_Z or shorten the fingers.")
+
+        # ----- Compliant fingertip lattices (the gripper "skin") -------
+        # Only the two fingers carry a lattice. CSLC compliance is applied
+        # uniformly (CSLCParams is a global solver flag), so the per-sphere
+        # k_anchor here is what makes the fingertips the soft, deforming
+        # surface; nothing else has a lattice, so model.lattice_delta is a
+        # clean readout of the fingertip grip compression.
+        for link_name, link_idx in (("panda_leftfinger", self.lf_idx),
+                                     ("panda_rightfinger", self.rf_idx)):
+            spheres = link_lattices[link_name]
+            bq = bq_grasp[link_idx]
             link_pos = wp.vec3(float(bq[0]), float(bq[1]), float(bq[2]))
-            # body_q quaternion layout is (qx, qy, qz, qw); wp.quat uses the
-            # same xyzw layout.
             link_rot = wp.quat(float(bq[3]), float(bq[4]),
                                float(bq[5]), float(bq[6]))
             builder.add_lattice(
@@ -249,114 +529,165 @@ class Example:
                 total_mass=0.0,
                 pos=link_pos,
                 rot=link_rot,
+                k_anchor=PAD_K_ANCHOR,
+                k_lateral=PAD_K_LATERAL,
+                k_bulk=PAD_K_BULK,
+                damping=PAD_DAMPING,
             )
 
-        # Pickable cube: 4x4x4 sphere packing inscribed in a 0.08 m cube.
-        # Total mass 0.3 kg, mu=0.7 (friction-closure grasp). The sphere packing
-        # acts as the shape-matched rigid body for the cube in Phase 2.
-        half_extent = 0.04  # cube half-side [m]
-        # sphere radius [m]; 4 spheres span 0.096 m ~ 0.08 m side
-        sphere_r = 0.012
-        coords = np.linspace(-half_extent + sphere_r,
-                             half_extent - sphere_r, 4)
-        xs, ys, zs = np.meshgrid(coords, coords, coords, indexing="ij")
-        cube_centers = np.stack(
-            [xs.flatten(), ys.flatten(), zs.flatten()], axis=1)
-        cube_radii = np.full(cube_centers.shape[0], sphere_r)
-        self.cube_group = builder.add_particle_volume(
-            volume_data={"centers": cube_centers.tolist(),
-                         "radii": cube_radii.tolist()},
-            total_mass=0.3,
-            pos=wp.vec3(0.55, 0.0, 0.05),
-        )
+        # ----- Make the arm/hand visible (visual-only spheres) ---------
+        # The sphere_panda URDF stores the robot's ENTIRE visible geometry
+        # in its per-link collision-sphere children (panda_link*_sphereK);
+        # the real chain links carry only an invisible 1 mm collision sphere
+        # and no <visual>. _prepare_sphere_panda_urdf strips all those
+        # children, so without re-adding them the arm/hand render as nothing
+        # and only the fingertip particle lattice is visible. Re-add the
+        # stripped arm/hand spheres as VISUAL-ONLY shapes (no shape/particle
+        # collision) on their parent bodies, reusing the centres/radii the
+        # prepare step already harvested into link_lattices. The two fingers
+        # are intentionally skipped: their "skin" is the compliant PARTICLE
+        # lattice added above -- that is the surface we want to watch deform,
+        # so overlaying rigid spheres there would hide the compression.
+        arm_visual_cfg = builder.default_shape_cfg.copy()
+        arm_visual_cfg.has_shape_collision = False
+        arm_visual_cfg.has_particle_collision = False
+        arm_visual_cfg.is_visible = True
+        # density=0: these are pure decoration. add_urdf already set each
+        # link's mass/inertia from its <inertial> tag, and the builder
+        # ACCUMULATES shape-derived mass on top -- so leaving the default
+        # 1000 kg/m^3 here would dump >1 kg onto each link (the r~7 cm
+        # spheres alone), wrecking the arm dynamics. Zero keeps them inert.
+        arm_visual_cfg.density = 0.0
+        for link_name, spheres in link_lattices.items():
+            if link_name in ("panda_leftfinger", "panda_rightfinger"):
+                continue
+            link_idx = _find_body(builder, link_name)
+            for c, r in zip(spheres["centers"], spheres["radii"]):
+                builder.add_shape_sphere(
+                    body=link_idx,
+                    xform=wp.transform(wp.vec3(*c), wp.quat_identity()),
+                    radius=float(r),
+                    cfg=arm_visual_cfg,
+                    color=wp.vec3(0.6, 0.6, 0.62),
+                )
 
-        # Fluid block dropping onto the robot's upper arm. Centered above
-        # panda_link2 (shoulder, world (0, 0, 0.333)) at z=0.95; the block
-        # free-falls ~0.6 m onto the lattice, cascading down the chain.
-        # 6x6x4 = 144 particles, particle radius 8 mm, cells touching at
-        # 16 mm spacing (rest_density matches add_fluid_grid default).
-        fluid_dims = (6, 6, 4)
-        fluid_cell = 0.016
-        fluid_r = 0.008
-        fluid_corner = wp.vec3(
-            -(fluid_dims[0] - 1) * fluid_cell / 2,
-            -(fluid_dims[1] - 1) * fluid_cell / 2,
-            0.95,
-        )
-        builder.add_fluid_grid(
-            pos=fluid_corner,
-            rot=wp.quat_identity(),
-            vel=wp.vec3(0.0, 0.0, 0.0),
-            dim_x=fluid_dims[0], dim_y=fluid_dims[1], dim_z=fluid_dims[2],
-            cell_x=fluid_cell, cell_y=fluid_cell, cell_z=fluid_cell,
-            particle_radius=fluid_r,
-            rest_density=1000.0,
-            smoothing_radius_factor=3.0,
-            viscosity=0.05,
-            cohesion=0.0,
-        )
+        # ----- Grasped object: tall SM-rigid box column ---------------
+        # Rests on the ground at the finger midpoint and stands up into the
+        # fingers' contact band. Yaw-aligned so a flat face meets each finger
+        # pad (form closure -> no squirt-out). Spawned ~5 mm above its
+        # resting height so it free-falls a short way and settles (a
+        # tangent-to-ground spawn is unstable for SM-rigid bodies). The
+        # fingers grip its faces at mid-height; the fingertips clear the
+        # ground (asserted above).
+        closing_dir = rfw.mean(axis=0)[:2] - lfw.mean(axis=0)[:2]
+        obj_yaw = float(np.arctan2(closing_dir[1], closing_dir[0]))
+        print(f"[place] gripper closing yaw = {np.degrees(obj_yaw):.1f} deg "
+              f"-> box X-faces aligned to the fingers")
+        self.obj_group, obj_rest_z = _build_box_column(
+            builder, hx=OBJ_HX, hy=OBJ_HY, hz=OBJ_HZ, grid=OBJ_GRID,
+            theta=obj_yaw, mass=OBJ_MASS, pos_xy=obj_xy, drop=0.005)
+        print(f"[place] column rest centroid z = {obj_rest_z*1e3:.1f} mm")
 
         self.model = builder.finalize()
-        # Cap particle velocity to suppress cross-substrate "impact launch"
-        # when the fluid block hits the robot's lattice (see the note in
-        # example_uxpbd_lattice_into_fluid for the underlying mechanism).
-        # Only applies to mass>0 particles, so the lattice anchors are
-        # unaffected and the cube grasp dynamics still play normally.
-        self.model.particle_max_velocity = 2.0
-        # Friction coefficient on cube particles (mu for particle-particle and
-        # particle-shape contacts, including the lattice finger pads). The
-        # particle-shape kernel uses mu = 0.5 * (particle_mu + shape_material_mu[shape]),
-        # so we override the per-shape value to match the intended 0.7 effective
-        # coefficient (default shape_material_mu is 0.5).
-        self.model.particle_mu = 0.7
-        self.model.soft_contact_mu = 0.7
+        # Friction: kernel mu_eff = 0.5*(particle_mu + shape_material_mu),
+        # so set every channel to MU to get exactly MU at the grip.
+        self.model.particle_mu = MU
+        self.model.soft_contact_mu = MU
         self.model.shape_material_mu.assign(
-            np.full(self.model.shape_count, 0.7, dtype=np.float32))
+            np.full(self.model.shape_count, MU, dtype=np.float32))
+        # Cap particle velocity: a safety net against the SM-rigid +
+        # first-contact "impact launch" at this small object scale. 2 m/s is
+        # far above the mm/s grasp/lift dynamics, so the grip is unaffected.
+        self.model.particle_max_velocity = 2.0
 
+        # CSLC is enabled by passing a CSLCParams instance; None leaves the
+        # fingertip lattice rigid (the --no-compliant A/B baseline).
+        cslc_params = CSLCParams(
+            clamp_delta_dot_max=1.0,
+            ka_tangent_ratio=1.0,
+            # Recover the friction-drag wrench the fingers feel from the
+            # gripped object (the anchor reaction alone only encodes normal
+            # compression) -- required to carry the object during LIFT.
+            enable_lattice_pp_body_wrench=True,
+        ) if self.use_cslc else None
         self.solver = newton.solvers.SolverUXPBD(
-            self.model, iterations=8, shock_propagation_k=1.0,
-            fluid_iterations=4)
+            self.model, iterations=8, stabilization_iterations=2,
+            shock_propagation_k=1.0, cslc_params=cslc_params)
+
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
         newton.eval_fk(self.model, self.model.joint_q,
                        self.model.joint_qd, self.state_0)
         self.contacts = self.model.contacts()
+
+        # Object particle indices + resting baseline. The nominal rest
+        # centroid is OBJ_HALF_H (cylinder stands from z=0 to z=2*OBJ_HALF_H);
+        # the actual settled value is captured live during SETTLE so the
+        # lift check is robust to small settling offsets.
+        obj_idx = self.model.particle_groups[self.obj_group]
+        if hasattr(obj_idx, "numpy"):
+            obj_idx = obj_idx.numpy()
+        self._obj_idx = np.asarray(list(obj_idx), dtype=np.int32)
+        # Baselines captured live during SETTLE (see _record): the settled
+        # object centroid and the PD-drooped grasp-pose hand height, both
+        # used by test_final's lift / slip checks. Seeded with their nominal
+        # values (box rest centroid from _build_box_column; hand target).
+        self._obj_z_settled = obj_rest_z
+        self._hand_z_grasp = GRASP_HAND_Z
+
+        # Lattice (fingertip) particle indices = every particle not in the
+        # object group, for the lattice<->object surface-gap telemetry.
+        n_part = self.model.particle_count
+        self._lat_pidx = np.setdiff1d(np.arange(n_part), self._obj_idx)
+        self._part_r = self.model.particle_radius.numpy()
+
+        # Peak compliance trackers (verified in test_final).
+        self._peak_delta = 0.0
+        self._peak_n_active = 0
+        self.history: list[dict] = []
+
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True
-        self.viewer.set_camera(pos=wp.vec3(
-            1.5, -1.5, 1.2), pitch=-25.0, yaw=135.0)
+        self.viewer.set_camera(pos=wp.vec3(1.0, -1.0, 0.55),
+                               pitch=-18.0, yaw=130.0)
 
-    def _advance_phase(self):
-        """Drive the phase machine: APPROACH -> SQUEEZE -> LIFT -> HOLD.
+    # ----- Phase machine ----------------------------------------------
+    def _phase_targets(self, t: float):
+        """Return (phase_name, q_arm[7], finger_target) at sim time ``t``.
 
-        Each phase transition updates joint_target_pos on the control object.
-        APPROACH: wait 1 s (arm already at home pose near cube).
-        SQUEEZE:  close fingers from FINGER_OPEN to FINGER_CLOSED so the
-                  gripper lattice friction-grasps the cube before LIFT.
-        LIFT:     retract elbow joint (joint_q[3]) to raise the end-effector.
-        HOLD:     freeze targets indefinitely.
+        SETTLE : hold the grasp pose, fingers open (object settles between
+                 the already-positioned open fingers).
+        GRASP  : hold grasp pose, ease fingers open -> closed (CSLC skin
+                 compresses around the column).
+        LIFT   : ease the arm grasp -> lift, fingers held closed.
+        HOLD   : hold lift pose, fingers closed.
         """
-        t = self.sim_time - self.phase_t0
-        if self.phase == PHASE_APPROACH and t > 1.0:
-            self.phase = PHASE_SQUEEZE
-            self.phase_t0 = self.sim_time
-            q = self.control.joint_target_pos.numpy().copy()
-            q[7:9] = [FINGER_CLOSED, FINGER_CLOSED]
-            self.control.joint_target_pos.assign(q)
-        elif self.phase == PHASE_SQUEEZE and t > 1.0:
-            self.phase = PHASE_LIFT
-            self.phase_t0 = self.sim_time
-            # Retract the elbow joint (joint 3 in 0-indexed arm DOFs) by +0.3 rad
-            # to raise the hand while keeping the wrist orientation stable.
-            q = self.control.joint_target_pos.numpy().copy()
-            q[3] += 0.3
-            self.control.joint_target_pos.assign(q)
-        elif self.phase == PHASE_LIFT and t > 2.0:
-            self.phase = PHASE_HOLD
-            self.phase_t0 = self.sim_time
+        if t < self.settle_t:
+            return "settle", self.q_grasp, FINGER_OPEN
+        t -= self.settle_t
+        if t < self.grasp_t:
+            w = _smoothstep(t / self.grasp_t)
+            finger = FINGER_OPEN + w * (self.finger_closed - FINGER_OPEN)
+            return "grasp", self.q_grasp, finger
+        t -= self.grasp_t
+        if t < self.lift_t:
+            w = _smoothstep(t / self.lift_t)
+            return "lift", self.q_grasp + w * (self.q_lift - self.q_grasp), self.finger_closed
+        return "hold", self.q_lift, self.finger_closed
+
+    def _apply_targets(self):
+        phase, q_arm, finger = self._phase_targets(self.sim_time)
+        self._phase = phase
+        target = self.control.joint_target_pos.numpy()
+        target[:7] = q_arm
+        target[7:9] = finger
+        self.control.joint_target_pos.assign(
+            wp.array(target, dtype=wp.float32,
+                     device=self.control.joint_target_pos.device))
 
     def simulate(self):
+        self._apply_targets()
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
@@ -364,54 +695,69 @@ class Example:
             self.solver.step(self.state_0, self.state_1,
                              self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
-        self._advance_phase()
 
     def step(self):
         self.simulate()
         self.sim_time += self.frame_dt
+        self._record()
 
-    def test_final(self):
-        """Verify the cube was lifted above the table surface and the
-        whole grasp pipeline stayed numerically stable.
+    # ----- Telemetry ---------------------------------------------------
+    def _record(self):
+        pq = self.state_0.particle_q.numpy()
+        q = pq[self._obj_idx]
+        v = self.state_0.particle_qd.numpy()[self._obj_idx]
+        obj = q.mean(axis=0)
+        # Track the settled centroid height during SETTLE so the lift check
+        # is anchored to where the object actually came to rest.
+        if self._phase == "settle":
+            self._obj_z_settled = float(obj[2])
+        v_max = float(np.linalg.norm(v, axis=1).max())
+        bq = self.state_0.body_q.numpy()
+        hand_z = float(bq[self.hand_idx, 2])
+        # Capture the actual (PD-drooped) hand height while holding the grasp
+        # pose, so the lift comparison uses the real grasp baseline.
+        if self._phase == "settle":
+            self._hand_z_grasp = hand_z
+        # Finger closure from the finger BODY poses (joint_q is NOT updated
+        # by the position-based solver, so it would read stale).
+        finger_sep = float(np.linalg.norm(
+            bq[self.lf_idx, :3] - bq[self.rf_idx, :3]))
+        # Closest fingertip-sphere <-> object-sphere surface gap (negative =
+        # interpenetrating, so CSLC should be active).
+        lat = pq[self._lat_pidx]
+        lr = self._part_r[self._lat_pidx][:, None]
+        orr = self._part_r[self._obj_idx][None, :]
+        d = np.linalg.norm(lat[:, None, :] - q[None, :, :], axis=2) - lr - orr
+        min_gap = float(d.min())
 
-        Reads mean Z of all cube particles. The cube rests at Z ~ 0.05 m
-        before grasping; a successful lift must reach > 0.02 m (in case
-        the cube settles on the ground) and not be ejected (< 1.5 m).
-        Full grasp validation requires CUDA (Warp tile-reduce limitation).
-        """
-        # model.particle_groups[i] may be a wp.array; .numpy() and then
-        # list() to get a plain Python iterable (wp.array does not
-        # support Python item indexing or iteration).
-        cube_idx = self.model.particle_groups[self.cube_group]
-        if hasattr(cube_idx, "numpy"):
-            cube_idx = cube_idx.numpy()
-        cube_idx_arr = np.asarray(list(cube_idx), dtype=np.int32)
+        delta_max = delta_mean = 0.0
+        n_active = 0
+        if self.model.lattice_sphere_count > 0:
+            ld = self.model.lattice_delta.numpy()
+            mag = np.linalg.norm(ld, axis=1)
+            delta_max = float(mag.max())
+            delta_mean = float(mag.mean())
+            n_active = int((mag > 1.0e-6).sum())
+        self._peak_delta = max(self._peak_delta, delta_max)
+        self._peak_n_active = max(self._peak_n_active, n_active)
 
-        cube_q = self.state_0.particle_q.numpy()[cube_idx_arr]
-        cube_v = self.state_0.particle_qd.numpy()[cube_idx_arr]
-
-        # 1. Numerical sanity — must hold before any height assertion.
-        assert np.isfinite(cube_q).all(), "NaN/Inf in cube particle positions"
-        assert np.isfinite(cube_v).all(), "NaN/Inf in cube particle velocities"
-
-        # 2. Lift / ejection bound.
-        cube_z = float(np.mean(cube_q[:, 2]))
-        if cube_z < 0.02:
-            raise RuntimeError(f"Cube not lifted; z={cube_z:.4f}")
-        if cube_z > 1.5:
-            raise RuntimeError(f"Cube ejected; z={cube_z:.4f}")
-
-        # 3. Cube hasn't shot off horizontally (stays within a 1 m radius
-        #    of its spawn).
-        com_xy = cube_q[:, :2].mean(axis=0)
-        assert float(np.linalg.norm(com_xy - np.array([0.55, 0.0]))) < 1.0, (
-            f"Cube drifted out of workspace: com_xy={com_xy}"
-        )
-
-        # 4. No catastrophic velocity (the grasp + lift should not impart
-        #    > a few m/s; >10 m/s indicates contact-PBF instability).
-        v_max = float(np.linalg.norm(cube_v, axis=1).max())
-        assert v_max < 5.0, f"Cube particle moving too fast: v_max={v_max:.3f} m/s"
+        frame = int(round(self.sim_time * self.fps))
+        row = {
+            "frame": frame, "t": self.sim_time, "phase": self._phase,
+            "obj_x": float(obj[0]), "obj_y": float(obj[1]),
+            "obj_z": float(obj[2]), "obj_v_max": v_max, "hand_z": hand_z,
+            "finger_sep": finger_sep, "min_gap": min_gap,
+            "n_active": n_active, "delta_max": delta_max,
+            "delta_mean": delta_mean,
+        }
+        self.history.append(row)
+        if frame < 5 or frame % 20 == 0:
+            print(f"[f={frame:03d} t={self.sim_time:4.2f} {self._phase:>6s}] "
+                  f"obj=({obj[0]:+.3f},{obj[1]:+.3f},{obj[2]:+.3f}) "
+                  f"hand_z={hand_z:+.3f} fsep={finger_sep*1e3:5.1f}mm "
+                  f"min_gap={min_gap*1e3:+6.1f}mm |v|={v_max:4.2f} "
+                  f"delta_max={delta_max*1e3:6.3f}mm "
+                  f"n_act={n_active}/{self.model.lattice_sphere_count}")
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
@@ -419,7 +765,71 @@ class Example:
         self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
 
+    # ----- Verification ------------------------------------------------
+    def test_final(self):
+        """Verify the full pipeline: IK reached the object, the fingertip
+        CSLC skin compressed around it, and the column was lifted clear of
+        the ground and held without slipping out or blowing up."""
+        obj_q = self.state_0.particle_q.numpy()[self._obj_idx]
+        obj_v = self.state_0.particle_qd.numpy()[self._obj_idx]
+        assert np.isfinite(obj_q).all(), "NaN/Inf in object positions"
+        assert np.isfinite(obj_v).all(), "NaN/Inf in object velocities"
+
+        # 1. IK reached the targets (sub-mm hand pose error).
+        assert self._ik_max_err < 1.0e-3, (
+            f"IK did not reach the grasp poses: max err={self._ik_max_err*1e3:.2f} mm")
+
+        obj_z = float(obj_q[:, 2].mean())
+        hand_z = float(self.state_0.body_q.numpy()[self.hand_idx, 2])
+
+        # 2. Cylinder was lifted clear of the ground (centroid rose well
+        #    above its settled height) and not ejected.
+        if obj_z < self._obj_z_settled + 0.04:
+            raise RuntimeError(
+                f"Object not lifted: obj_z={obj_z:.4f} "
+                f"(settled~{self._obj_z_settled:.4f})")
+        if obj_z > 0.6:
+            raise RuntimeError(f"Object ejected: obj_z={obj_z:.4f}")
+
+        # 3. Object stayed in the grip during the lift. The check is
+        #    DIRECTIONAL: the failure mode is the object LAGGING the hand --
+        #    i.e. rising less than the hand because it slipped down/out of
+        #    the pads (the rigid --no-compliant baseline drops the column
+        #    entirely). Seating the OTHER way -- the object climbing a few cm
+        #    UP into the grip as the compliant pads draw it in during the
+        #    lift -- is benign (it ends firmly held), so we do not penalise
+        #    obj_rise > hand_rise beyond a generous sanity bound that still
+        #    catches the object being flung.
+        hand_rise = hand_z - self._hand_z_grasp
+        obj_rise = obj_z - self._obj_z_settled
+        assert hand_rise - obj_rise < 0.05, (
+            f"Object lagged/slipped out of the grip: hand_rise={hand_rise*1e3:.1f} mm "
+            f"obj_rise={obj_rise*1e3:.1f} mm (object rose far less than the hand)")
+        assert obj_rise - hand_rise < 0.10, (
+            f"Object climbed implausibly far in the grip (possible fling): "
+            f"hand_rise={hand_rise*1e3:.1f} mm obj_rise={obj_rise*1e3:.1f} mm")
+
+        # 4. The fingertip CSLC skin actually deformed (only when compliant).
+        if self.use_cslc:
+            assert self._peak_n_active > 0, "No fingertip lattice spheres ever engaged"
+            assert self._peak_delta > 5.0e-5, (
+                f"Fingertip compliance never engaged: "
+                f"peak delta={self._peak_delta*1e3:.4f} mm (<0.05 mm)")
+
+        # 5. No catastrophic velocity.
+        v_max = float(np.linalg.norm(obj_v, axis=1).max())
+        assert v_max < 5.0, f"Object moving too fast: v_max={v_max:.3f} m/s"
+
+    @staticmethod
+    def create_parser():
+        parser = newton.examples.create_parser()
+        parser.add_argument(
+            "--no-compliant", action="store_true",
+            help=("Disable the CSLC compliant fingertip lattice and run the "
+                  "rigid-lattice baseline, for A/B comparison of the grip."))
+        return parser
+
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+    viewer, args = newton.examples.init(Example.create_parser())
     newton.examples.run(Example(viewer, args), args)

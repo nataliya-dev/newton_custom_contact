@@ -1,49 +1,48 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""v2 contract target abstraction and concrete samplers.
+"""Contact-target abstraction and concrete samplers.
 
-Per ``cslc_main/theory/contract_v2.md`` §7, a contact target is
-**any** surface sampled as a discrete set of points carrying:
+A CSLC contact target is **any** surface sampled as a discrete set of
+points carrying:
 
-  * ``positions``  ∈ ℝ^(M×3) — sample positions [m] in world frame
+  * ``positions``  ∈ ℝ^(M×3) — sample positions [m]
   * ``normals``    ∈ ℝ^(M×3) — outward unit face normals at each sample
   * ``areas``      ∈ ℝ^M     — per-sample Voronoi area on the surface [m²]
 
-No ``radii`` field — the v1 sphere-vs-sphere overlap form is gone.
+Pad sphere ``i`` couples to target sample ``j`` via the signed half-space
+overlap (theory.md §3.2)::
+
+    raw_ij  =  r_i − n_face_j · (q_i − t_j)
+
+with no per-sample radius — the radius is carried by the pad spheres.
 
 This module provides:
 
-  :class:`PointSetTargetV2`
-      The v2 dataclass.  The ``V2`` suffix is temporary; Phase 7 of the
-      contract_v2 rewrite deletes the legacy
-      :class:`cslc_main.theory.cslc_theory.PointSetTarget` (sphere-vs-
-      sphere form with radii) and renames this class to drop the suffix.
+  :class:`PointSetTarget`
+      The target dataclass.
 
   :func:`make_flat_face_target`
-      A regular grid on a flat face.  Default test fixture for T-F, T-G,
-      and the bridge scenes that need a flat target.
+      Regular grid on a flat face.
 
   :func:`make_sphere_target`
       Fibonacci-spiral surface sampling of a rigid sphere.  Each sample
-      carries the radial outward normal; areas are uniform = 4πR²/M.
-      Per contract §7.2 the half-space approximation degrades smoothly
-      off-axis with error O(r_pad²/R) — fit-for-purpose at R ≫ r_pad.
+      carries the radial outward normal; areas are uniform ``4πR²/M``.
+      The half-space approximation degrades smoothly off-axis with
+      error ``O(r_pad²/R)`` per active pair, fit-for-purpose at
+      ``R ≫ r_pad``.
 
   :func:`make_box_target`
       Per-face area-weighted random sampling of an axis-aligned box.
       Each sample carries its face's outward normal; areas are uniform
-      total_surface_area / M.  Drop-in v2 replacement for the legacy
-      :func:`cslc_main.theory.cslc_box.make_box_target` (which carries
-      a non-zero ``radii`` field).
+      ``total_surface_area / M``.
 
   :func:`make_mesh_target`
       Area-weighted random surface sampling of a generic trimesh, with
       per-sample face normals.
 
 All samplers are deterministic via ``seed``.  ``trimesh`` is imported
-lazily inside the functions that need it so importing this module from
-a CI lane without the ``importers`` extra succeeds.
+lazily so this module imports without it.
 """
 
 from __future__ import annotations
@@ -54,7 +53,7 @@ import numpy as np
 
 
 __all__ = [
-    "PointSetTargetV2",
+    "PointSetTarget",
     "make_flat_face_target",
     "make_sphere_target",
     "make_box_target",
@@ -63,40 +62,35 @@ __all__ = [
 
 
 # ─────────────────────────────────────────────────────────────────────────
-#  v2 target dataclass
+#  Target dataclass
 # ─────────────────────────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
-class PointSetTargetV2:
-    """v2 contact target: discrete surface samples with face normals.
+class PointSetTarget:
+    """Contact target: discrete surface samples with face normals.
 
-    Per ``contract_v2.md`` §7.  A pad sphere ``i`` contacts every active
-    sample ``j`` via the half-space overlap
+    A pad sphere ``i`` contacts every active sample ``j`` via the
+    half-space overlap (theory.md §3.2)::
 
-        raw_ij  =  r_i - n_face_j · (q_i - t_j)
+        raw_ij  =  r_i − n_face_j · (q_i − t_j)
 
-    where ``r_i`` is the pad sphere radius and the target's contribution
-    is just ``(t_j, n_face_j, A_j)`` — no per-sample radius.
+    where ``r_i`` is the pad sphere radius and the target carries
+    ``(t_j, n_face_j, A_j)`` per sample — no per-sample radius.
 
     Attributes:
-        positions: (M, 3) sample positions in world (or body-local)
-            frame [m].
+        positions: (M, 3) sample positions [m].
         normals: (M, 3) outward unit face normals at each sample.
         areas: (M,) per-sample Voronoi area on the underlying surface
-            [m²].  Defaults to uniform ones (``np.ones(M)``) — pass real
-            areas to make the discrete sum approximate the surface
-            integral of contact pressure.  See contract §5 (eq:F-contact-i).
+            [m²].  If None, treated as uniform ones by callers — pass
+            real areas to make the discrete sum approximate the surface
+            integral of contact pressure (theory.md eq:F-contact-i).
 
     Construction-time validation:
         * positions, normals must be 2-D arrays of shape (M, 3).
         * normals must be unit (within 1e-6 tolerance per sample).
-        * areas, if supplied, must be 1-D of length M.
-
-    Class invariant: there is no ``radii`` field.  Mistakes that pass
-    one through a kwarg will TypeError immediately.  Legacy code that
-    constructs the v1 :class:`cslc_main.theory.cslc_theory.PointSetTarget`
-    (with radii) is unchanged.
+        * areas, if supplied, must be 1-D of length M with all entries
+          strictly positive.
     """
 
     positions: np.ndarray
@@ -130,10 +124,7 @@ class PointSetTargetV2:
         return int(self.positions.shape[0])
 
     def areas_or_ones(self) -> np.ndarray:
-        """Return ``areas`` or a (M,) array of ones if not supplied.
-
-        Convenience for solvers that always want a concrete area array.
-        """
+        """Return ``areas`` or an (M,) array of ones if not supplied."""
         if self.areas is None:
             return np.ones(self.M, dtype=np.float64)
         return np.asarray(self.areas, dtype=np.float64)
@@ -150,32 +141,30 @@ def make_flat_face_target(
     span_u: float,
     span_v: float,
     pitch: float,
-) -> PointSetTargetV2:
+) -> PointSetTarget:
     """Sample a flat rectangular face with a regular grid.
 
-    The face passes through ``centre`` with outward normal ``normal``
-    (must be unit).  Two in-plane orthonormal axes ``u``, ``v`` are
-    chosen automatically: ``u`` is whichever of (+x, +y) is more
-    perpendicular to ``normal``, projected to the face plane and
-    normalised; ``v = normal × u``.
+    The face passes through ``centre`` with outward unit normal
+    ``normal``.  Two in-plane orthonormal axes ``u``, ``v`` are chosen
+    automatically: ``u`` is whichever of (+x, +y) is more perpendicular
+    to ``normal``, projected to the face plane and normalised;
+    ``v = normal × u``.
 
     Samples populate a regular grid of ``ceil(span/pitch) + 1`` points
-    along each axis, centred on ``centre``.  Each sample has the same
-    area ``pitch²`` (interior grid step), or — if you'd rather treat the
-    face as exactly area ``span_u · span_v`` — pass an equivalent
-    ``pitch`` and ignore boundary effects.
+    along each axis, centred on ``centre``.  Each sample carries area
+    ``(span_u · span_v) / M``.
 
     Args:
-        centre: (3,) world-frame face centre [m].
+        centre: (3,) face centre [m].
         normal: (3,) outward unit face normal.
         span_u: face extent along u-axis [m].
         span_v: face extent along v-axis [m].
         pitch: target sample spacing [m].  Choose pitch ≲ r_pad so the
-            tangential locality kernel (width 3·r_pad) sees several
+            tangential locality kernel (width r_pad) sees several
             samples per pad sphere.
 
     Returns:
-        PointSetTargetV2 with M = (N_u × N_v) samples, all carrying the
+        ``PointSetTarget`` with M = N_u × N_v samples, all carrying the
         same face normal.
     """
     centre = np.asarray(centre, dtype=np.float64)
@@ -191,8 +180,8 @@ def make_flat_face_target(
         raise ValueError(
             f"span_u, span_v, pitch must be > 0; got {span_u}, {span_v}, {pitch}")
 
-    # Pick an in-plane u-axis.  Use whichever cardinal axis is least
-    # parallel to normal to avoid a degenerate cross product.
+    # Pick an in-plane u-axis least parallel to ``normal`` to avoid a
+    # degenerate cross product.
     x_hat = np.array([1.0, 0.0, 0.0])
     y_hat = np.array([0.0, 1.0, 0.0])
     seed = x_hat if abs(np.dot(normal, y_hat)) > abs(np.dot(normal, x_hat)) else y_hat
@@ -201,7 +190,6 @@ def make_flat_face_target(
     v = np.cross(normal, u)
     v /= np.linalg.norm(v)
 
-    # Grid count.  Aim for spacing close to pitch.
     n_u = max(2, int(np.ceil(span_u / pitch)) + 1)
     n_v = max(2, int(np.ceil(span_v / pitch)) + 1)
     u_grid = np.linspace(-span_u / 2.0, span_u / 2.0, n_u)
@@ -212,10 +200,9 @@ def make_flat_face_target(
                  + vv[:, :, None] * v[None, None, :]).reshape(-1, 3)
     M = positions.shape[0]
     normals = np.broadcast_to(normal, (M, 3)).copy()
-    # Area: face_area / M  (per-sample Voronoi at uniform sampling).
     total_area = span_u * span_v
     areas = np.full(M, total_area / M, dtype=np.float64)
-    return PointSetTargetV2(positions=positions, normals=normals, areas=areas)
+    return PointSetTarget(positions=positions, normals=normals, areas=areas)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -227,27 +214,17 @@ def make_sphere_target(
     t: np.ndarray,
     R: float,
     n_samples: int,
-) -> PointSetTargetV2:
+) -> PointSetTarget:
     """Sample a sphere surface deterministically via the Fibonacci spiral.
 
     Samples are quasi-uniformly distributed on the sphere of radius
     ``R`` centred at ``t``.  Each sample's normal is the radial outward
-    direction at the sample.  Each sample carries the same area
-    ``4πR² / n_samples`` (uniform-area Fibonacci spiral).
-
-    This is the v2 way to represent a "sphere target": sample its
-    surface as a point cloud with radial normals, then let the unified
-    half-space contact path consume it like any other ``PointSetTargetV2``.
-    Per contract §7.2 the half-space approximation gives error
-    O(r_pad²/R) per active pair, fit-for-purpose at R ≫ r_pad.
+    direction; each sample carries the same area ``4πR² / n_samples``.
 
     Args:
         t: (3,) sphere centre [m].
         R: sphere radius [m] (> 0).
         n_samples: number of surface samples (≥ 4).
-
-    Returns:
-        PointSetTargetV2 with M = n_samples points on the sphere.
     """
     t = np.asarray(t, dtype=np.float64)
     if t.shape != (3,):
@@ -257,10 +234,8 @@ def make_sphere_target(
     if n_samples < 4:
         raise ValueError(f"n_samples ≥ 4 required, got {n_samples}")
 
-    # Fibonacci spiral on the unit sphere (uniform area per sample).
-    # z_i ∈ [-1+1/N, +1-1/N] centre-of-cell; phi via the golden angle.
     indices = np.arange(n_samples, dtype=np.float64)
-    z = 1.0 - 2.0 * (indices + 0.5) / n_samples         # (-1, +1) centres
+    z = 1.0 - 2.0 * (indices + 0.5) / n_samples         # (-1, +1) cell centres
     r_xy = np.sqrt(np.maximum(1.0 - z * z, 0.0))
     golden_angle = float(np.pi * (3.0 - np.sqrt(5.0)))
     phi = indices * golden_angle
@@ -271,11 +246,11 @@ def make_sphere_target(
     normals = unit                                        # radial outward
     total_area = 4.0 * np.pi * R * R
     areas = np.full(n_samples, total_area / n_samples, dtype=np.float64)
-    return PointSetTargetV2(positions=positions, normals=normals, areas=areas)
+    return PointSetTarget(positions=positions, normals=normals, areas=areas)
 
 
 # ─────────────────────────────────────────────────────────────────────────
-#  Sampler 3: axis-aligned box surface (v2, drops legacy radii field)
+#  Sampler 3: axis-aligned box surface
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -285,32 +260,22 @@ def make_box_target(
     *,
     center: np.ndarray | None = None,
     seed: int = 0,
-) -> PointSetTargetV2:
-    """Sample an axis-aligned box surface via trimesh.
-
-    Drop-in v2 replacement for :func:`cslc_main.theory.cslc_box.make_box_target`.
-    Differences from the legacy form:
-
-      * No ``radius_factor`` argument.  The v1 form synthesised a per-
-        sample radius ``R_j = radius_factor · mean_spacing`` so the
-        sphere-vs-sphere overlap had something to subtract; v2 drops
-        ``R`` entirely.
-      * Returns :class:`PointSetTargetV2`, not the legacy
-        :class:`cslc_main.theory.cslc_theory.PointSetTarget`.
+) -> PointSetTarget:
+    """Sample an axis-aligned box surface area-weighted via trimesh.
 
     Args:
         extents: (W, H, D) box side lengths [m].  Box is axis-aligned.
-        n_samples: target number of surface points (area-weighted across
+        n_samples: number of surface points (area-weighted across
             the six faces).
-        center: (3,) world-frame box centre [m].  Default origin.
+        center: (3,) box centre [m].  Default origin.
         seed: numpy RNG seed for trimesh's area-weighted sampler.
 
     Returns:
-        PointSetTargetV2 with ``n_samples`` points; normal at each
+        ``PointSetTarget`` with ``n_samples`` points; normal at each
         sample is the source face's outward normal; area per sample is
         ``total_surface_area / n_samples``.
     """
-    import trimesh  # lazy import — matches cslc_box.py convention.
+    import trimesh
 
     if n_samples < 1:
         raise ValueError(f"n_samples ≥ 1 required, got {n_samples}")
@@ -333,7 +298,7 @@ def make_box_target(
     total_area = float(mesh.area)
     areas = np.full(int(n_samples), total_area / float(n_samples),
                     dtype=np.float64)
-    return PointSetTargetV2(positions=positions, normals=normals, areas=areas)
+    return PointSetTarget(positions=positions, normals=normals, areas=areas)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -346,22 +311,19 @@ def make_mesh_target(
     n_samples: int,
     *,
     seed: int = 0,
-) -> PointSetTargetV2:
+) -> PointSetTarget:
     """Sample a generic trimesh surface area-weighted.
 
     Per-sample normal is the source face's outward normal.  Area per
     sample is ``mesh.area / n_samples`` (uniform-density approximation;
-    a Voronoi area would be tighter but is a separate computation).
+    a true Voronoi area is a separate computation).
 
     Args:
         mesh: a ``trimesh.Trimesh`` instance.
         n_samples: number of surface samples.
         seed: numpy RNG seed for trimesh's sampler.
-
-    Returns:
-        PointSetTargetV2 with M = n_samples samples.
     """
-    import trimesh  # noqa: F401  (imported for the type, used by mesh API)
+    import trimesh  # noqa: F401
 
     if n_samples < 1:
         raise ValueError(f"n_samples ≥ 1 required, got {n_samples}")
@@ -370,8 +332,6 @@ def make_mesh_target(
         if hasattr(mesh, "sample") else \
         __import__("trimesh").sample.sample_surface(
             mesh, count=int(n_samples), seed=int(seed))
-    # ``trimesh.sample.sample_surface`` returns (samples, face_indices);
-    # mesh.sample returns the same with return_index=True.
     positions = np.asarray(positions, dtype=np.float64)
     face_index = np.asarray(face_index, dtype=np.int64)
     face_normals = np.asarray(mesh.face_normals, dtype=np.float64)
@@ -379,4 +339,4 @@ def make_mesh_target(
     total_area = float(mesh.area)
     areas = np.full(int(n_samples), total_area / float(n_samples),
                     dtype=np.float64)
-    return PointSetTargetV2(positions=positions, normals=normals, areas=areas)
+    return PointSetTarget(positions=positions, normals=normals, areas=areas)

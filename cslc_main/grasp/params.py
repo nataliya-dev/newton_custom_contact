@@ -29,6 +29,7 @@ from pathlib import Path
 # Repository root: cslc_main/grasp/params.py → ../..  is the repo root.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _DEFAULT_DOME_OBJ = _REPO_ROOT / "assets" / "pad" / "pad.obj"
+_DEFAULT_BUNNY_OBJ = _REPO_ROOT / "assets" / "bunny" / "bunny.obj"
 _DEFAULT_OUTPUT_ROOT = _REPO_ROOT / "outputs" / "grasp"
 
 
@@ -62,31 +63,7 @@ class ObjectParams:
     # target sample inside its contact kernel; without that, the
     # alignment+gate+w_tangent hard-culls in jacobi_step yield ZERO
     # active samples and the apex registers no contact force at all.
-    #
-    # Calibration trace: with the Phase 6 w_tangent hard-cull in
-    # jacobi_step (cslc_kernels.py line ~702), the dome pad has
-    # r_pad ≈ 1.4 mm, so target samples > ~1.4 mm tangentially are
-    # culled.  At N=100, mean sphere-sample spacing ≈ 12 mm, so most
-    # apex pad spheres saw NO active samples → the lattice barely
-    # deformed → ball slipped out.  At N=300, spacing ≈ 7 mm and
-    # apex pad spheres reliably see 1-2 active samples → ~1 mm
-    # compression at the apex, ball held cleanly (final_z within
-    # 6 mm of pad target, xy slip < 7 mm vs ~14 mm at N=100).
-    #
-    # Before Phase 6 the w_tangent smoothing-tail accidentally
-    # contributed (often huge) phantom force from samples on the
-    # far side of the ball, so N=100 "worked" by accident -- the
-    # phantom force replaced the missing real contact.  Densifying
-    # didn't help then because the apex still saw few REAL contacts;
-    # the phantom forces dominated and weren't sensitive to N.
-    # With Phase 6 the apex needs real samples in its kernel, so
-    # N=300 is now the production-equivalent default.
-    #
-    # N is the dominant axis of per-step cost on dome grasps
-    # (cost = O(N_pad · N) per Jacobi iter).  Drop to N=100 for
-    # box-pad-only scenes if iteration speed is critical, or raise to
-    # N=500 if you need finer ``F = ∫ kc·phi·n dA`` integration
-    # accuracy at the cost of ~3× per-step cost vs N=300.
+
     sphere_n_samples: int = 300
 
     # Box half-extents [m] in body-local frame.  Default 33.5 mm
@@ -106,10 +83,8 @@ class ObjectParams:
 
     # Target-point pitch [m] on each box face.  Default 5 mm gives
     # ~169 samples per 67 mm face, ~338 total across the two approach
-    # faces (the +y/-y/+z/-z faces are physically unreachable to the
-    # ±x pads and are not sampled; see ``_BOX_APPROACH_FACES`` in
-    # ``contact_models.py``).
-    #
+    # faces
+
     # Pitch must be ≤ the pad sphere's tangential-locality kernel
     # half-width ``3·r_pad`` (default r_pad ≈ 2.8 mm → kernel half-
     # width ≈ 8.5 mm) so every active pad sphere sees at least one
@@ -118,6 +93,23 @@ class ObjectParams:
     # meaningful change in contact-patch resolution; above ~8 mm
     # pitch the locality kernel starts missing samples.
     box_face_pitch: float = 0.005
+
+    # ── Bunny mesh object (kind="bunny") ──
+    # Stanford-bunny demo object.  Loaded from an OBJ, scaled so its
+    # vertical (Z) extent equals ``bunny_height``, and centred at its
+    # bounding-box centre so the body origin sits at the geometric
+    # centre (same convention as sphere/box).  The CSLC contact path
+    # samples its surface into a point-set via Lloyd/CVT (see
+    # :func:`cslc_main.grasp.objects.make_mesh_target`), exactly like the
+    # pad contact face.
+    bunny_obj: Path = _DEFAULT_BUNNY_OBJ
+    # Upright height [m] the bunny is scaled to (Z extent).  100 mm by
+    # default — comparable bulk to the 67 mm tennis ball / cube.
+    bunny_height: float = 0.10
+    # Lloyd surface-sample count for the CSLC target.  0 → auto: match
+    # the sphere's surface point density (samples / m²) so the spacing
+    # reads consistently across object kinds.
+    bunny_n_samples: int = 0
 
     # Material density [kg/m³].  368 → tennis-ball mass at r=33.5 mm.
     density: float = 368.0
@@ -136,6 +128,15 @@ class ObjectParams:
     # centre-of-pad spawn.
     spawn_y_offset: float = 0.0
 
+    def _bunny_trimesh(self):
+        """The scaled, centred bunny mesh (cached).
+
+        Lazy import of :mod:`cslc_main.grasp.objects` avoids a circular
+        import at module load (``objects`` imports this module).
+        """
+        from . import objects
+        return objects.make_bunny_trimesh(self)
+
     @property
     def mass(self) -> float:
         """Mass [kg], derived from density × volume for the active kind."""
@@ -144,6 +145,9 @@ class ObjectParams:
         if self.kind == "box":
             hx, hy, hz = self.box_half_extents
             return self.density * (2.0 * hx) * (2.0 * hy) * (2.0 * hz)
+        if self.kind == "bunny":
+            # abs(): a non-watertight OBJ can report signed volume.
+            return self.density * abs(float(self._bunny_trimesh().volume))
         raise ValueError(f"Unknown object kind: {self.kind!r}")
 
     @property
@@ -159,6 +163,11 @@ class ObjectParams:
             return self.radius
         if self.kind == "box":
             return self.box_half_extents[0]
+        if self.kind == "bunny":
+            # Width at the grasp height (central band), NOT the global max
+            # X-extent — see objects.bunny_grasp_half_width for why.
+            from . import objects
+            return objects.bunny_grasp_half_width(self)
         raise ValueError(f"Unknown object kind: {self.kind!r}")
 
     @property
@@ -174,6 +183,10 @@ class ObjectParams:
             return self.radius
         if self.kind == "box":
             return self.box_half_extents[2]
+        if self.kind == "bunny":
+            # COM-centred mesh: the body origin (= centre of mass) rests
+            # this far above the ground, i.e. the COM-to-base distance.
+            return -float(self._bunny_trimesh().bounds[0][2])
         raise ValueError(f"Unknown object kind: {self.kind!r}")
 
     @property
@@ -201,22 +214,11 @@ class PadParams:
 
     # "box" (default, flat pads), "dome" (curved pad from a pre-baked
     # OBJ asset), or "dome_param" (curved pad generated in-code from
-    # ``dome_param_R_pad`` and ``dome_param_half_angle`` -- mirrors the
-    # ``make_dome`` math in ``cslc_main.theory.cslc_lattice`` so the
-    # grasp pad shape and the theory dome lattice share their geometry).
+    # ``dome_param_R_pad`` and ``dome_param_half_angle`` parameters)
     kind: str = "box"
 
     # Box pad half-extents [m] (only used when kind="box").  Defaults:
-    # 16 mm thick × 40 mm wide × 40 mm tall.  ``box_hz`` was previously
-    # 40 mm (= 80 mm tall) so the pad face fully spanned the
-    # tennis-ball vertically.  That created a LIFT-phase artifact: pad
-    # lattice spheres beyond the ball's vertical extent participate
-    # in the contact set, and as the pad translates upward those
-    # asymmetric off-equator spheres drive the ball UP much faster
-    # than the pad itself (sphere flew to z = 8 cm with pads at 5.4 cm
-    # commanded).  Shrinking to 40 mm tall (matches box_hy for a
-    # square contact face) reduces the fly-up overshoot from ~5 cm to
-    # ~1 cm while preserving grip stability.
+    # 16 mm thick × 40 mm wide × 40 mm tall.
     box_hx: float = 0.008
     box_hy: float = 0.020
     box_hz: float = 0.020
@@ -230,12 +232,6 @@ class PadParams:
     dome_nz_threshold: float = 0.3
 
     # Parametric-dome geometry (only used when kind="dome_param").
-    # Defaults reproduce the shipped ``assets/pad/pad.obj`` to within
-    # mesh resolution: R_pad = 10 mm, half_angle = 72 deg, 3 mm back.
-    # Sweep these for the Step-11 dome-geometry experiment in
-    # ``cslc_main/theory/notes.md``.  The math matches
-    # ``cslc_main.theory.cslc_lattice.make_dome`` so the grasp pad and
-    # the theory lattice share their cap.
     dome_param_R_pad: float = 0.010
     dome_param_half_angle: float = 72.0 * math.pi / 180.0
     dome_param_back_height: float = 0.003
@@ -259,7 +255,17 @@ class PadParams:
     # Number of Lloyd/CVT samples drawn per pad contact face.  Determines
     # the resolution of the lattice; ``sample_mesh_lloyd`` returns
     # exactly this count.
-    n_samples: int = 50
+    #
+    # Note: 2026-05-27 we tried n_samples=50 thinking fewer pad spheres
+    # would lower CSLC's shelf-dominated force on flat-pad geometries.
+    # It went the OTHER way (F=110→134N on box/box at δ=1mm) because
+    # fewer pad spheres → larger per-sphere locality kernel
+    # (r_pad = spacing/2) → each captures MORE target samples within
+    # its disc.  Total contact pair count dropped but per-contact
+    # force grew faster.  The shelf is target-sample-driven, not pad-
+    # sphere-driven; thinning the pad doesn't thin the shelf.
+    # Reverted to n=100.
+    n_samples: int = 100
 
     # k for the k-NN neighbour graph used to wire each lattice sphere to
     # its lateral-spring neighbours.  6 ≈ Delaunay valency in 2-D, which
@@ -321,11 +327,6 @@ class MaterialParams:
        ``ke_target_physical`` changes BOTH force-per-penetration AND
        solver stability characteristics.
 
-    The legacy ``MaterialParams.ke`` is preserved as a property
-    alias for ``ke_pad_physical`` (silent; no DeprecationWarning).
-    CLI ``--material-ke`` sets BOTH ke fields to the same value so
-    pre-split recipes (dome_curved_flat, C2 day-1 sweep) reproduce
-    bit-identically.
     """
 
     # ── Fields ──
@@ -344,20 +345,15 @@ class MaterialParams:
     # regularization coupling note).
     ke_target_physical: float = 5.0e4
 
-    # Hydroelastic physical-compliance modulus [Pa/m].  Used ONLY when
-    # ``contact_model="hydro"``; setting this under CSLC or point has
-    # NO effect.
-    #
-    # Sweep on tennis-ball lift (pad commanded to z = 54 mm at HOLD):
-    #     5e7  → ball slips out (held=N), 21 mm settle gap below pad
-    #     5.3e8 → held, peak 63 mm, +12 mm jump, 2 mm settle gap
-    # *   5e9  → held, peak 57 mm, +3.3 mm jump, settles within 0.8 mm
-    #             of pad target.  BEST: matches CSLC default
-    #             ``kc_per_volume = 1.5e8`` lift outcome for apples-to-
-    #             apples comparison.  kh/kc ratio ≈ 30 because hydro
-    #             integrates over the smaller Hertz contact disc while
-    #             CSLC integrates over its locality kernel disc.
-    kh: float = 5.0e9
+    # Hydroelastic physical-compliance modulus [Pa/m] split by role,
+    # parallel to the ``ke_pad_physical`` / ``ke_target_physical`` split
+    # above.  Used ONLY when ``contact_model="hydro"``; both fields are
+    # silently ignored under CSLC or point.  Asymmetric setups (soft pad
+    # / rigid object) set the two independently; the legacy single-knob
+    # API (``material.kh = X``) is preserved as a property that writes
+    # both at once (see getter/setter below).
+    kh_pad: float = 5.0e9
+    kh_object: float = 5.0e9
 
     # Hunt-Crossley damping coefficient [N·s/m].  Used by ``point``
     # contact.  Under ``cslc`` the emission kernel writes
@@ -411,6 +407,30 @@ class MaterialParams:
         self.ke_pad_physical = value
         self.ke_target_physical = value
 
+    @property
+    def kh(self) -> float:
+        """Legacy alias for ``kh_pad`` (read-only getter).
+
+        Pre-split code reads ``material.kh``; the split keeps this as
+        a property returning the pad knob so existing call sites
+        (e.g. the ``--kh`` CLI flag, the ``HydroParams`` docstring
+        examples) keep working.  Asymmetric setups should set
+        ``kh_pad`` and ``kh_object`` explicitly.
+        """
+        return self.kh_pad
+
+    @kh.setter
+    def kh(self, value: float) -> None:
+        """Legacy setter -- sets BOTH kh fields to ``value``.
+
+        Mirrors the ``ke`` setter above.  Use for symmetric hydro
+        runs (both bodies share the same hydroelastic modulus); use
+        ``kh_pad`` / ``kh_object`` directly for asymmetric soft-vs-
+        rigid contact studies.
+        """
+        self.kh_pad = value
+        self.kh_object = value
+
 
 # ── CSLC compliant-skin tuning ───────────────────────────────────────────
 
@@ -435,9 +455,7 @@ class CSLCParams:
     picks a representative operating depth δ_op and matches local
     stiffness at that depth (see field comment below).
 
-    Units: ``kc`` has units N / (m² · m^1.5) = Pa · m^(−1/2).  Previous
-    linear-law default 1.5e8 Pa/m no longer applies; new default
-    3e10 Pa·m^(−1/2) verified on tennis-ball lift.
+    Units: ``kc`` has units N / (m² · m^1.5) = Pa · m^(−1/2).
 
     Tune intentionally:
       - ``kc_per_volume`` -- primary contact stiffness, derive from
@@ -456,32 +474,16 @@ class CSLCParams:
     # Per-volume contact stiffness [Pa · m^(−1/2)].  PRIMARY contact knob.
     # Hertz-like force: F = kc · A_j · w_tangent · α · gate · raw^1.5.
     #
-    # Sweep on tennis-ball lift after the Hertz revision (pad commanded
-    # to z = 54 mm at HOLD):
-    #     1e9   → held, peak 58 mm, +7.5 mm jump
-    #     3e9   → held, peak 57 mm, +6.3 mm jump
-    #     5e9   → held, peak 55 mm, +3.8 mm jump
-    #     1e10  → held, peak 55 mm, +4.0 mm jump
-    # *   3e10  → held, peak 56 mm, +2.8 mm jump, settles within 1.4 mm
-    #             of pad target.  BEST: smallest peak-to-final excursion;
-    #             corresponds to a silicone-stiffness pad (E ~ 1e7 Pa)
-    #             at δ_op = 1 mm via kc ≈ (5/3π) E* / (√R · δ_op).
-    #
-    # Material → kc mapping (kc such that local stiffness at δ_op matches
-    # Hertz 2·E*·√(R·δ_op)):
-    #     foam        E=1e5, δ_op=1mm → kc ≈ 3e8
-    #     silicone    E=1e6              → kc ≈ 3e9
-    #     rubber      E=1e7              → kc ≈ 3e10  (DEFAULT)
-    #     hard rubber E=1e8              → kc ≈ 3e11
-    #
-    # Fair comparison against ``contact_model="point"`` / ``"hydro"``:
-    # use this default with MaterialParams.kh = 5e9 (hydro) and
-    # MaterialParams.ke_pad_physical = 5e4 (point) -- the three models
-    # then deliver ``final_z`` within 2 mm of each other and jump
-    # < 4 mm on the tennis-ball test.  Comparison with hydro ``kh``
-    # (units Pa/m) requires picking an operating depth: at δ_op = 1 mm,
-    # ``kh ≈ 1.5 · kc · √δ_op`` for matched local stiffness.
-    kc_per_volume: float = 3.0e10
+    # Rebalanced 2026-05-27 from 3e10 → 1e10 so the default-knob CSLC
+    # force levels at δ=1mm sit in the same regime as hydro across the
+    # geometry matrix (cross-model comparison study).  Previous 3e10
+    # produced 117 N on box-pad × box-object vs hydro's 33 N (3.5×
+    # over) and 7.5 N on dome×sphere vs hydro's 11.7 N (under). At
+    # 1e10 the per-cell ratio CSLC:hydro tightens to ~1.2× across the
+    # matrix.  Production grasp scripts that hard-coded grip
+    # behaviour around the old default may need a CLI override
+    # (``--cslc-kc 3e10``) to recover the old force level.
+    kc_per_volume: float = 1.0e10
 
     # Anchor stiffness [N/m] — pulls each lattice sphere back toward
     # its rest position relative to the pad body.  Threshold knob:
@@ -497,8 +499,6 @@ class CSLCParams:
     # *    1000 → held cleanly, slip ~2.5 mm (BEST for tennis ball)
     #     20000 → lattice over-coupled, can't conform to curvature,
     #             lift truncated (final_z 49 vs 60 mm)
-    # Raise toward ~25000 only if studying Poisson-bulging behaviour;
-    # it costs grip strength.
     kl: float = 1_000.0
 
     # Per-step Jacobi refinement iterations.  Each is one
@@ -563,13 +563,13 @@ class CSLCParams:
     # closed-form linear warm-start before the Jacobi refinement.
     build_A_inv: bool = True
 
-    # B3 — Lattice-level velocity damping coefficient [N·s/m].
+    # Lattice-level velocity damping coefficient [N·s/m].
     # Adds an explicit ``-c_lattice · (δ - δ_prev_step) / dt`` term to
     # each pad sphere's force balance in jacobi_step (alongside anchor,
     # lateral, contact, friction).  Default 0.0 disables the term
     # entirely (multiply by zero); pass ``--cslc-c-lat <value>`` to
     # enable.  Dissipates energy from oscillatory lattice modes BEFORE
-    # the contact emission, complementary to A1's MuJoCo-side damping
+    # the contact emission, complementary to MuJoCo-side damping
     # ``dc`` which acts AFTER emission.
     #
     # Easy-removal: every B3 site is tagged with ``# B3`` -- grep for
@@ -653,16 +653,7 @@ class TimingParams:
     # SQUEEZE: each pad continues inward at this slower speed [m/s] to
     # build a controlled penetration into the object.  Trajectory commands
     # 1 mm of dx beyond the closed approach_gap.
-    #
-    # CAVEAT (2026-05-24, H5 — open): when the target is rigid and the
-    # contact stiffness is high (e.g. point-set kernel, steel-cube Repro B),
-    # the joint actually OVER-TRAVELS the dx setpoint by ~4 mm under load
-    # (measured qd ≈ +25 mm vs target +21 mm) and snaps back to target the
-    # moment contact breaks.  Over-travel is roughly independent of ke,
-    # which rules out PD overshoot — looks like MuJoCo constraint-solver
-    # residual at high contact stiffness.  Apex penetration as seen in the
-    # GL viewer is therefore ~5 mm here, not the commanded 1 mm.  Fix is
-    # deferred to the H5 round.
+
     squeeze_speed: float = 1.0e-3 / 0.5  # 2 mm/s → 1 mm in 0.5 s
     squeeze_duration: float = 0.5
 

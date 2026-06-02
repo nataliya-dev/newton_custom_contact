@@ -269,7 +269,8 @@ def build_scene(config: GraspConfig) -> SceneArtifacts:
 
     obj_body, obj_shape, _j_free = objects.add_object(
         b, config.object, obj_cfg,
-        (0.0, config.object.spawn_y_offset, config.object.start_z)
+        (0.0, config.object.spawn_y_offset, config.object.start_z),
+        sdf_resolution=config.hydro.sdf_resolution,
     )
 
     # Request the per-contact "force" attribute so we can read solver-
@@ -318,7 +319,19 @@ def build_scene(config: GraspConfig) -> SceneArtifacts:
         # is a no-op).  See example_robot_panda_hydro.py.
         from newton import CollisionPipeline
         from newton._src.geometry.sdf_hydroelastic import HydroelasticSDF
-        sdf_cfg = HydroelasticSDF.Config(output_contact_surface=True)
+        # ``buffer_mult_iso=2``: doubles the iso-voxel buffer over the
+        # Newton default.  With matched-soft kh (~1e9 Pa/m) the
+        # contact patch spans more voxels than the default budget
+        # (49k) accommodates and ~20% of contacts get silently dropped
+        # (logged as "iso voxel overflow: 59k > 49k").  Doubling the
+        # budget eats ~30 MB more GPU memory and clears the warnings;
+        # 2× picked because the largest observed overflow ratio was
+        # ~1.2× (60k/49k), so 2× gives safe headroom without bloating
+        # memory.  Bump further if a different scene over-runs.
+        sdf_cfg = HydroelasticSDF.Config(
+            output_contact_surface=True,
+            buffer_mult_iso=2,
+        )
         model._collision_pipeline = CollisionPipeline(
             model, sdf_hydroelastic_config=sdf_cfg,
         )

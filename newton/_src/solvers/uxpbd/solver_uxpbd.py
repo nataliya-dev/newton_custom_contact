@@ -745,11 +745,21 @@ class SolverUXPBD(SolverBase):
                 # Reuse the shared particle-deltas accumulator (perf #2).
                 self._particle_deltas.zero_()
                 pp_particle_deltas = self._particle_deltas
-                # Flag: when CSLC is active, the pp contact kernel skips
-                # the lattice-side body_delta write and the CSLC anchor
-                # reaction kernel below provides the body wrench instead.
-                # See contract_v2 §4-§5 and the kernel docstring.
-                cslc_owns_lattice_wrench = 1 if self.cslc_params is not None else 0
+                # Flag: when CSLC is active AND its
+                # ``enable_lattice_pp_body_wrench`` is False (the
+                # default), the pp contact kernel skips the
+                # lattice-side body_delta write and the CSLC anchor
+                # reaction kernel below provides the body wrench
+                # instead.  Setting ``enable_lattice_pp_body_wrench=
+                # True`` on CSLCParams keeps the pp body wrench in
+                # addition to the anchor reaction (double-counts the
+                # normal direction but recovers the friction-drag
+                # wrench on the body, which the anchor reaction
+                # alone cannot capture).  See contract_v2 §4-§5 and
+                # the CSLCParams docstring.
+                cslc_owns_lattice_wrench = 0
+                if self.cslc_params is not None and not self.cslc_params.enable_lattice_pp_body_wrench:
+                    cslc_owns_lattice_wrench = 1
                 wp.launch(
                     kernel=solve_particle_particle_contacts_uxpbd,
                     dim=model.particle_count,
@@ -1303,6 +1313,14 @@ class SolverUXPBD(SolverBase):
         ka_ratio = float(self.cslc_params.ka_tangent_ratio)
         k_stick = float(self.cslc_params.k_stick)
         mu_friction = float(self.cslc_params.mu_friction)
+        # B3 -- lattice velocity damping rate, pre-divided by dt so the
+        # kernel sees the implicit-Euler coefficient directly.
+        # ``c_lattice = 0`` (default) ⇒ c_over_dt = 0 ⇒ kernel reduces
+        # to pre-B3 form bit-for-bit.  ``lattice_delta_prev`` was
+        # snapshotted from ``lattice_delta`` above (line ~1246), giving
+        # the substep-start reference δ̇ ≈ (δ_new − δ_prev_step) / dt
+        # needs.
+        c_over_dt = float(self.cslc_params.c_lattice) / dt if dt > 0.0 else 0.0
 
         # The Jacobi kernel reads ``lattice_neighbor_*`` for the lateral
         # Laplacian.  Until that topology is populated (Step 2), the
@@ -1344,6 +1362,10 @@ class SolverUXPBD(SolverBase):
                     k_stick,
                     mu_friction,
                     clamp_delta,
+                    # B3 -- lattice velocity damping (no-op when
+                    # CSLCParams.c_lattice = 0).
+                    model.lattice_delta_prev,
+                    c_over_dt,
                 ],
                 device=model.device,
             )

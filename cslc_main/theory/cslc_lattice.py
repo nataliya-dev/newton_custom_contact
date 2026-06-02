@@ -3,21 +3,18 @@
 
 """Multi-sphere lattice extension of ``cslc_main.theory.cslc_theory``.
 
-The single-sphere module covers anchor + contact + friction on ONE
-lattice sphere.  This module adds the **lateral springs** that couple
-a sphere to its neighbours, the lattice-scale quadratic form (the
-lattice stiffness matrix ``K``), and the v2 unified contact solver
-``solve_lattice_contact`` (contract §6).
+Adds the lateral springs that couple a sphere to its neighbours, the
+lattice-scale quadratic form (the lattice stiffness matrix ``K``), and
+the unified contact solver :func:`solve_lattice_contact` for a pad
+:class:`Lattice` against a
+:class:`cslc_main.theory.cslc_targets.PointSetTarget` (theory.md §6).
 
-Lateral law: graph-Laplacian only.
+Lateral law: graph-Laplacian (theory.md §6.2)::
 
-    f_lat(i, j) = -k_l * (delta_i - delta_j)            (paper eq. 9)
+    f_lat(i, j) = −k_l · (δ_i − δ_j)
 
 Isotropic in 3D; equivalent quadratic energy
-``E = (1/2) k_l Σ_edges ||delta_i - delta_j||^2``.  The nonlinear
-distance-preserving lateral was deleted in Phase 5 along with the v1
-sphere-target solver chain (``ContactTarget`` / ``SphereIndenter`` /
-``PointSetIndenter``).
+``E = ½·k_l·Σ_edges ||δ_i − δ_j||²``.
 """
 
 from __future__ import annotations
@@ -44,20 +41,19 @@ class Lattice:
     """A connected lattice of CSLC spheres.
 
     All quantities are body-local (or world; rigid-body transforms
-    preserve them).  No contact target -- this module is the lateral
-    coupling reference; contact is layered on in step 3.
+    preserve them).
 
     Attributes:
-        p: (N, 3) float64 -- rest positions.
-        n: (N, 3) float64 -- rest outward unit normals.
-        edges: (E, 2) int64 -- undirected edge list (i, j) with i < j.
-            We treat each unordered edge once; force assembly handles
-            both endpoints.
-        ka: float -- anchor stiffness [N/m] (isotropic in step 2).
-        kl: float -- lateral stiffness [N/m].
+        p: (N, 3) float64 — rest positions [m].
+        n: (N, 3) float64 — rest outward unit normals.
+        edges: (E, 2) int64 — undirected edge list ``(i, j)`` with
+            ``i < j``.  Each unordered edge appears once; force
+            assembly handles both endpoints.
+        ka: anchor stiffness [N/m].
+        kl: lateral stiffness [N/m].
 
-    The neighbour count of sphere i is the number of edges that contain
-    i; it is computed lazily by ``neighbour_counts``.
+    The neighbour count of sphere ``i`` is the number of edges
+    containing ``i``; computed lazily by :meth:`neighbour_counts`.
     """
 
     p: np.ndarray
@@ -111,7 +107,8 @@ class Lattice:
             d = self.p[j] - self.p[i]
             L = float(np.linalg.norm(d))
             if L < 1e-15:
-                raise ValueError(f"degenerate edge {(int(i), int(j))} with L = 0")
+                raise ValueError(
+                    f"degenerate edge {(int(i), int(j))} with L = 0")
             e[k] = d / L
         return e
 
@@ -128,7 +125,8 @@ def make_chain(N: int, h: float, ka: float, kl: float,
     p = np.zeros((N, 3))
     p[:, 0] = np.arange(N) * h
     n_arr = np.broadcast_to(n, (N, 3)).copy()
-    edges = np.stack([np.arange(N - 1), np.arange(1, N)], axis=1).astype(np.int64)
+    edges = np.stack([np.arange(N - 1), np.arange(1, N)],
+                     axis=1).astype(np.int64)
     return Lattice(p=p, n=n_arr, edges=edges, ka=ka, kl=kl)
 
 
@@ -147,10 +145,7 @@ def make_arc(N: int, R_pad: float, arc_length_spacing: float,
         n_i     = (cos theta_i, sin theta_i, 0)        (radially outward)
 
     Edges connect nearest neighbours along the arc, same topology as
-    a chain.  The IDEAL lateral-coupling story changes vs the chain
-    because rest edges no longer point along a single global axis -- in
-    particular, distance-preserving can produce outward bulging at
-    finite curvature (see test_05_arc_contact step-5 math).
+    :func:`make_chain`.
     """
     if N < 2:
         raise ValueError(f"N must be >= 2, got {N}")
@@ -165,7 +160,84 @@ def make_arc(N: int, R_pad: float, arc_length_spacing: float,
     n_arr = np.stack([np.cos(thetas),
                       np.sin(thetas),
                       np.zeros(N)], axis=1)
-    edges = np.stack([np.arange(N - 1), np.arange(1, N)], axis=1).astype(np.int64)
+    edges = np.stack([np.arange(N - 1), np.arange(1, N)],
+                     axis=1).astype(np.int64)
+    return Lattice(p=p, n=n_arr, edges=edges, ka=ka, kl=kl)
+
+
+def make_flat_grid(
+    n_u: int, n_v: int, spacing: float, ka: float, kl: float,
+    *, normal: np.ndarray | None = None,
+    diagonals: bool = False,
+) -> Lattice:
+    """Build a flat 2D rectangular lattice in the x-y plane.
+
+    Used for visualising and stress-testing the lattice equilibrium on
+    a planar pad (the paper's ``test3_surface_deflection`` configuration
+    and the canonical demo of the lateral-coupling Green's function).
+
+    Sphere positions on a regular ``n_u × n_v`` grid::
+
+        p_{i,j} = (i · spacing − (n_u−1)·spacing/2,
+                   j · spacing − (n_v−1)·spacing/2,
+                   0)
+
+    centred on the origin.  All outward normals share the same direction
+    ``normal`` (default ``+ẑ``).  Edges are 4-connected nearest
+    neighbours along (u, v); pass ``diagonals=True`` to add the two
+    diagonal edges per cell (8-connected).
+
+    Args:
+        n_u, n_v: grid dimensions (number of spheres along each axis).
+            Both ≥ 2.
+        spacing: nearest-neighbour distance [m].  Set ``r_pad = spacing/2``
+            downstream to make the discs of radius r_pad tile the pad
+            face exactly once (theory.md §3.5 tiling identity).
+        ka: anchor stiffness [N/m].
+        kl: lateral stiffness [N/m].
+        normal: shared outward unit normal for every sphere.  Default +z.
+        diagonals: include diagonal edges per cell.  Default False
+            (4-connected); True gives 8-connected which weakly stiffens
+            the lateral response but reduces the angular anisotropy of
+            the Green's function.
+
+    Returns:
+        ``Lattice`` with ``N = n_u · n_v`` spheres.  Sphere index ordering
+        is row-major in (u, v): ``idx = i·n_v + j``.
+    """
+    if n_u < 2 or n_v < 2:
+        raise ValueError(f"n_u, n_v >= 2 required, got {n_u}, {n_v}")
+    if spacing <= 0.0:
+        raise ValueError(f"spacing must be > 0, got {spacing}")
+    if normal is None:
+        normal = np.array([0.0, 0.0, 1.0])
+    normal = np.asarray(normal, dtype=np.float64)
+    normal = normal / float(np.linalg.norm(normal))
+
+    N = n_u * n_v
+    i_idx, j_idx = np.meshgrid(np.arange(n_u), np.arange(n_v), indexing="ij")
+    x = (i_idx - (n_u - 1) / 2.0) * spacing
+    y = (j_idx - (n_v - 1) / 2.0) * spacing
+    p = np.stack([x.ravel(), y.ravel(), np.zeros(N)], axis=1)
+    n_arr = np.broadcast_to(normal, (N, 3)).copy()
+
+    edge_list: list[tuple[int, int]] = []
+    def lin(i: int, j: int) -> int:
+        return i * n_v + j
+
+    for i in range(n_u):
+        for j in range(n_v):
+            if i + 1 < n_u:
+                edge_list.append((lin(i, j), lin(i + 1, j)))
+            if j + 1 < n_v:
+                edge_list.append((lin(i, j), lin(i, j + 1)))
+            if diagonals:
+                if i + 1 < n_u and j + 1 < n_v:
+                    edge_list.append((lin(i, j), lin(i + 1, j + 1)))
+                if i + 1 < n_u and j - 1 >= 0:
+                    edge_list.append((lin(i, j), lin(i + 1, j - 1)))
+    edges = np.array(sorted({(min(a, b), max(a, b)) for (a, b) in edge_list}),
+                     dtype=np.int64)
     return Lattice(p=p, n=n_arr, edges=edges, ka=ka, kl=kl)
 
 
@@ -175,44 +247,33 @@ def make_dome(N: int, R_pad: float, half_angle: float,
               ) -> tuple[Lattice, float, float]:
     """Build a 3D spherical-cap lattice via the Fibonacci-spiral sampler.
 
-    Step-5's ``make_arc`` proved the 1D bulge window analytically; this
-    function lifts the same idea to a 2D manifold (the dome) so we can
-    study sphere-vs-sphere contact at production geometry.  Cap layout:
+    Cap layout::
 
-        z_min   = cos(half_angle)              (cap base)
-        z_i     = z_min + (1 - z_min) * (i + 0.5) / N      (equal area)
-        r_xy_i  = sqrt(1 - z_i^2)
-        phi_i   = i * golden_angle             (golden_angle = pi*(3 - sqrt(5)))
-        p_i     = R_pad * (r_xy_i cos phi_i, r_xy_i sin phi_i, z_i)
-        n_i     = p_i / R_pad                  (radial outward unit)
+        z_min   = cos(half_angle)                       (cap base)
+        z_i     = z_min + (1 − z_min)·(i + 0.5)/N        (equal area)
+        r_xy_i  = sqrt(1 − z_i²)
+        phi_i   = i · golden_angle    (golden_angle = π·(3 − sqrt(5)))
+        p_i     = R_pad · (r_xy_i·cos(phi_i), r_xy_i·sin(phi_i), z_i)
+        n_i     = p_i / R_pad                            (radial outward)
 
-    The Fibonacci spiral with equal-area-per-sample is *quasi-uniform*
-    on the cap (variance of nearest-neighbour distance ~ 5% of the mean
-    on the cap interior), and is the production-equivalent of
-    Lloyd/CVT sampling on an analytic cap (deterministic, no scipy
-    optimiser in the loop).  Edges = unordered k-NN in 3D, which on a
-    quasi-uniform 2D manifold is a close approximation of the surface
-    Delaunay graph and reproduces the production
-    ``make_cslc_pad_from_samples`` topology.
-
-    Apex sits at theta = 0 (top of cap), i.e. ``(0, 0, R_pad)``.
+    The Fibonacci spiral with equal area per sample is quasi-uniform on
+    the cap (variance of nearest-neighbour distance ≈ 5% of the mean
+    on the cap interior).  Edges are unordered k-NN in 3D, which on a
+    quasi-uniform 2D manifold approximates the surface Delaunay graph.
+    Apex sits at theta = 0, i.e. ``(0, 0, R_pad)``.
 
     Args:
         N: number of lattice spheres.
-        R_pad: dome radius [m] (the *pad* sphere radius, NOT the held
-            object's).  Production fingertip dome: R_pad = 10 mm.
-        half_angle: cap half-angle [rad].  Production fingertip dome
-            spans theta_max ~ 1.26 rad (~72 deg, cos = 0.31).
+        R_pad: dome radius [m].
+        half_angle: cap half-angle [rad].
         ka: anchor stiffness [N/m].
         kl: lateral stiffness [N/m].
-        k_neighbors: k for the k-NN neighbour graph (production: 6).
+        k_neighbors: k for the k-NN neighbour graph (typical 6).
 
     Returns:
         ``(lat, spacing, cap_area)`` where ``spacing`` is the mean
-        nearest-neighbour distance [m] (a Fibonacci-spiral invariant
-        analogous to Lloyd's CVT spacing) and ``cap_area`` [m^2] is the
-        analytic spherical-cap area used downstream for Hertz-patch
-        density predictions.
+        nearest-neighbour distance [m] and ``cap_area`` [m²] is the
+        analytic spherical-cap area.
     """
     if R_pad <= 0.0 or half_angle <= 0.0 or half_angle >= np.pi:
         raise ValueError(
@@ -255,37 +316,32 @@ def make_dome(N: int, R_pad: float, half_angle: float,
                 edge_set.add((a, b))
     edges = np.array(sorted(edge_set), dtype=np.int64)
 
-    # Mean NN distance = lattice spacing (matches the production
-    # ``make_cslc_pad_from_samples`` convention).  Use the first
-    # neighbour column (excluding self at column 0).
+    # Mean NN distance = lattice spacing (first neighbour column,
+    # excluding self at column 0).
     nn_dists = np.linalg.norm(p[idx[:, 1]] - p, axis=1)
     spacing = float(np.mean(nn_dists))
 
-    # Spherical-cap area for diagnostics: A = 2 pi R^2 (1 - cos theta_max).
+    # Spherical-cap area: A = 2·π·R²·(1 − cos θ_max).
     cap_area = float(2.0 * np.pi * R_pad * R_pad * (1.0 - z_min))
 
     return Lattice(p=p, n=n_arr, edges=edges, ka=ka, kl=kl), spacing, cap_area
 
 
 # ────────────────────────────────────────────────────────────────────────
-#  Lattice stiffness matrix K (paper eq. 10, scalar form)
+#  Lattice stiffness matrix K (scalar form)
 # ────────────────────────────────────────────────────────────────────────
 
 
 def build_K_matrix(lat: Lattice) -> np.ndarray:
-    """Assemble the scalar lattice stiffness K in R^{N x N} (paper eq. 10).
+    """Assemble the scalar lattice stiffness ``K ∈ ℝ^{N×N}``.
 
-    K_ii = ka + kl * |N(i)|,    K_ij = -kl if (i, j) in edges, else 0.
-
-    This is the matrix the paper uses for the scalar normal-projection
-    formulation; in the vec3 setting (the ideal we want), the
-    graph-Laplacian system is the Kronecker lift  K_3D = K x I_3  so
-    each axis decouples and solves with the same K.  We expose the
-    scalar K here so the test can inspect, eigen-decompose, and
-    hand-check it.
+    ``K_ii = ka + kl·|N(i)|``, ``K_ij = −kl`` if ``(i, j)`` is an edge,
+    else 0.  In the vector setting the graph-Laplacian system is the
+    Kronecker lift ``K_3D = K ⊗ I_3``, so each axis decouples and
+    solves with the same scalar ``K``.
 
     Returns:
-        Symmetric PD numpy array of shape (N, N).
+        Symmetric positive-definite array of shape ``(N, N)``.
     """
     N = lat.N
     K = np.zeros((N, N), dtype=np.float64)
@@ -322,8 +378,8 @@ def chain_discrete_decay_length(ka: float, kl: float) -> float:
                      The lattice cannot resolve a continuum decay
                      shorter than ~1 spacing, so it localises further.
 
-    Use this -- not the continuum approximation -- as the reference for
-    Green's-function fits on lattices where k_l/k_a is not >> 1.
+    Use this — not the continuum approximation — as the reference for
+    Green's-function fits on lattices where ``k_l/k_a`` is not ≫ 1.
     """
     if ka <= 0.0:
         raise ValueError(f"ka must be > 0, got {ka}")
@@ -335,21 +391,18 @@ def chain_discrete_decay_length(ka: float, kl: float) -> float:
 
 
 def chain_analytical_eigenvalues(N: int, ka: float, kl: float) -> np.ndarray:
-    """Eigenvalues of the chain's K, in ASCENDING order.
+    """Eigenvalues of the chain's K, in ascending order.
 
     For a 1D chain of N spheres with free endpoints (degree-1 at the
-    ends, degree-2 elsewhere), K is a tridiagonal matrix whose
-    eigenvalues are the Neumann modes of a discrete Laplacian:
+    ends, degree-2 elsewhere), K is tridiagonal with the Neumann modes
+    of a discrete Laplacian::
 
-        lambda_k = ka + 2 * kl * (1 - cos(k * pi / N)),   k = 0, 1, ..., N-1.
+        λ_k = ka + 2·kl·(1 − cos(k·π/N)),    k = 0, 1, ..., N−1
 
-    Reference: Strang, "Computational Science and Engineering" eq.
-    2.34 (free-free 1D Laplacian DCT-II spectrum).  At k=0 we recover
-    the uniform-translation mode lambda_0 = ka (the only mode the
-    lateral spring cannot resist).
-
-    This is the analytical witness the eigenvalue test in
-    ``test_02_chain.py`` compares against.
+    Reference: Strang, "Computational Science and Engineering" eq. 2.34
+    (free-free 1D Laplacian DCT-II spectrum).  At ``k = 0`` we recover
+    the uniform-translation mode ``λ_0 = ka`` — the only mode the
+    lateral spring cannot resist.
     """
     k = np.arange(N, dtype=np.float64)
     return ka + 2.0 * kl * (1.0 - np.cos(k * np.pi / N))
@@ -361,32 +414,31 @@ def chain_analytical_eigenvalues(N: int, ka: float, kl: float) -> np.ndarray:
 
 
 def anchor_force_all(lat: Lattice, deltas: np.ndarray) -> np.ndarray:
-    """f_anchor = +ka * delta, per sphere.  (Isotropic for step 2.)
+    """Per-sphere isotropic anchor force ``f_anchor = +ka · δ``.
 
     Args:
-        deltas: (N, 3) displacements.
+        deltas: ``(N, 3)`` displacements.
     Returns:
-        (N, 3) anchor forces.
+        ``(N, 3)`` anchor forces.
     """
     return lat.ka * deltas
 
 
 def anchor_energy(lat: Lattice, deltas: np.ndarray) -> float:
-    """E_anchor = (1/2) * ka * sum_i ||delta_i||^2."""
+    """``E_anchor = ½·ka·Σ_i ||δ_i||²``."""
     return 0.5 * lat.ka * float(np.sum(deltas * deltas))
 
 
 def lateral_force_graph_laplacian(lat: Lattice,
                                   deltas: np.ndarray) -> np.ndarray:
-    """Paper eq. 9.  Graph-Laplacian force per sphere.
+    """Graph-Laplacian lateral force per sphere (theory.md §6.2)::
 
-        f_lat_i = -k_l * sum_{j in N(i)} (delta_i - delta_j)
+        f_lat_i = −k_l · Σ_{j ∈ N(i)} (δ_i − δ_j)
 
-    Equivalent to ``-(kl * L) @ deltas`` where ``L = D - A`` is the
-    graph Laplacian (D = degree, A = adjacency).  Quadratic and convex
-    in deltas; the equilibrium with anchor + this lateral is the
-    solution of ``K @ delta_axis = f_ext_axis`` for each axis
-    independently (axes decouple).
+    Equivalent to ``-(kl · L) @ δ`` where ``L = D − A`` is the graph
+    Laplacian (``D`` = degree, ``A`` = adjacency).  Quadratic and convex
+    in ``δ``; with anchor it is the solution of
+    ``K · δ_axis = f_ext_axis`` per axis independently (axes decouple).
     """
     f = np.zeros_like(deltas)
     for (i, j) in lat.edges:
@@ -406,25 +458,21 @@ def lateral_energy_graph_laplacian(lat: Lattice, deltas: np.ndarray) -> float:
 
 
 # ────────────────────────────────────────────────────────────────────────
-#  v2 unified lattice contact solver  (contract_v2.md §6)
+#  Lattice contact solver  (theory.md §6)
 #
-#  Pad ``Lattice`` vs ``PointSetTargetV2``.  Half-space overlap, graph-
-#  Laplacian lateral, anisotropic anchor via ``ka_t_ratio``.  The v1
-#  ``ContactTarget`` / ``SphereIndenter`` / ``PointSetIndenter`` solvers
-#  and the distance-preserving lateral law were deleted in Phase 5.
+#  Pad ``Lattice`` vs ``PointSetTarget``.  Half-space overlap, graph-
+#  Laplacian lateral, anisotropic anchor via ``ka_t_ratio``.
 #
-#  ``solve_lattice_contact`` uses L-BFGS-B on the per-pair contact
-#  energy summed over the full (N, M) pad×target grid (gradient form
-#  per contract §6.5) plus ``_jacobi_refine`` post-step to reach the
-#  kernel's damped-Jacobi fixed point on sphere targets (Phase 4b
-#  finding #14).
+#  :func:`solve_lattice_contact` warm-starts with L-BFGS-B on a
+#  heuristic Lyapunov-like energy whose Jacobian is the force-form
+#  contact term, then refines with damped Jacobi (theory.md §6.5–§6.6)
+#  to reach the kernel's force fixed point.
 # ────────────────────────────────────────────────────────────────────────
-
 
 
 def solve_lattice_contact(
     lat: Lattice,
-    target,                       # PointSetTargetV2 (from cslc_targets)
+    target,                       # PointSetTarget (from cslc_targets)
     kc: float,
     *,
     r_pad: np.ndarray | float,
@@ -436,108 +484,114 @@ def solve_lattice_contact(
     maxiter: int = 5000,
     kernel_half_width: np.ndarray | float | None = None,
 ) -> tuple[np.ndarray, dict]:
-    """v2 unified contact equilibrium: ``Lattice`` vs ``PointSetTargetV2``.
+    """Lattice contact equilibrium for ``Lattice`` vs ``PointSetTarget``.
 
-    Minimises (per contract_v2.md §6, all gradient terms with + sign)::
+    Reaches the force-balance fixed point of theory.md §6.5::
 
-        E_total  =  E_anchor_aniso + E_lateral_GL
-                  + Σ_i Σ_j (½ k_c A_j w_t_ij a_ij φ_eff_ij²)
+        0 = ka·δ_n·n̂_pad + (ka·ρ)·δ_t                         (anchor §6.1)
+            + kl·Σ_{j∈N(i)}(δ_i − δ_j)                         (lateral §6.2)
+            + Σ_j kc·A_j·w_t_ij·a_ij·φ_eff_ij·gate_ij·n̂_face_j (contact §5)
 
-    over per-pad-sphere δ ∈ ℝ^(N×3).
+    with the Hertz-like coupling::
 
-    **Anisotropic anchor (Phase 4 extension, contract §6.1).**  In each
-    pad sphere's local ``{n̂_pad_i, n̂_pad_i^⊥}`` frame::
+        φ_eff = σ_ε(raw) · √(σ_ε(raw) + ε)        (theory.md eq:phi-eff)
+        gate  = Σ_ε(raw)                          (theory.md eq:gate)
+        w_t   = Σ_ε(r_i − d_t)                    (theory.md §3.5)
 
-        δ_n_i = δ_i · n̂_pad_i,   δ_t_i = δ_i − δ_n_i n̂_pad_i
-        E_anchor_i = ½ k_a δ_n_i² + ½ (k_a ρ) ||δ_t_i||²
+    Under the Hertz lift the kernel writes the force law directly
+    (theory.md §4 "Note on energy form") — there is no globally-defined
+    potential whose ``∂E/∂δ`` equals this force.  This solver
+    warm-starts with L-BFGS-B on the heuristic Lyapunov-like energy
+    ``½·kc·A·w·a·φ_eff²`` paired with the force-form Jacobian, then
+    refines via damped Jacobi (theory.md §6.6) to the kernel's
+    fixed point.  The Jacobi sweep matches
+    :func:`cslc_kernels.jacobi_step` directly.
+
+    **Anisotropic anchor (theory.md §6.1).**  In each pad sphere's
+    local ``{n̂_pad_i, n̂_pad_i^⊥}`` frame::
+
+        δ_n_i = δ_i · n̂_pad_i,   δ_t_i = δ_i − δ_n_i·n̂_pad_i
+        E_anchor_i = ½·k_a·δ_n_i² + ½·(k_a·ρ)·||δ_t_i||²
 
     with ``ρ = ka_t_ratio``.  ``ρ = 1`` recovers the isotropic anchor.
-    Because ``n̂_pad_i`` is rest body-local (δ-independent), the
-    gradient picks up no extra ``∂n̂_pad/∂δ`` term::
+    Since ``n̂_pad_i`` is rest body-local (δ-independent), the gradient
+    picks up no extra ``∂n̂_pad/∂δ`` term::
 
-        ∂E_anchor_i/∂δ = k_a δ_n_i n̂_pad_i + (k_a ρ) δ_t_i
+        ∂E_anchor_i/∂δ = k_a·δ_n_i·n̂_pad_i + (k_a·ρ)·δ_t_i
 
-    The Phase 4 bridge harness (T-K scene E) requires this.
+    **w_t treated as δ-independent.**  The ``∂w_t/∂δ`` term is dropped
+    so the theory-side gradient matches the kernel's truncated
+    gradient exactly.  This makes ``jac`` an ``O(eps²/r³)`` inconsistent
+    approximation of ``fun``, but the converged ``∂E/∂δ = 0`` point is
+    the same smooth-surrogate equilibrium the kernel iterates to.
 
-    **w_t treated as δ-independent (Phase 4 commit, finding #4).**
-    The ∂w_t/∂δ term ``∂E_contact/∂δ_i = ... + ½ k_c A_j a φ_eff² ·
-    Σ'_ε(3r − d_t) · ẑ_ij`` is **dropped** so theory's gradient matches
-    the kernel's truncated gradient (`jacobi_step_point_set` ignores
-    this term by convention; cf. contract §4 deriv).  Removing it
-    means ``jac`` is an O(ε²/r³) inconsistent approximation of ``fun``
-    — L-BFGS-B's line search may oscillate marginally — but the
-    converged ``∂E/∂δ = 0`` point is the SAME smooth-surrogate
-    equilibrium the kernel iterates to.  This is the Phase 4 commit
-    (cf. contract §17 finding #9): **theory = kernel, never both ways**.
+    **Smooth alignment gate ``a_ij``** (theory.md §3.6)::
 
-    ``a_ij`` is the **smooth alignment gate** (contract §3.6, amended
-    Phase 4b after finding #11):
+        align_arg_ij = −(n̂_face_j · n̂_pad_i)      (>0 = opposing)
+        a_ij         = smoothstep(align_arg_ij; 0, eps_align)
 
-        align_arg_ij  =  -(n̂_face_j · n̂_pad_i)               (>0 = opposing)
-        a_ij          =  smoothstep(align_arg_ij; 0, eps_align)
-
-    a C¹ cubic smoothstep on the **one-sided** band ``[0, +eps_align]``:
+    C¹ cubic smoothstep on the one-sided band ``[0, +eps_align]``:
     exactly 1 for ``align_arg ≥ +eps_align`` (face-on), exactly 0 for
-    ``align_arg ≤ 0`` (perpendicular OR back-to-back — both HARD-culled).
-    It is δ-independent (n_pad and n_face are rest body-local geometry),
-    so it enters the gradient as a constant multiplier — no extra
-    ``∂a/∂δ`` term.  Compact support means back-side AND perpendicular
-    samples contribute *exactly* zero (no polynomial tail; cf. the
-    alternative Σ_ε form which has a 1/x² tail).
-
-    **Why one-sided.**  The earlier symmetric band ``[-eps_align,
-    +eps_align]`` gave ``a = 0.5`` at perpendicular, which over-coupled
-    side-face samples on closed convex targets (box, mesh).  At
-    production eps a single pad vs a full box failed to converge under
-    L-BFGS-B because corner samples of side faces sat inside the
-    locality kernel with half-strength asymmetric in-plane forces.
-    Contract amendment after Phase 4a finding #11; see contract §17.
+    ``align_arg ≤ 0`` (perpendicular or back-to-back, both hard-culled).
+    δ-independent (``n_pad`` and ``n_face`` are rest body-local), so it
+    enters the gradient as a constant multiplier.  Compact support
+    means back-side and perpendicular samples contribute exactly zero,
+    avoiding the polynomial tail that an open band would produce on
+    closed convex targets.
 
     Args:
         lat: pad lattice (uses ``lat.p``, ``lat.n``, ``lat.edges``,
             ``lat.ka``, ``lat.kl``).
-        target: a ``PointSetTargetV2`` instance from
-            :mod:`cslc_main.theory.cslc_targets`.  Has ``positions``
-            (M, 3), ``normals`` (M, 3), and ``areas`` (M,) or None.
-        kc: contact stiffness [N/m] (per-pair; same for all pairs in v2).
-        r_pad: per-pad-sphere radius [m].  Scalar or shape (N,).
-        delta0: warm start, shape (N, 3).  Default zeros.
+        target: a :class:`cslc_main.theory.cslc_targets.PointSetTarget`
+            with ``positions`` ``(M, 3)``, ``normals`` ``(M, 3)``, and
+            optional ``areas`` ``(M,)``.
+        kc: contact stiffness in kernel units ``[Pa·m^(−1/2)]`` — the
+            per-volume form ``kc = kc_per_sphere / (π·r_pad²)``
+            (theory.md §10).  The CSLC handler does this rescale
+            upstream; theory-side callers pass per-volume kc directly to
+            match the kernel API.  Single-pair primitives in
+            :mod:`cslc_theory` take per-sphere kc since they have no
+            area or locality weights.
+        r_pad: per-pad-sphere radius [m].  Scalar or shape ``(N,)``.
+        delta0: warm start, shape ``(N, 3)``.  Default zeros.
         eps: smoothing width [m] for the half-space surrogate.  Default
-             1e-9 for theory-side precision; production kernel uses 5e-4.
+             1e-9 (theory-side precision); production kernel uses 5e-4.
         eps_align: smoothing half-width for the alignment gate
-            (dimensionless cosine units in [0, 1]).  Default 0.05
-            (≈ 2.87° angular half-transition, one-sided from α = 0 to
-            α = +eps_align).  Set to 0 for the legacy binary cull
-            (recovers the hard step at n_face·n_pad = 0, with the
-            documented force-discontinuity bug — only use for ablation
-            testing).
+            (dimensionless cosine units, in ``[0, 1]``).  Default 0.05
+            (≈ 2.87° angular half-transition, one-sided from
+            ``α = 0`` to ``α = +eps_align``).  Set to 0 for the binary
+            hard step at ``n_face·n_pad = 0`` (ablation only — the
+            hard step produces a force discontinuity).
         ka_t_ratio: anisotropic anchor ratio ``ρ = k_at / k_a``.  Default
-            1.0 (isotropic).  Lattice does not carry this — the kernel
-            takes it as a scalar parameter (``ka_tangent_ratio``), and
-            this signature follows the same convention so bridge scenes
-            can sweep ρ without rebuilding the lattice.
+            1.0 (isotropic).  ``Lattice`` does not carry this; passed
+            here as a scalar so callers can sweep ``ρ`` without
+            rebuilding the lattice.
         tol: L-BFGS-B ``gtol`` / ``ftol``.
         maxiter: L-BFGS-B iteration cap.
         kernel_half_width: tangential locality kernel half-width [m]
-            (the ``3 r_i`` in contract eq:w_t).  Scalar or (N,) or
-            None.  None ⇒ ``3 · r_pad`` (the contract default).  Pass a
-            smaller value to restrict contact locality (useful for
-            chain-vs-single-sample tests where you want only one pad
-            sphere to engage).
+            (the ``r_i`` in theory.md eq:w_t §3.5).  Scalar or ``(N,)``
+            or None.  None ⇒ ``r_pad`` — the spec value, matching the
+            production kernel.  This makes the disc-of-radius-r tiling
+            cover the contact patch exactly once when pads are
+            CVT-sampled at spacing ``2·r_pad`` (theory.md §3.5 tiling
+            identity).
 
     Returns:
-        ``(deltas, info)`` — ``deltas`` is (N, 3); ``info`` is the
-        scipy diagnostic dict augmented with ``n_active_pairs``.
+        ``(deltas, info)`` — ``deltas`` is ``(N, 3)``; ``info`` is the
+        scipy diagnostic dict augmented with ``n_active_pairs`` and
+        ``jacobi_refine_iters``.
     """
     from scipy.optimize import minimize
 
     N = lat.N
     M = int(target.M)
     p_rest = np.asarray(lat.p, dtype=np.float64)              # (N, 3)
-    n_pad = np.asarray(lat.n, dtype=np.float64)               # (N, 3) outward normals
+    # (N, 3) outward normals
+    n_pad = np.asarray(lat.n, dtype=np.float64)
     edges = np.asarray(lat.edges, dtype=np.int64)             # (E, 2)
     ka = float(lat.ka)
-    ka_t = ka * float(ka_t_ratio)                             # anisotropic tangent
+    # anisotropic tangent
+    ka_t = ka * float(ka_t_ratio)
     kl = float(lat.kl)
     t_pos = np.asarray(target.positions, dtype=np.float64)    # (M, 3)
     n_face = np.asarray(target.normals, dtype=np.float64)     # (M, 3)
@@ -545,31 +599,19 @@ def solve_lattice_contact(
              if target.areas is not None
              else np.ones(M, dtype=np.float64))
 
-    # ──────────────────────────────────────────────────────────────────
-    # Smooth alignment gate (contract §3.6, amended Phase 4b after
-    # finding #11).
-    # ``align_arg = -(n_face · n_pad)`` is +1 at perfect face-on and -1
-    # at back-to-back; perpendicular faces give align_arg = 0.  The C¹
-    # cubic smoothstep on the ONE-SIDED band [0, +eps_align] is exactly
-    # 1 for align_arg ≥ +eps_align, exactly 0 for align_arg ≤ 0
-    # (perpendicular OR back-to-back), and smooth in between.
-    # Compactly supported ⇒ back-side AND perpendicular samples
-    # contribute exactly zero; no polynomial tail to over-couple side
-    # faces of closed convex targets (boxes, meshes).  Cached once
-    # since (n_pad, n_face) are δ-independent.
-    # ──────────────────────────────────────────────────────────────────
+    # Smooth alignment gate (theory.md §3.6).  align_arg = -(n_face · n_pad)
+    # is +1 face-on, -1 back-to-back, 0 perpendicular.  C¹ cubic
+    # smoothstep on the one-sided band [0, +eps_align].  δ-independent
+    # (n_pad and n_face are rest-frame); cached once.
     n_face_dot_n_pad = np.einsum("nj,mj->nm", n_pad, n_face)  # (N, M)
     align_arg = -n_face_dot_n_pad                             # (N, M)
     if eps_align > 0.0:
-        # Cubic smoothstep s(t) = 3t² − 2t³ on t = clip(α/ε, 0, 1).
-        # Perpendicular (α = 0) ⇒ t = 0 ⇒ s = 0 (HARD-cull).
         t = np.clip(align_arg / eps_align, 0.0, 1.0)
         align_gate = t * t * (3.0 - 2.0 * t)                  # (N, M)
     else:
-        # Hard binary step (recovered limit; perpendicular hard-culled).
+        # Hard binary step (perpendicular hard-culled).
         align_gate = (align_arg > 0.0).astype(np.float64)
-    # Performance cull: pairs with align_gate == 0 contribute nothing.
-    # Perpendicular (α = 0) is hard-culled under the amended gate.
+    # Performance cull: align_gate == 0 contributes nothing.
     align_active = align_arg > 0.0                            # (N, M) bool
 
     if np.isscalar(r_pad):
@@ -581,7 +623,9 @@ def solve_lattice_contact(
                 f"r_pad must be scalar or shape ({N},), got {r_arr.shape}")
 
     if kernel_half_width is None:
-        kh_arr = 3.0 * r_arr
+        # theory.md §3.5: w_t half-width = r_i (pad sphere radius itself).
+        # Matches cslc_kernels.jacobi_step (line ~735: kernel_h = r_i).
+        kh_arr = r_arr
     elif np.isscalar(kernel_half_width):
         kh_arr = np.full(N, float(kernel_half_width), dtype=np.float64)
     else:
@@ -606,53 +650,59 @@ def solve_lattice_contact(
     def _state(d_flat: np.ndarray):
         """Compute everything needed by fun() and jac() at delta = d_flat.
 
-        Returns a dict with raws, phi_eff, gate, w_t, diff, d_t — all
-        (N, M)-shaped where applicable.  w_t is treated as δ-independent
-        (its derivative is NOT carried — see solve_lattice_contact
-        docstring for the Phase 4 commit and contract §17 finding #9).
+        Returns a dict with raws, sigma, phi_eff, gate, w_t — all
+        ``(N, M)``-shaped.  ``phi_eff = σ_ε(raw)·√(σ_ε(raw)+ε)`` is the
+        Hertz-like coupling (theory.md eq:phi-eff).  ``w_t`` is treated
+        as δ-independent (matches the kernel's truncated gradient).
         """
         d = d_flat.reshape(N, 3)
         q = p_rest - d                                          # (N, 3)
         diff = q[:, None, :] - t_pos[None, :, :]                # (N, M, 3)
-        # Half-space depth along n_face: raw = r - n_face · (q - t).
+        # Half-space depth along n_face: raw = r − n_face · (q − t).
         proj = np.einsum("nmj,mj->nm", diff, n_face)            # (N, M)
         raws = r_arr[:, None] - proj                            # (N, M)
-        # Active set: raw >= -50·eps AND align_gate > 0 (contract §3.6).
+        # Active set: raw ≥ −50·eps AND align_gate > 0 (theory.md §3.6).
         active = (raws >= inactive_threshold) & align_active    # (N, M)
         # Tangential magnitude (vector dropped — only |d_t| enters w_t).
         proj_vec = proj[:, :, None] * n_face[None, :, :]        # (N, M, 3)
         z_vec = diff - proj_vec
         d_t = np.linalg.norm(z_vec, axis=2)                     # (N, M)
-        # Smooth quantities.
+        # Smooth quantities (theory.md §3.4–§3.5).
+        #   sigma   = σ_ε(raw)       smooth ReLU
+        #   phi_eff = σ_ε(raw)·√(σ_ε(raw)+ε)  Hertz lift (eq:phi-eff)
+        #   gate    = Σ_ε(raw)       smooth step (eq:gate)
+        #   w_t     = Σ_ε(kh − d_t)  tangential locality (eq:w_t)
         if eps > 0.0:
             r2 = raws * raws + eps * eps
             sqr2 = np.sqrt(r2)
-            phi_eff = 0.5 * (raws + sqr2)
+            sigma = 0.5 * (raws + sqr2)
+            phi_eff = sigma * np.sqrt(sigma + eps)
             gate = 0.5 * (1.0 + raws / sqr2)
             w_t = 0.5 * (1.0 + (kh_arr[:, None] - d_t)
                          / np.sqrt((kh_arr[:, None] - d_t) ** 2 + eps * eps))
         else:
-            phi_eff = np.maximum(0.0, raws)
+            sigma = np.maximum(0.0, raws)
+            phi_eff = sigma * np.sqrt(sigma)  # raw^1.5 for raw≥0, else 0
             gate = np.where(raws > 0, 1.0,
                             np.where(raws == 0, 0.5, 0.0))
             arg = kh_arr[:, None] - d_t
             w_t = np.where(arg > 0, 1.0,
                            np.where(arg == 0, 0.5, 0.0))
         # Mask inactive pairs to zero.
+        sigma = np.where(active, sigma, 0.0)
         phi_eff = np.where(active, phi_eff, 0.0)
         gate = np.where(active, gate, 0.0)
         w_t = np.where(active, w_t, 0.0)
         return {
-            "d": d, "raws": raws, "active": active,
+            "d": d, "raws": raws, "active": active, "sigma": sigma,
             "phi_eff": phi_eff, "gate": gate, "w_t": w_t,
         }
 
     def fun(d_flat: np.ndarray) -> float:
         s = _state(d_flat)
         d = s["d"]
-        # Anisotropic anchor (contract §6.1): split each δ_i into its
-        # pad-normal component δ_n and tangent δ_t, using rest n̂_pad
-        # (δ-independent, so no extra Jacobian term).
+        # Anisotropic anchor (theory.md §6.1): split δ into pad-normal
+        # and tangent components using rest n̂_pad (δ-independent).
         delta_n = np.einsum("nj,nj->n", d, n_pad)               # (N,)
         delta_t = d - delta_n[:, None] * n_pad                  # (N, 3)
         E_anchor = (0.5 * ka * float(np.sum(delta_n * delta_n))
@@ -662,8 +712,9 @@ def solve_lattice_contact(
             E_lateral = 0.5 * kl * float(np.sum(ed * ed))
         else:
             E_lateral = 0.0
-        # E_contact = sum_ij ½ kc A_j w_t_ij a_ij phi_eff_ij²
-        # (a_ij = align_gate; δ-independent, just a multiplier.)
+        # Heuristic contact energy: ½·kc·A_j·w_t·a·φ_eff² (Lyapunov
+        # surrogate; not the antiderivative of the force-form Jacobian
+        # under the Hertz lift — see theory.md §4).
         E_contact = 0.5 * kc * float(
             np.sum(areas[None, :] * s["w_t"] * align_gate
                    * s["phi_eff"] * s["phi_eff"]))
@@ -672,27 +723,22 @@ def solve_lattice_contact(
     def jac(d_flat: np.ndarray) -> np.ndarray:
         s = _state(d_flat)
         d = s["d"]
-        # Anisotropic anchor gradient (contract §6.1):
+        # Anisotropic anchor gradient (theory.md §6.1):
         #   ∂E_anchor_i/∂δ = ka·δ_n·n̂_pad + ka·ρ·δ_t
         delta_n = np.einsum("nj,nj->n", d, n_pad)               # (N,)
         delta_t = d - delta_n[:, None] * n_pad                  # (N, 3)
         grad = ka * delta_n[:, None] * n_pad + ka_t * delta_t
         if edges.size:
             ed = d[edge_i] - d[edge_j]
-            # ∂E_lat/∂δ_i = +kl Σ_j∈N(i) (δ_i − δ_j)
+            # ∂E_lat/∂δ_i = +kl · Σ_{j ∈ N(i)} (δ_i − δ_j)
             np.add.at(grad, edge_i, kl * ed)
             np.add.at(grad, edge_j, -kl * ed)
-        # Contact gradient — main term only.  ∂w_t/∂δ DROPPED to match
-        # the kernel's truncated gradient (Phase 4 policy, contract
-        # finding #9).  The converged δ is the point where the
-        # TRUNCATED gradient is zero — NOT a stationary point of the
-        # full smooth-surrogate energy in ``fun``.  Both theory and
-        # kernel see the same offset, so bridge parity holds;
-        # ``info["energy"]`` is off from the true minimum by O(1%).
-        #
-        #   ∂/∂δ_i (½ kc A_j w_t a phi_eff²) at fixed w_t, a
-        #     =  kc A_j w_t a phi_eff gate · n_face_j
-        # ∂(raw)/∂δ_i = +n_face_j (contract §4)
+        # Force-form contact term (theory.md eq:f-phys):
+        #   +kc · A_j · w_t · a · φ_eff · gate · n_face_j
+        # w_t is treated as δ-independent (matches the kernel's truncated
+        # gradient).  This is the kernel's force law, not the gradient
+        # of the heuristic ``fun``; convergence at jac = 0 is the
+        # force-balance fixed point.
         weights = (kc * areas[None, :] * s["w_t"] * align_gate
                    * s["phi_eff"] * s["gate"])
         grad = grad + np.einsum("nm,mj->nj", weights, n_face)
@@ -702,21 +748,11 @@ def solve_lattice_contact(
         fun, delta0_arr.reshape(-1), jac=jac, method="L-BFGS-B",
         options={"gtol": tol, "ftol": tol, "maxiter": maxiter},
     )
-    # Post-Jacobi refinement (Phase 4b, finding #14).  L-BFGS-B's
-    # internal Wolfe line search compares ``fun`` (full E, including
-    # w_t) against the Phase 4a truncated ``jac`` (no ∂w_t/∂δ).  For
-    # flat / box targets the inconsistency is O(ε²/r³) per pair and
-    # L-BFGS-B converges fine.  For sphere targets (high curvature,
-    # many off-axis samples simultaneously in w_t transition zone)
-    # the inconsistency stalls L-BFGS-B short of the truncated-
-    # gradient zero — the kernel's damped Jacobi reaches a noticeably
-    # different fixed point.  Adding a Jacobi post-refinement mirrors
-    # the kernel's iteration (contract §6.5) and pulls theory to the
-    # same truncated-gradient zero as the kernel.  On scenes where
-    # L-BFGS-B already converged (flat / box / chain), Jacobi exits
-    # in O(1) iterations; on scenes where it stalled, Jacobi cleans
-    # up.  Tolerance ``jacobi_tol`` chosen to match the kernel's
-    # JACOBI_TOL (1e-10) for direct bridge parity.
+    # Damped-Jacobi refinement to the force fixed point (theory.md §6.5).
+    # L-BFGS-B uses an inconsistent fun/jac pair under the Hertz lift,
+    # so its convergence stalls before reaching the true force-balance
+    # zero; the Jacobi sweep matches the kernel's iteration and pulls
+    # δ to the same fixed point as the kernel.
     delta_lbfgs = np.asarray(res.x, dtype=np.float64).reshape(N, 3)
     delta_refined, jacobi_iters = _jacobi_refine(
         delta_lbfgs,
@@ -759,17 +795,19 @@ def _jacobi_refine(
     inactive_threshold: float,
     max_iter: int, tol: float, alpha: float,
 ) -> tuple[np.ndarray, int]:
-    """Damped block-Jacobi mirror of ``jacobi_step_point_set``.
+    """Damped block-Jacobi mirror of the Warp kernel's ``jacobi_step``.
 
-    Iterates the same fixed-point equation as the Warp kernel
-    (contract §6.5): in each pad sphere's local ``{n̂_pad, n̂_pad^⊥}``
-    frame, ``δ_jacobi_n = (rhs_n + S_n · δ_old_n) / (ka + S_n)`` with
-    ``S_n = kl·|N(i)| + kc·Σ_j A_j · w_t · a · gate``.  Stops when
+    Iterates the force-balance fixed-point equation of theory.md §6.5
+    in each pad sphere's local ``{n̂_pad, n̂_pad^⊥}`` frame::
+
+        δ_jacobi_n = (rhs_n + S_n · δ_old_n) / (ka + S_n)
+        S_n        = kl·|N(i)| + kc·Σ_j A_j · w_t · a · gate
+
+    (analogous block on the tangent axis).  Stops when
     ``max|δ_new − δ_old| < tol`` or after ``max_iter`` sweeps.
 
-    Pure numpy; no friction (anchor + lateral + contact only — friction
-    is added separately by the smooth-friction path in
-    :mod:`cslc_main.theory.cslc_theory`).
+    Pure numpy; anchor + lateral + contact only (friction is handled by
+    the smooth-friction primitives in :mod:`cslc_main.theory.cslc_theory`).
     """
     delta = np.asarray(delta_in, dtype=np.float64).copy()
     if N == 0:
@@ -790,15 +828,19 @@ def _jacobi_refine(
         proj_vec = proj[:, :, None] * n_face[None, :, :]      # (N, M, 3)
         z_vec = diff - proj_vec
         d_t = np.linalg.norm(z_vec, axis=2)                   # (N, M)
+        # Hertz-like phi_eff = σ_ε(raw)·√(σ_ε(raw)+ε) (theory.md eq:phi-eff);
+        # gate = Σ_ε(raw); w_t = Σ_ε(kh - d_t) with kh = r_pad.
         if eps > 0.0:
             r2 = raws * raws + eps * eps
             sqr2 = np.sqrt(r2)
-            phi_eff = 0.5 * (raws + sqr2)
+            sigma = 0.5 * (raws + sqr2)
+            phi_eff = sigma * np.sqrt(sigma + eps)
             gate = 0.5 * (1.0 + raws / sqr2)
             arg_t = kh_arr[:, None] - d_t
             w_t = 0.5 * (1.0 + arg_t / np.sqrt(arg_t * arg_t + eps * eps))
         else:
-            phi_eff = np.maximum(0.0, raws)
+            sigma = np.maximum(0.0, raws)
+            phi_eff = sigma * np.sqrt(sigma)
             gate = np.where(raws > 0, 1.0,
                             np.where(raws == 0, 0.5, 0.0))
             arg_t = kh_arr[:, None] - d_t
@@ -807,14 +849,9 @@ def _jacobi_refine(
         phi_eff = np.where(active, phi_eff, 0.0)
         gate = np.where(active, gate, 0.0)
         w_t = np.where(active, w_t, 0.0)
-        # Contact LOAD on δ_i = -kc · A · w_t · a · phi · gate · n_face
-        # (= -∂E_contact/∂δ_i, per contract §4 eq:f-load).  Mirrors
-        # the kernel's ``f_contact_vec = kc · area_kernel · align_w
-        # · phi_eff · gate · n_eff`` where ``n_eff = -n_face_world``
-        # (the negative sign on n_eff IS the load-vs-grad sign flip).
-        # The equilibrium ka·δ_n = rhs_n_scalar derived below picks
-        # up this load with a + sign so that the standard form
-        # ka·δ_n = -∂E_contact·n_pad/∂δ holds at the fixed point.
+        # Contact load on δ_i = −kc · A · w_t · a · φ_eff · gate · n_face
+        # (theory.md eq:f-load).  At the fixed point this load balances
+        # anchor + lateral via ka·δ_n = rhs_n_scalar below.
         load_weights = (kc * areas[None, :] * w_t * align_gate
                         * phi_eff * gate)                     # (N, M)
         f_contact = -np.einsum("nm,mj->nj", load_weights, n_face)  # (N, 3)
@@ -851,13 +888,13 @@ def _jacobi_refine(
 
 
 # ────────────────────────────────────────────────────────────────────────
-#  Per-sphere normal force readout  (v2 contract — Phase 3)
+#  Per-sphere contact force readout
 # ────────────────────────────────────────────────────────────────────────
 
 
 def lattice_contact_normal_forces(
     lat: Lattice,
-    target,                       # PointSetTargetV2
+    target,                       # PointSetTarget
     deltas: np.ndarray,
     kc: float,
     *,
@@ -866,46 +903,37 @@ def lattice_contact_normal_forces(
     eps_align: float = EPS_ALIGN_DEFAULT,
     kernel_half_width: np.ndarray | float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Per-sphere contact-force vector and normal-axis magnitude (v2).
+    """Per-sphere contact-force vector and pad-normal magnitude.
 
     Given an equilibrium ``deltas`` from :func:`solve_lattice_contact`,
     reconstruct the per-sphere aggregate contact force and project on
-    each sphere's outward normal — the inputs T-J's grip aggregation
-    needs (contract §6.4, eq:F-contact-i).
+    each sphere's outward normal (theory.md §6.4, eq:F-contact-i)::
 
-    Computes (gradient form per contract §6.5; positive sign on each
-    term)::
+        F_contact_i = Σ_j  k_c · A_j · w_t_ij · a_ij
+                            · phi_eff_ij · gate_ij · n_face_j   (3-vector)
+        f_n_i       = |F_contact_i · n̂_pad_i|                  (scalar)
 
-        F_contact_i  =  Σ_j  k_c · A_j · w_t_ij · a_ij
-                              · phi_eff_ij · gate_ij · n_face_j        (3-vec)
-        f_n_i        =  |F_contact_i · n̂_pad_i|                       (scalar)
-
-    using the **same** smooth quantities and gates as
-    :func:`solve_lattice_contact` — half-space ``raw_ij``, smoothed
-    ``phi_eff_ij = σ_ε(raw)``, ``gate_ij = Σ_ε(raw)``, locality
-    ``w_t_ij = Σ_ε(kernel_half_width − d_t_ij)``, and the one-sided
-    cubic smoothstep alignment gate ``a_ij`` from contract §3.6
-    (amended Phase 4b: band ``[0, +eps_align]``; perpendicular faces
-    HARD-culled).  Inactive pairs (raw < −50ε or align_arg ≤ 0)
-    contribute zero.
+    using the same smooth quantities and gates as
+    :func:`solve_lattice_contact`.  Inactive pairs
+    (``raw < −50·eps`` or ``align_arg ≤ 0``) contribute zero.
 
     Args:
         lat: pad lattice; ``lat.n`` provides per-sphere outward normals.
-        target: ``PointSetTargetV2`` — the same target instance used in
-            the original :func:`solve_lattice_contact` call.
-        deltas: equilibrium displacement, shape (N, 3).
-        kc, r_pad, eps, eps_align, kernel_half_width: **must match
-            the values passed to** :func:`solve_lattice_contact` —
-            this helper recomputes the contact-force gradient from
+        target: :class:`cslc_main.theory.cslc_targets.PointSetTarget` —
+            the same instance used in the original
+            :func:`solve_lattice_contact` call.
+        deltas: equilibrium displacement, shape ``(N, 3)``.
+        kc, r_pad, eps, eps_align, kernel_half_width: must match the
+            values passed to :func:`solve_lattice_contact` — this
+            helper recomputes the contact-force gradient from
             ``deltas``, so any kwarg drift silently desynchronises
-            ``f_n`` from the equilibrium state.  Pass identical values
-            (e.g. as a shared kwargs dict) at both call sites.
+            ``f_n`` from the equilibrium state.
 
     Returns:
-        ``(F_contact, f_n)`` — ``F_contact`` is (N, 3) per-sphere force
-        in the gradient form (= physical force on q_i, contract §2);
-        ``f_n`` is (N,) the magnitude of the projection on the pad's
-        own outward normal.  Inactive spheres get the zero vector.
+        ``(F_contact, f_n)`` — ``F_contact`` is ``(N, 3)`` per-sphere
+        force (= physical force on ``q_i``, theory.md §2);
+        ``f_n`` is ``(N,)`` the magnitude of the projection on the
+        pad's own outward normal.  Inactive spheres get the zero vector.
     """
     N = lat.N
     M = int(target.M)
@@ -928,7 +956,8 @@ def lattice_contact_normal_forces(
             raise ValueError(
                 f"r_pad must be scalar or shape ({N},), got {r_arr.shape}")
     if kernel_half_width is None:
-        kh_arr = 3.0 * r_arr
+        # Matches solve_lattice_contact: kh = r_pad (theory.md §3.5).
+        kh_arr = r_arr
     elif np.isscalar(kernel_half_width):
         kh_arr = np.full(N, float(kernel_half_width), dtype=np.float64)
     else:
@@ -938,9 +967,9 @@ def lattice_contact_normal_forces(
                 f"kernel_half_width must be scalar or shape ({N},), "
                 f"got {kh_arr.shape}")
 
-    # Alignment gate (contract §3.6, amended Phase 4b) — δ-independent.
-    # One-sided cubic smoothstep on [0, +eps_align]; perpendicular
-    # faces (α = 0) are HARD-culled to align_w = 0.
+    # Alignment gate (theory.md §3.6) — δ-independent.  One-sided cubic
+    # smoothstep on [0, +eps_align]; perpendicular faces (α = 0) are
+    # hard-culled to align_w = 0.
     n_face_dot_n_pad = np.einsum("nj,mj->nm", n_pad, n_face)
     align_arg = -n_face_dot_n_pad
     if eps_align > 0.0:
@@ -962,18 +991,21 @@ def lattice_contact_normal_forces(
     proj_vec = proj[:, :, None] * n_face[None, :, :]
     z_vec = diff - proj_vec
     d_t = np.linalg.norm(z_vec, axis=2)
-    # Smooth surrogates.
+    # Smooth surrogates.  Hertz-like phi_eff = σ_ε(raw)·√(σ_ε(raw)+ε)
+    # (theory.md eq:phi-eff); matches the kernel exactly.
     if eps > 0.0:
         r2 = raws * raws + eps * eps
         sqr2 = np.sqrt(r2)
-        phi_eff = 0.5 * (raws + sqr2)
+        sigma = 0.5 * (raws + sqr2)
+        phi_eff = sigma * np.sqrt(sigma + eps)
         gate = 0.5 * (1.0 + raws / sqr2)
         arg = kh_arr[:, None] - d_t
         arg2 = arg * arg + eps * eps
         sqa = np.sqrt(arg2)
         w_t = 0.5 * (1.0 + arg / sqa)
     else:
-        phi_eff = np.maximum(0.0, raws)
+        sigma = np.maximum(0.0, raws)
+        phi_eff = sigma * np.sqrt(sigma)
         gate = np.where(raws > 0, 1.0, np.where(raws == 0, 0.5, 0.0))
         arg = kh_arr[:, None] - d_t
         w_t = np.where(arg > 0, 1.0, np.where(arg == 0, 0.5, 0.0))
@@ -986,30 +1018,28 @@ def lattice_contact_normal_forces(
                * phi_eff * gate)                              # (N, M)
     # F_contact_i = Σ_j weights_ij · n_face_j  (3-vector per sphere).
     F_contact = np.einsum("nm,mj->nj", weights, n_face)       # (N, 3)
-    # Pad-normal magnitude (contract §6.4 chooses this projection).
+    # Pad-normal magnitude (theory.md §6.4 projection).
     f_n = np.abs(np.einsum("nj,nj->n", F_contact, n_pad))     # (N,)
     return F_contact, f_n
 
 
 # ────────────────────────────────────────────────────────────────────────
-#  Equilibrium solvers (no contact in step 2 -- just anchor + lateral
-#  + external load)
+#  Equilibrium solvers without contact (anchor + lateral + external load)
 # ────────────────────────────────────────────────────────────────────────
 
 
 def solve_equilibrium_graph_laplacian(lat: Lattice,
                                       f_ext: np.ndarray) -> np.ndarray:
-    """Linear solve (K x I_3) @ delta = f_ext.
+    """Linear solve ``(K ⊗ I_3) · δ = f_ext``.
 
-    Because the graph-Laplacian + anchor system separates by axis, we
-    can solve each of x, y, z with the same scalar K and stack the
-    results.  This is the cheapest possible "ground truth" reference.
+    Because the graph-Laplacian + anchor system decouples by axis, each
+    of x, y, z is solved with the same scalar ``K``.
 
     Args:
-        f_ext: (N, 3) external force vector per sphere.
+        f_ext: ``(N, 3)`` external force vector per sphere.
 
     Returns:
-        deltas: (N, 3) equilibrium displacements.
+        ``deltas`` of shape ``(N, 3)``.
     """
     K = build_K_matrix(lat)
     deltas = np.zeros_like(f_ext)
@@ -1021,11 +1051,11 @@ def solve_equilibrium_graph_laplacian(lat: Lattice,
 def total_energy(lat: Lattice, deltas: np.ndarray,
                  f_ext: np.ndarray,
                  lateral: LateralLaw = "graph_laplacian") -> float:
-    """E_total(delta) = E_anchor + E_lateral - f_ext . delta.
+    """``E_total(δ) = E_anchor + E_lateral − f_ext · δ``.
 
-    The last term is the work the external force does against delta;
-    negating it makes the equilibrium the minimiser of E_total at
-    fixed f_ext.
+    The ``-f_ext · δ`` term is the external potential whose gradient is
+    ``-f_ext``; minimising ``E_total`` at fixed ``f_ext`` yields the
+    equilibrium displacement.
     """
     if lateral != "graph_laplacian":
         raise ValueError(f"unknown lateral law: {lateral!r}")
@@ -1038,18 +1068,18 @@ def total_energy(lat: Lattice, deltas: np.ndarray,
 def total_force(lat: Lattice, deltas: np.ndarray,
                 f_ext: np.ndarray,
                 lateral: LateralLaw = "graph_laplacian") -> np.ndarray:
-    """Residual force per sphere = f_anchor - f_ext - f_lateral.
+    """Residual force per sphere = ``f_anchor − f_ext − f_lateral``.
 
-    The signs reflect the energy gradient:
-        grad E_anchor = +ka * delta = +f_anchor
-        grad E_lateral = -(force on sphere from lateral) [confusing but
-            true: lateral energy is quadratic in (delta_i - delta_j),
-            so its gradient pushes deltas APART, opposite to the
-            restoring force].
-        grad of -f_ext . delta = -f_ext.
+    Signs reflect the energy gradient::
 
-    At equilibrium, the residual is zero.  The numerical solvers below
-    drive ``||residual||`` below tol.
+        ∇ E_anchor      = +ka·δ           (= f_anchor)
+        ∇ E_lateral     = −f_lateral      (quadratic in (δ_i − δ_j),
+                                           gradient pushes δ apart —
+                                           opposite to the restoring
+                                           lateral force)
+        ∇ (−f_ext·δ)    = −f_ext
+
+    At equilibrium the residual is zero.
     """
     if lateral != "graph_laplacian":
         raise ValueError(f"unknown lateral law: {lateral!r}")
@@ -1068,13 +1098,12 @@ def solve_equilibrium_numerical(lat: Lattice,
                                 delta0: np.ndarray | None = None,
                                 tol: float = 1.0e-10,
                                 ) -> tuple[np.ndarray, dict]:
-    """General equilibrium by L-BFGS-B on E_total.
+    """General equilibrium by L-BFGS-B on ``E_total``.
 
-    Retained as a numerical witness against the linear
-    :func:`solve_equilibrium_graph_laplacian`.  Phase 5 dropped the
-    distance-preserving lateral law, so the only supported choice is
-    ``lateral = "graph_laplacian"``; the numerical and linear solvers
-    should agree to L-BFGS-B precision.
+    Numerical witness against the linear
+    :func:`solve_equilibrium_graph_laplacian`; the two should agree to
+    L-BFGS-B precision.  Only the ``graph_laplacian`` lateral law is
+    supported.
     """
     if delta0 is None:
         delta0 = np.zeros((lat.N, 3))
@@ -1108,10 +1137,11 @@ __all__ = [
     "make_chain",
     "make_arc",
     "make_dome",
+    "make_flat_grid",
     "build_K_matrix",
     "chain_analytical_eigenvalues",
     "chain_discrete_decay_length",
-    # v2 unified lattice contact path (contract §6).
+    # Lattice contact (theory.md §6).
     "solve_lattice_contact",
     "lattice_contact_normal_forces",
     # Per-sphere primitives (anchor + graph-Laplacian lateral).

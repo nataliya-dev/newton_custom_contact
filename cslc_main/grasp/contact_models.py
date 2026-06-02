@@ -58,7 +58,10 @@ from .objects import (
     box_surface_area,
     compute_k_max,
     make_box_target,
+    make_bunny_trimesh,
+    make_mesh_target,
     make_sphere_target,
+    resolve_bunny_n_samples,
 )
 
 # Newton geometry-type integer for SPHERE.  Phase 7: sphere objects are
@@ -144,11 +147,11 @@ def make_pad_shape_cfg(
             cslc_alpha=cslc.alpha,
         )
     elif contact_model == "hydro":
-        # Under hydro the pad's physical compliance is set via ``kh``
+        # Under hydro the pad's physical compliance is set via ``kh_pad``
         # (Pa/m), NOT via ``ke``.  ``ke_pad_physical`` is silently
         # unused -- it would only affect a hypothetical CSLC pad
         # building atop the hydro pipeline, which doesn't exist.
-        kwargs.update(kh=material.kh, is_hydroelastic=True)
+        kwargs.update(kh=material.kh_pad, is_hydroelastic=True)
     # "point": no extra kwargs — bare Hunt-Crossley + Coulomb.
     return newton.ModelBuilder.ShapeConfig(**kwargs)
 
@@ -302,6 +305,29 @@ def build_cslc_handler_with_mesh_pads(
                         other_geo_type=gt_other,
                     )
                 )
+            elif gt_other in _MESH_LIKE_TYPES:
+                # Mesh target (e.g. the bunny): Lloyd-sample its surface
+                # into a point-set, exactly like the pad contact face.
+                if obj is None or obj.kind != "bunny":
+                    raise RuntimeError(
+                        f"CSLC pair has MESH target (shape {other}) but "
+                        f"obj is not a bunny object (kind="
+                        f"{obj.kind if obj else 'None'!r}).  Pass "
+                        f"obj=config.object with kind='bunny' so "
+                        f"make_mesh_target can sample the surface."
+                    )
+                if other not in point_set_samples_by_shape:
+                    tm = make_bunny_trimesh(obj)
+                    point_set_samples_by_shape[other] = make_mesh_target(
+                        tm, resolve_bunny_n_samples(obj, tm)
+                    )
+                shape_pairs.append(
+                    CSLCShapePair(
+                        cslc_shape=cslc_shape,
+                        other_shape=other,
+                        other_geo_type=gt_other,
+                    )
+                )
             # other geo types: silently skipped.
     if not shape_pairs:
         return None
@@ -440,6 +466,14 @@ def build_cslc_handler_with_mesh_pads(
             # contact point.  Use total area; compute_k_max's
             # INCLUSION_FACTOR scaling handles the rest.
             target_surface_area = 4.0 * float(np.pi) * obj.radius ** 2
+            max_face_area = target_surface_area
+        elif obj.kind == "bunny":
+            # Full mesh surface area (= Σ per-sample Voronoi areas).  Like
+            # the sphere case there is no flat-face clip cap; the one-sided
+            # alignment cull + locality kernel already bound the reach, so
+            # use the total area and let compute_k_max's INCLUSION_FACTOR
+            # scaling size the buffer.
+            target_surface_area = float(samples["areas"].sum())
             max_face_area = target_surface_area
         else:
             raise RuntimeError(

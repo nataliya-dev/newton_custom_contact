@@ -31,9 +31,11 @@ Two solvers share the per-sphere displacement buffer
     close-packed packing), not from a Voronoi area baked at load.
   - Hard culls on the active-set gates (``raw < 0`` and
     ``alignment ≤ 0``) instead of the C∞ smooth gates the CSLC kernel
-    uses for ``wp.Tape``-friendly backprop.  ``phi_eff`` keeps the
-    smooth_relu lift so the contact force has no first-touch
-    discontinuity.
+    uses for ``wp.Tape``-friendly backprop.  ``phi_eff`` uses
+    ``smooth_blend`` (the rigid-body kernel's post-fix-A form), exactly
+    zero for ``raw ≤ 0`` and exactly ``raw^{1.5}`` at depth, so the
+    contact force has neither a first-touch discontinuity nor the
+    ``ε^{1.5}`` floor that the C∞ ``smooth_relu`` surrogate produces.
 
 Both kernels write the same buffer with the same sign convention, so
 :func:`accumulate_cslc_body_wrench` consumes either output uniformly:
@@ -54,8 +56,9 @@ from ...geometry import ParticleFlags
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Smooth surrogates — mirror cslc_kernels.smooth_relu / smooth_step
-#  (only smooth_relu is used; hard culls replace the smooth gates).
+#  Smooth surrogates — mirror cslc_kernels.smooth_relu / smooth_blend
+#  / smooth_step (hard culls replace the smooth gates here; phi_eff
+#  uses smooth_blend, which is exactly 0 at raw=0).
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -63,12 +66,37 @@ from ...geometry import ParticleFlags
 def smooth_relu(x: float, eps: float) -> float:
     """``0.5·(x + sqrt(x² + ε²))`` — C∞ surrogate for max(x, 0).
 
-    Matches ``cslc_kernels.smooth_relu`` exactly.  Used here for the
-    Hertz-like ``phi_eff = σ_ε(raw) · sqrt(σ_ε(raw) + ε)`` lift so the
-    per-contact stiffness vanishes smoothly at first touch (``raw → 0``)
-    rather than producing a step-function impulse.
+    Matches ``cslc_kernels.smooth_relu`` exactly.  Retained for
+    reference / cross-kernel parity; ``phi_eff`` now uses
+    ``smooth_blend`` instead because ``smooth_relu(0) = ε/2 ≠ 0``
+    propagates an ``ε^{1.5}`` baseline force through the Hertz lift.
     """
     return 0.5 * (x + wp.sqrt(x * x + eps * eps))
+
+
+@wp.func
+def smooth_blend(x: float, eps: float) -> float:
+    """One-sided Hermite-quintic blend: 0 for x ≤ 0, x for x ≥ ε.
+
+    Mirror of ``cslc_kernels.smooth_blend``.  Used for the Hertz-like
+    ``phi_eff = β_ε(raw) · sqrt(β_ε(raw) + ε)`` lift so the per-contact
+    stiffness vanishes at first touch (``raw → 0``) AND the force is
+    EXACTLY zero before contact, eliminating the ``ε^{1.5}`` baseline
+    that the C∞ ``smooth_relu`` surrogate carries through ``smooth_relu(0)
+    = ε/2``.  C² at both endpoints (``H₅`` and its first two derivatives
+    vanish at ``t ∈ {0, 1}``), which is sufficient for ``wp.Tape``
+    reverse-mode autodiff through the lattice solve.
+    """
+    if x <= 0.0:
+        return 0.0
+    if x >= eps:
+        return x
+    t = x / eps
+    t2 = t * t
+    t3 = t2 * t
+    # H₅(t) = t³·(10 − 15t + 6t²); C² at t=0 and t=1.
+    h = t3 * (10.0 - 15.0 * t + 6.0 * t2)
+    return x * h
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -260,6 +288,15 @@ def solve_lattice_jacobi_step(
     k_stick: float,
     mu_friction: float,
     clamp_delta_max: float,
+    # B3 -- lattice velocity damping (implicit-Euler).
+    # ``delta_prev_step`` is the snapshot of ``lattice_delta`` taken
+    # at the start of this contact substep (= ``model.lattice_delta_prev``
+    # after the snapshot in ``SolverUXPBD.compute_compliant_contact_response``).
+    # ``c_over_dt = c_lattice / dt`` is the damping rate.  Setting
+    # ``c_over_dt = 0`` makes the damping term identically zero and the
+    # kernel reduces to the pre-B3 form bit-for-bit.
+    delta_prev_step: wp.array[wp.vec3],
+    c_over_dt: float,
 ):
     """One damped Jacobi sweep over the UXPBD lattice (mirror of
     ``cslc_kernels.jacobi_step``).
@@ -309,7 +346,7 @@ def solve_lattice_jacobi_step(
             δ in update_lattice_world_positions).
         max_radius: ``model.particle_max_radius``; the hash query
             radius is ``r_i + max_radius``, matching the contact pass.
-        eps: Smoothing width for ``smooth_relu`` (CSLCParams.smoothing_eps).
+        eps: Smoothing width for ``smooth_blend`` (CSLCParams.smoothing_eps).
         alpha_damping: Jacobi damping factor ∈ (0, 1].  1.0 = undamped.
         ka_tangent_ratio: ``k_a_t / k_a``; anisotropic anchor stiffness
             on the two in-plane (tangential) axes.
@@ -317,6 +354,17 @@ def solve_lattice_jacobi_step(
             friction; see ``cslc_kernels.jacobi_step`` for the form).
         clamp_delta_max: Optional upper bound on ``|δ|`` [m]; pass a
             negative sentinel to disable.
+        delta_prev_step: Snapshot of ``lattice_delta`` taken at the
+            start of this contact substep (B3 reference for the
+            implicit-Euler damping term).  Caller passes
+            ``model.lattice_delta_prev`` after the substep-start
+            snapshot.  Read-only inside the kernel.
+        c_over_dt: ``c_lattice / dt``, the implicit-Euler damping rate
+            [N·s/m / s = N/m].  Pass 0.0 to disable (kernel reduces to
+            the pre-B3 form bit-for-bit).  Positive values add
+            ``c_over_dt`` to both per-axis diagonals and add
+            ``c_over_dt · delta_prev_step`` to the explicit RHS; the
+            iteration is unconditionally stable in this term.
     """
     sid = wp.tid()
 
@@ -425,10 +473,16 @@ def solve_lattice_jacobi_step(
         align_arg = -wp.dot(n_pair, n_world)
         if align_arg <= 0.0:
             continue
-        # Hertz-like phi_eff with smoothed ReLU (mirrors
-        # cslc_kernels.jacobi_step lines ~715-716).  C∞ at raw = 0 so
-        # per-contact stiffness vanishes at first touch.
-        raw_pos = smooth_relu(raw, eps)
+        # Hertz-like phi_eff with one-sided polynomial blend (mirrors
+        # cslc_kernels.jacobi_step post-fix-A).  smooth_blend is exactly
+        # 0 for raw ≤ 0 and exactly raw for raw ≥ ε with a C² Hermite-
+        # quintic transition, so phi_eff(raw = 0) = 0 EXACTLY (no
+        # ε^{1.5} baseline force the way ``smooth_relu(0) = ε/2`` would
+        # produce) and phi_eff = raw^{1.5} EXACTLY at depth (true Hertz).
+        # The +ε inside the sqrt is a gradient-safety regulariser; since
+        # smooth_blend = 0 for raw ≤ 0 it multiplies to zero and
+        # contributes no floor.
+        raw_pos = smooth_blend(raw, eps)
         phi_eff = raw_pos * wp.sqrt(raw_pos + eps)
         # Per-particle area weight A_j (UXPBD substitute for the CSLC
         # target Voronoi area).  For a close-packed sphere object,
@@ -474,10 +528,24 @@ def solve_lattice_jacobi_step(
         f_friction_vec = -scale_used * delta_t
 
     # ────────────────────────────────────────────────────────────────
+    # B3 -- implicit-Euler lattice velocity damping.
+    # Continuum equation: c · δ̇ + (anchor + lateral + contact + ...) δ = ...
+    # Backward-Euler: δ̇ ≈ (δ_new − δ_prev_step) / dt, so the (c/dt)
+    # coefficient appears on BOTH sides of the Jacobi update:
+    #   * EXPLICIT (rhs):  +c_over_dt · δ_prev_step  (constant within iter)
+    #   * IMPLICIT (lhs):  +c_over_dt added to k_diag_{n,t}
+    # When c_over_dt = 0 both contributions vanish and the kernel
+    # collapses to the pre-B3 form.  When c_over_dt > 0 the form is
+    # unconditionally stable -- raising c_over_dt monotonically pulls
+    # δ_new toward δ_prev_step.
+    # ────────────────────────────────────────────────────────────────
+    f_damping = c_over_dt * delta_prev_step[sid]
+
+    # ────────────────────────────────────────────────────────────────
     # Anisotropic block-Jacobi in pad sphere's local rest-normal frame
     # (mirror cslc_kernels.jacobi_step lines ~813-844).
     # ────────────────────────────────────────────────────────────────
-    rhs_explicit = f_contact_vec + f_lateral + f_friction_vec
+    rhs_explicit = f_contact_vec + f_lateral + f_friction_vec + f_damping
     rhs_n_scalar = wp.dot(rhs_explicit, n_world)
     rhs_t_vec = rhs_explicit - rhs_n_scalar * n_world
 
@@ -488,8 +556,11 @@ def solve_lattice_jacobi_step(
     ka_t = ka * ka_tangent_ratio
     S_n = kl * float(n_neighbors) + sum_gate_n
     S_t = kl * float(n_neighbors) + sum_gate_t
-    k_diag_n = ka + S_n
-    k_diag_t = ka_t + S_t
+    # B3 -- c_over_dt added to BOTH per-axis diagonals.  Pairs with
+    # the c_over_dt · δ_prev_step term added to rhs_explicit above.
+    # When c_over_dt = 0 this collapses to the pre-B3 diagonal.
+    k_diag_n = ka + S_n + c_over_dt
+    k_diag_t = ka_t + S_t + c_over_dt
 
     rhs_n_total = rhs_n_scalar + S_n * delta_old_n
     rhs_t_total = rhs_t_vec + S_t * delta_old_t
@@ -538,43 +609,40 @@ def accumulate_cslc_body_wrench(
     The anchor connects pad sphere ``i`` to its host body via an
     anisotropic spring with normal stiffness ``k_a`` and tangent
     stiffness ``k_a · ratio`` in the pad's local rest-normal frame.
-    A vec3 displacement ``δ_i`` (CSLC sign: outward positive)
-    decomposes as ``δ_n_scalar = δ · n_outward``,
-    ``δ_t = δ − δ_n_scalar · n_outward``; the spring force on the
-    sphere is
+    Sign convention: ``q_i = p_i − δ_i``, so the sphere centre sits at
+    ``p_i − δ_i`` and the spring is stretched by ``δ`` from its rest
+    state.
 
-        F_sphere = -k_a · δ_n_scalar · n_outward  -  k_a · ratio · δ_t
+    Hooke's law on the sphere from the anchor spring (anchor point
+    pinned to body at ``p_rest``):
 
-    By Newton's 3rd, ``F_body = -F_sphere = +k_a · δ_n · n_outward +
-    k_a · ratio · δ_t``... wait that's pushing the body INTO the
-    object, which is wrong.  The right derivation:
+        F_sphere = -k · (q − p_rest) = -k · (-δ) = +k · δ
 
-    The spring REST length is set so the SPHERE rests at ``p_rest``.
-    When the sphere is compressed inward by ``δ`` (sphere moves to
-    ``p_rest - δ``), the spring is COMPRESSED along ``+n_outward`` by
-    ``δ_n_scalar`` (positive δ_n means closer body↔sphere distance).
-    A compressed spring pushes its ends APART: sphere outward (along
-    ``+n_outward``), body inward (along ``-n_outward``).  So
-    ``F_body = -k_a · δ_n_scalar · n_outward`` (= ``-k_a · (δ ·
-    n_outward) · n_outward``, the normal-axis component of ``-k_a · δ``).
+    Componentwise with anisotropic stiffness:
 
-    Tangentially, ``δ_t`` represents the sphere shearing relative to
-    the body; the spring exerts ``+k_a·ratio · δ_t`` on the body to
-    restore relative position.
+        F_sphere = +k_a · δ_n · n_outward  +  k_a · ratio · δ_t
 
-    Combining: ``F_body = -k_a · δ_n_scalar · n_outward + k_a·ratio · δ_t``.
-    When ratio = 1 (isotropic), this collapses to
-    ``F_body = -k_a · (δ_n · n_outward) + k_a · (δ − δ_n · n_outward)
-              = k_a · (δ − 2·δ_n·n_outward) = k_a · (δ_t − δ_n · n_outward)``.
-    That's NOT equal to ``-k_a · δ`` in general — the normal axis
-    flips sign relative to the tangent under our convention.
+    Newton's 3rd:
 
-    Cross-check: when ``δ = δ_n · n_outward`` (pure compression, no
-    shear), ``δ_t = 0``, ``F_body = -k_a · δ_n · n_outward``.  For the
-    left pad with ``n_outward = +X`` and ``δ_n > 0``, ``F_body``
-    points along ``-X`` — pushes the pad body AWAY from the object
-    (the ball at +X side pressing on the pad pushes the pad to more
-    negative X).  ✓
+        F_body = -F_sphere
+               = -k_a · δ_n · n_outward  -  k_a · ratio · δ_t
+
+    The body is pulled along ``-δ`` — opposite to the direction the
+    sphere has been displaced from rest.
+
+    Cross-check (normal axis): pure inward compression with
+    ``δ = δ_n · n_outward``, ``δ_n > 0``.  For the left pad with
+    ``n_outward = +X``, ``F_body = -k_a · δ_n · n_outward`` points
+    along ``-X`` — the pad body is pushed AWAY from the object on the
+    +X side that is pressing it.  ✓
+
+    Cross-check (tangent axis): sphere sheared in ``+Y`` by external
+    force, ``q = p + (0, ε, 0)`` so ``δ = p − q = (0, −ε, 0)``,
+    ``δ_t = (0, −ε, 0)``.  The spring is stretched in ``+Y``, pulling
+    the sphere back toward p in ``-Y`` (so ``F_sphere_y = -k·ε``).  By
+    Newton's 3rd the body is pulled in ``+Y`` (``F_body_y = +k·ε``).
+    With our formula, ``F_body = -k_a · (0, −ε, 0) = (0, +k_a·ε, 0)``.
+    ✓
 
     Run inside the iteration loop after the pp contact pass has
     zeroed ``body_delta`` and written its non-lattice contributions.
@@ -604,12 +672,16 @@ def accumulate_cslc_body_wrench(
     delta_n_scalar = wp.dot(delta, n_world)
     delta_t = delta - delta_n_scalar * n_world
 
-    # Anchor spring force on the BODY.  Normal axis: compressed spring
-    # pushes body inward (-n_world).  Tangent axes: shear spring drags
-    # body along the same direction the sphere was sheared (+δ_t).
+    # Anchor spring force on the BODY (Newton's 3rd of F_sphere = +k·δ):
+    # both axes get ``-k · δ`` with anisotropic stiffness on the tangent.
+    # The pre-fix kernel had ``+k_a_t * delta_t`` (sign error on the
+    # tangent axis), which inverted the body wrench under tangential
+    # shear and would surface as inverted friction reaction once
+    # k_stick > 0.  See unit test
+    # ``test_uxpbd_body_wrench_tangent_sign``.
     k_a = lattice_k_anchor[sid]
     k_a_t = k_a * ka_tangent_ratio
-    F_body = (-k_a * delta_n_scalar) * n_world + k_a_t * delta_t  # [N]
+    F_body = (-k_a * delta_n_scalar) * n_world - k_a_t * delta_t  # [N]
 
     # Cheap early-out if numerically zero after the split.
     if wp.length(F_body) <= 0.0:

@@ -35,6 +35,9 @@ from .cslc_data import CSLCData, CSLCLattice, calibrate_kc
 from .cslc_kernels import (
     compute_cslc_penetration,
     compute_outward_normals_world,
+    compute_pad_pos_world,
+    compute_target_W,
+    compute_target_world_state,
     cslc_copy_active,
     jacobi_step,
     lattice_solve_equilibrium,
@@ -206,6 +209,28 @@ class CSLCHandler:
         # closed-form solve.  Bodies move every step so this cannot be
         # cached at construction.
         self.out_normal_world_scratch = wp.zeros(n, dtype=wp.vec3, device=self.device)
+        # Per-sphere world-frame rest centre, refreshed once per pair
+        # launch by ``compute_pad_pos_world``.  Consumed by
+        # ``jacobi_step`` in place of the per-iter
+        # ``transform_point(X_wb, transform_point(X_ws, p_local))`` -- the
+        # transforms are constant during the n_iter Jacobi sweep, so
+        # hoisting them saves n_spheres × (n_iter − 1) transform pairs per
+        # pair launch.
+        self.pad_pos_world_scratch = wp.zeros(n, dtype=wp.vec3, device=self.device)
+        # Per-pair target world-frame scratch buffers, allocated lazily
+        # in ``_launch`` once ``pair.target_count`` is populated.  Sized
+        # to that pair's target_count and reused across steps.  Keyed by
+        # pair_idx.
+        self._target_pos_world_pairs: dict[int, wp.array] = {}
+        self._target_normal_world_pairs: dict[int, wp.array] = {}
+        # Per-pair partition-of-unity normalizer
+        # ``W_j = Σ_i w_t_ij · α_ij`` (theory fix #3+#4), one scalar per
+        # target sample.  Computed once per pair launch on the warm-
+        # start δ by ``compute_target_W``; consumed by both
+        # ``jacobi_step`` (during the n_iter Jacobi sweep) and
+        # ``write_cslc_contacts`` (during emission) so the lattice
+        # solver and MuJoCo see the same per-pair contact force.
+        self._target_W_pairs: dict[int, wp.array] = {}
         # Vec3 ping-pong buffers for the damped Jacobi iteration; same
         # dtype + layout as ``CSLCData.sphere_delta``.
         self._jacobi_a = wp.zeros(n, dtype=wp.vec3, device=self.device)
@@ -372,54 +397,39 @@ class CSLCHandler:
             pair.other_body = int(shape_body_np[pair.other_shape])
 
         # Calibrate kc on the externally-supplied lattices.  ``calibrate_kc``
-        # returns a per-sphere [N/m] stiffness satisfying the contract §10
-        # series-spring identity ``1/k_c = N_contact/k_e_bulk − 1/k_a
-        # − 1/k_e_target``.
+        # returns a per-sphere [N/m] stiffness satisfying the theory §10
+        # three-spring identity
+        #     1/k_c^sphere = N_contact/k_e_bulk − 1/k_a − 1/k_e_target
+        # so the aggregate chain (anchor ⊕ contact ⊕ target body, in
+        # series, summed over N_contact active pairs) reproduces
+        # k_e_bulk exactly.  Passing ke_target here is the three-spring
+        # form; omitting it would give the two-spring (rigid-target)
+        # calibration and softens the actual aggregate by an extra
+        # 1/ke_target term — wrong for compliant targets.
         lattices_ordered = [lattices_by_shape[i] for i in cslc_shape_indices]
         ke_bulk = float(shape_ke[first_cslc])
+        ke_target = float(shape_pairs[0].other_ke)
         kc_per_sphere = calibrate_kc(
             ke_bulk, lattices_ordered, ka=ka,
             contact_fraction=contact_fraction, per_lattice=True,
+            ke_target=ke_target,
         )
 
-        # Compose kc with the target's contact stiffness ke_target
-        # (Phase 6, contract §11 amendment).  The two contact springs
-        # (pad + target body) are in series: every pair carries the
-        # spring rate ``k_pair_eff = kc_per_sphere · ke_target /
-        # (kc_per_sphere + ke_target)``.  v1 buried this composition
-        # inside ``write_cslc_contacts`` (``kc_series = kc·ke/(kc+ke
-        # +ε²)``) but mixed units — kc was per-volume [N/m³] there,
-        # ke_target per-pair [N/m] — and ``jacobi_step`` skipped the
-        # composition entirely, so the lattice solver and emission
-        # disagreed on the per-pair force at any finite ke_target.
-        # Pre-composing here (units consistent: both [N/m]) gives a
-        # single global kc the kernels can use directly.  For multiple
-        # pairs with the same target body, this is unambiguous; for
-        # heterogeneous ke_targets a future extension would store kc
-        # per-pair.
-        ke_target = float(shape_pairs[0].other_ke)
-        kc_per_sphere_eff = (
-            kc_per_sphere * ke_target / (kc_per_sphere + ke_target)
-        )
-
-        # Per-volume rescale (Option-2 tiling): the v2 unified contact
-        # kernels (``jacobi_step``, ``write_cslc_contacts``) multiply
-        # ``kc`` by the per-sample Voronoi area ``A_j`` and the locality
-        # kernel ``w_tangent`` (half-width = r_pad), so the kc the
-        # kernel expects is per-volume [N/m³], not the per-sphere [N/m]
-        # that ``calibrate_kc`` returns.  Divide by the kernel disc
-        # area ``A_kernel = π·r_pad²``.  Pre-Option-2 this used 3·r_pad
-        # and paired with a CSLC_SOFTENING ≈ 0.1 hack to cancel the
-        # resulting 7× kernel-overlap error on a Lloyd lattice; with
-        # kernel_h = r_pad the discs tile without overlap and the
-        # identity ``kc_per_volume · A_kernel = kc_per_sphere`` is
-        # exact.
+        # Per-volume rescale (theory §10 step 3): the contact kernels
+        # (``jacobi_step``, ``write_cslc_contacts``) multiply ``kc`` by
+        # the per-sample Voronoi area ``A_j`` and the locality kernel
+        # ``w_tangent`` (half-width = r_pad), so the kc the kernel
+        # expects is per-volume [N/m³], not the per-sphere [N/m] that
+        # ``calibrate_kc`` returns.  Divide by the kernel disc area
+        # ``A_kernel = π·r_pad²``.  With kernel_h = r_pad the discs tile
+        # without overlap and the identity
+        # ``kc_per_volume · A_kernel = kc_per_sphere`` is exact.
         first_lat = lattices_ordered[0]
         r_pad_avg = float(np.mean(
             first_lat.radii[first_lat.is_surface.astype(bool)]
         ))
         A_kernel = float(np.pi * r_pad_avg * r_pad_avg)
-        kc = kc_per_sphere_eff / A_kernel
+        kc = kc_per_sphere / A_kernel
 
         cslc_data = CSLCData.from_lattices(
             lattices_ordered, ka=ka, kl=kl, kc=kc, dc=dc,
@@ -632,6 +642,49 @@ class CSLCHandler:
             device=self.device,
         )
 
+        # ── Kernel 1c: World-frame per-sphere rest centres ──
+        # Hoisted out of the Jacobi inner loop; X_wb, X_ws are constant
+        # across the n_iter sweeps so the per-sphere world-frame rest
+        # position can be precomputed once per pair launch.
+        wp.launch(
+            kernel=compute_pad_pos_world,
+            dim=data.n_spheres,
+            inputs=[
+                data.positions, data.sphere_shape,
+                state.body_q, model.shape_body, model.shape_transform,
+            ],
+            outputs=[self.pad_pos_world_scratch],
+            device=self.device,
+        )
+
+        # ── Kernel 1d: World-frame per-target pose ──
+        # X_tb is constant across the n_iter Jacobi sweeps, so
+        # transforming target positions / face normals every iter is
+        # pure recomputation.  Allocate per-pair scratch lazily on first
+        # launch (target_count is only finalised by the caller AFTER
+        # CSLCHandler.__init__ returns; see CSLCShapePair docstring).
+        tp_world = self._target_pos_world_pairs.get(pair_idx)
+        if tp_world is None or tp_world.shape[0] != pair.target_count:
+            tp_world = wp.zeros(
+                pair.target_count, dtype=wp.vec3, device=self.device)
+            tn_world = wp.zeros(
+                pair.target_count, dtype=wp.vec3, device=self.device)
+            self._target_pos_world_pairs[pair_idx] = tp_world
+            self._target_normal_world_pairs[pair_idx] = tn_world
+        else:
+            tn_world = self._target_normal_world_pairs[pair_idx]
+        wp.launch(
+            kernel=compute_target_world_state,
+            dim=pair.target_count,
+            inputs=[
+                pair.target_positions_local,
+                pair.target_normals_local,
+                state.body_q, pair.other_body,
+            ],
+            outputs=[tp_world, tn_world],
+            device=self.device,
+        )
+
         # ── Kernel 2: Lattice equilibrium solve (linear warm-start) ──
         if data.A_inv is not None:
             wp.launch(
@@ -648,27 +701,72 @@ class CSLCHandler:
             wp.copy(self._jacobi_a, data.sphere_delta)
             src, dst = self._jacobi_a, self._jacobi_b
 
+        # ── Allocate the per-target partition-of-unity buffer ──
+        # Theory fix #3+#4 scratch — W_j = Σ_i w_t_ij · α_ij, one scalar
+        # per target sample.  Lazily allocated per pair (target_count is
+        # only finalised by the caller after __init__ returns).
+        W_targets = self._target_W_pairs.get(pair_idx)
+        if W_targets is None or W_targets.shape[0] != pair.target_count:
+            W_targets = wp.zeros(
+                pair.target_count, dtype=wp.float32, device=self.device)
+            self._target_W_pairs[pair_idx] = W_targets
+
         # ── Damped Jacobi refinement (contract §6.5) ──
+        # Per-sphere/per-target pose-dependent quantities are precomputed
+        # in kernels 1b/1c/1d above; jacobi_step reads them directly
+        # instead of recomputing transforms every sweep.
+        #
+        # W_j is recomputed every iteration on the current src δ
+        # (theory fix #3+#4, plan v4).  Reason: "compute-W-once-on-
+        # warm-start" (v3) is unsafe because a pad sphere can shift
+        # in/out of the active set during the n_iter sweep as δ
+        # updates change d_t_ij.  When the warm-start W misses a pad
+        # sphere that later becomes active, the per-pair force divides
+        # by an artificially small (or zero) W and explodes — the
+        # NaN cascade observed at SQUEEZE-onset before this plan-v4
+        # promotion.  Per-iter W is ~2× kernel launches per sweep but
+        # restores the partition-of-unity invariant Σ_i share_ij = 1
+        # at every iteration.  If profiling shows this dominates, the
+        # next optimization is to refresh W every K iterations instead
+        # of every iteration (active set stabilises within ~5 sweeps
+        # post-warm-start).
         for _ in range(self.n_iter):
+            wp.launch(
+                kernel=compute_target_W,
+                dim=pair.target_count,
+                inputs=[
+                    src,
+                    data.radii,
+                    data.is_surface,
+                    data.sphere_shape, pair.cslc_shape,
+                    data.n_spheres,
+                    self.pad_pos_world_scratch,
+                    self.out_normal_world_scratch,
+                    tp_world, tn_world,
+                    eps,
+                ],
+                outputs=[W_targets],
+                device=self.device,
+            )
             wp.launch(
                 kernel=jacobi_step,
                 dim=data.n_spheres,
                 inputs=[
                     src, dst,
                     data.radii,
-                    data.positions,
                     data.is_surface,
                     data.neighbor_start, data.neighbor_count,
                     data.neighbor_list,
                     data.ka, data.kl, data.kc, self.alpha,
                     data.sphere_shape, pair.cslc_shape,
-                    data.outward_normals,
-                    state.body_q, model.shape_body, model.shape_transform,
+                    self.pad_pos_world_scratch,
+                    self.out_normal_world_scratch,
                     data.ka_tangent_ratio,
                     data.k_stick, data.mu_friction,
-                    pair.target_positions_local,
-                    pair.target_normals_local, pair.target_areas_local,
-                    pair.target_count, pair.other_body,
+                    tp_world, tn_world,
+                    pair.target_areas_local,
+                    W_targets,
+                    pair.target_count,
                     # No external tangential load in production
                     # (apex_idx = -1 is the no-op sentinel).
                     int(-1), wp.vec3(0.0, 0.0, 0.0),
@@ -687,6 +785,29 @@ class CSLCHandler:
             dim=data.n_spheres,
             inputs=[src, data.sphere_shape, pair.cslc_shape],
             outputs=[data.sphere_delta],
+            device=self.device,
+        )
+
+        # ── Refresh W on converged δ for emission parity ──
+        # The last in-loop W was computed on the pre-final-sweep δ.
+        # MuJoCo's per-contact force = stiffness · solver_pen needs to
+        # match jacobi_step's per-pair force at the CONVERGED δ, so
+        # write_cslc_contacts must consume W evaluated at that δ.
+        wp.launch(
+            kernel=compute_target_W,
+            dim=pair.target_count,
+            inputs=[
+                src,
+                data.radii,
+                data.is_surface,
+                data.sphere_shape, pair.cslc_shape,
+                data.n_spheres,
+                self.pad_pos_world_scratch,
+                self.out_normal_world_scratch,
+                tp_world, tn_world,
+                eps,
+            ],
+            outputs=[W_targets],
             device=self.device,
         )
 
@@ -722,6 +843,13 @@ class CSLCHandler:
                 pair.other_ke,
                 data.dc,
                 eps,
+                # Theory fix #3+#4 — partition-of-unity normalizer
+                # shared with the lattice solver above.  Emission uses
+                # the W computed once on the warm-start δ; for the
+                # production grasp scene δ changes are sub-mm across
+                # the Jacobi loop so W is essentially constant from
+                # warm-start to convergence.
+                W_targets,
                 contacts.rigid_contact_stiffness,
                 contacts.rigid_contact_damping,
                 contacts.rigid_contact_friction,

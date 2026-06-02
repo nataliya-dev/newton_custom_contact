@@ -970,6 +970,11 @@ class ModelBuilder:
         """Bulk material stiffness per lattice sphere [N/m] accumulated for :attr:`Model.lattice_k_bulk`."""
         self.lattice_damping: list[float] = []
         """Hunt-Crossley damping coefficient per lattice sphere [s/m] accumulated for :attr:`Model.lattice_damping`."""
+        self.lattice_neighbors: list[list[int]] = []
+        """Per-sphere lists of GLOBAL lattice-sphere neighbour indices (symmetric
+        kNN over rest centres), accumulated for the CSLC lateral graph-Laplacian.
+        Flattened to CSR (:attr:`Model.lattice_neighbors_offset` / ``_count`` /
+        ``_csr``) at :meth:`finalize`."""
 
         # UXPBD Phase 4 fluid metadata accumulators.
         self.fluid_rest_density: list[float] = []
@@ -7552,6 +7557,7 @@ class ModelBuilder:
         k_lateral: float = 5.0e2,
         k_bulk: float = 1.0e5,
         damping: float = 2.0,
+        k_neighbors: int = 6,
     ) -> int:
         """Attach a MorphIt-generated kinematic lattice to an articulated link.
 
@@ -7597,6 +7603,10 @@ class ModelBuilder:
                 ``model.lattice_k_bulk``; v2 calibrates the per-sphere
                 contact stiffness ``k_c`` from this value.
             damping: Hunt-Crossley damping coefficient for v2 CSLC [s/m]. Stored.
+            k_neighbors: Number of nearest neighbours per sphere in the
+                lateral-coupling graph (symmetric kNN over rest centres).
+                Populates ``model.lattice_neighbors_*``; the CSLC Jacobi
+                solver's graph-Laplacian term reads it. Defaults to 6.
 
         Returns:
             The starting index in the lattice arrays for this link's lattice.
@@ -7614,6 +7624,7 @@ class ModelBuilder:
             k_lateral=k_lateral,
             k_bulk=k_bulk,
             damping=damping,
+            k_neighbors=k_neighbors,
         )
 
     def add_lattice_to_all_links(
@@ -10394,14 +10405,32 @@ class ModelBuilder:
                 m.lattice_k_lateral = wp.array(self.lattice_k_lateral, dtype=wp.float32, device=device)
                 m.lattice_k_bulk = wp.array(self.lattice_k_bulk, dtype=wp.float32, device=device)
                 m.lattice_damping = wp.array(self.lattice_damping, dtype=wp.float32, device=device)
-                # lattice_neighbors_csr (edge list) stays empty until
-                # Step 2 wires MorphIt adjacency through.  Allocate the
-                # per-sphere offset/count arrays as zeros so the Jacobi
-                # solver can read them unconditionally (count=0 ⇒ the
-                # lateral Laplacian contribution is identically zero).
-                m.lattice_neighbors_offset = wp.zeros(n_lat, dtype=wp.int32, device=device)
-                m.lattice_neighbors_count = wp.zeros(n_lat, dtype=wp.int32, device=device)
-                m.lattice_neighbors_csr = wp.empty(0, dtype=wp.int32, device=device)
+                # Lateral-coupling adjacency (symmetric kNN), built per
+                # lattice in add_lattice_to_builder. Flatten the per-sphere
+                # neighbour lists into CSR: count[i] = #neighbours of i,
+                # offset = exclusive prefix sum, csr = neighbours
+                # concatenated in sphere order. The CSLC Jacobi solver walks
+                # csr[offset[i] : offset[i]+count[i]] (count=0 ⇒ no lateral
+                # term). Falls back to a zero (no-edge) graph if the
+                # accumulator was not populated for every sphere.
+                if len(self.lattice_neighbors) == n_lat:
+                    nbr_counts = np.array(
+                        [len(nb) for nb in self.lattice_neighbors], dtype=np.int32)
+                    nbr_offsets = np.zeros(n_lat, dtype=np.int32)
+                    if n_lat > 1:
+                        nbr_offsets[1:] = np.cumsum(nbr_counts[:-1])
+                    nbr_csr = np.fromiter(
+                        (j for nb in self.lattice_neighbors for j in nb),
+                        dtype=np.int32, count=int(nbr_counts.sum()))
+                    m.lattice_neighbors_offset = wp.array(nbr_offsets, dtype=wp.int32, device=device)
+                    m.lattice_neighbors_count = wp.array(nbr_counts, dtype=wp.int32, device=device)
+                    m.lattice_neighbors_csr = (
+                        wp.array(nbr_csr, dtype=wp.int32, device=device)
+                        if nbr_csr.size else wp.empty(0, dtype=wp.int32, device=device))
+                else:
+                    m.lattice_neighbors_offset = wp.zeros(n_lat, dtype=wp.int32, device=device)
+                    m.lattice_neighbors_count = wp.zeros(n_lat, dtype=wp.int32, device=device)
+                    m.lattice_neighbors_csr = wp.empty(0, dtype=wp.int32, device=device)
 
             # Per-link CSR offsets for the lattice arrays.
             if n_lat:

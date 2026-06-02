@@ -50,10 +50,13 @@ def make_object_shape_cfg(
 ) -> newton.ModelBuilder.ShapeConfig:
     """Build the ``ShapeConfig`` for the held object's shape.
 
-    For ``contact_model="hydro"`` the sphere primitive gets
-    ``is_hydroelastic=True`` and ``kh``; Newton generates the SDF from
-    the analytic sphere geometry.  Other contact models use the bare
-    Hunt–Crossley + Coulomb material parameters.
+    For ``contact_model="hydro"`` the object gets ``is_hydroelastic=True``
+    and ``kh``.  For primitives (sphere/box) Newton generates the SDF from
+    the analytic geometry, driven by ``sdf_max_resolution`` on the cfg.
+    A **mesh** object (bunny) must instead carry its SDF on the
+    ``newton.Mesh`` itself (built in :func:`add_object` via
+    ``mesh.build_sdf``); ``add_shape_mesh`` rejects ``cfg.sdf_*``, so we
+    omit ``sdf_max_resolution`` from the cfg in that case.
     """
     # Object's ke flows to MuJoCo as ``pair.other_ke`` -> the
     # series-spring partner in CSLC's calibrate_kc, and as MuJoCo's
@@ -69,11 +72,11 @@ def make_object_shape_cfg(
         density=obj.density,
     )
     if contact_model == "hydro":
-        kwargs.update(
-            kh=material.kh,
-            is_hydroelastic=True,
-            sdf_max_resolution=hydro.sdf_resolution,
-        )
+        kwargs.update(kh=material.kh_object, is_hydroelastic=True)
+        # Primitives generate their SDF from cfg.sdf_max_resolution; mesh
+        # shapes (bunny) carry it on the Mesh instead (see add_object).
+        if obj.kind != "bunny":
+            kwargs["sdf_max_resolution"] = hydro.sdf_resolution
     return newton.ModelBuilder.ShapeConfig(**kwargs)
 
 
@@ -82,22 +85,27 @@ def add_object(
     obj: ObjectParams,
     shape_cfg: newton.ModelBuilder.ShapeConfig,
     spawn_xyz: tuple[float, float, float],
+    *,
+    sdf_resolution: int | None = None,
 ) -> tuple[int, int, int]:
     """Add the held object as a free-joint body to the builder.
 
     Args:
         builder: live ``newton.ModelBuilder``.
-        obj: object params (currently only ``kind="sphere"``).
+        obj: object params (``kind`` in ``{"sphere", "box", "bunny"}``).
         shape_cfg: pre-built shape config (see :func:`make_object_shape_cfg`).
         spawn_xyz: initial centre position of the body.
+        sdf_resolution: max SDF grid resolution for a hydroelastic mesh
+            object (bunny).  Required when ``shape_cfg`` is
+            hydroelastic and the object is a mesh; ignored otherwise.
 
     Returns:
         ``(body_idx, shape_idx, free_joint_idx)``.
     """
-    if obj.kind not in ("sphere", "box"):
+    if obj.kind not in ("sphere", "box", "bunny"):
         raise NotImplementedError(
             f"Held-object kind {obj.kind!r} not implemented yet "
-            "(supported: 'sphere', 'box')."
+            "(supported: 'sphere', 'box', 'bunny')."
         )
 
     body_idx = builder.add_link(
@@ -108,10 +116,28 @@ def add_object(
         shape_idx = builder.add_shape_sphere(
             body_idx, radius=obj.radius, cfg=shape_cfg
         )
-    else:  # box
+    elif obj.kind == "box":
         hx, hy, hz = obj.box_half_extents
         shape_idx = builder.add_shape_box(
             body_idx, hx=hx, hy=hy, hz=hz, cfg=shape_cfg
+        )
+    else:  # bunny mesh
+        tm = make_bunny_trimesh(obj)
+        mesh = newton.Mesh(
+            tm.vertices.astype(np.float32),
+            tm.faces.astype(np.int32).flatten(),
+        )
+        # Hydroelastic needs an SDF attached to the mesh itself (mesh
+        # shapes reject cfg.sdf_*).  Mirror the pad-mesh path in scene.py.
+        if getattr(shape_cfg, "is_hydroelastic", False):
+            if sdf_resolution is None:
+                raise ValueError(
+                    "Hydroelastic bunny object requires sdf_resolution; "
+                    "pass sdf_resolution=config.hydro.sdf_resolution."
+                )
+            mesh.build_sdf(max_resolution=sdf_resolution, margin=shape_cfg.gap)
+        shape_idx = builder.add_shape_mesh(
+            body_idx, mesh=mesh, cfg=shape_cfg, label="object_mesh"
         )
     j_free = builder.add_joint_free(body_idx, label="object_free")
     builder.add_articulation([j_free], label="object")
@@ -278,6 +304,141 @@ def make_sphere_target(
         "normals": target.normals.astype(np.float32),
         "areas": target.areas.astype(np.float32),
     }
+
+
+# ── Bunny mesh object (Phase 8) ──────────────────────────────────────────
+
+
+# Cache the scaled/centred bunny mesh by (path, height) so the three
+# consumers — ObjectParams geometry properties, the collision shape in
+# add_object, and the CSLC target sampler — all share one load and an
+# identical transform.  Values are read-only; do not mutate in place.
+_BUNNY_MESH_CACHE: dict[tuple[str, float], "object"] = {}
+
+
+def make_bunny_trimesh(obj: ObjectParams):
+    """Load, scale, and centre the bunny mesh for use as a held object.
+
+    Mirrors the sizing recipe in
+    :mod:`cslc_main.grasp.preview_targets`: load the OBJ, uniformly
+    scale it so its **vertical (Z) extent** equals ``obj.bunny_height``,
+    then translate it so its bounding-box centre is at the origin.  This
+    matches the sphere/box convention where the body origin sits at the
+    object's geometric centre, so :data:`ObjectParams.settled_z_center`
+    (= ½·height) and :data:`ObjectParams.grasp_axis_half` (= ½·X-extent)
+    place the pads correctly.
+
+    Returns a cached ``trimesh.Trimesh`` keyed by ``(path, height)``.
+    """
+    key = (str(obj.bunny_obj), float(obj.bunny_height))
+    cached = _BUNNY_MESH_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    import trimesh  # local: heavy optional dep, banned at module level (TID253)
+
+    tm = trimesh.load(str(obj.bunny_obj), force="mesh")
+    if not isinstance(tm, trimesh.Trimesh):
+        raise RuntimeError(f"{obj.bunny_obj} did not load as a single mesh")
+    # Scale so the upright (Z) extent matches the requested height.
+    tm.apply_scale(float(obj.bunny_height) / float(tm.extents[2]))
+    # Centre on the CENTRE OF MASS, not the bounding-box centre: the
+    # bunny's bulk is offset from its bbox centre (~10 mm in Y, ~14 mm in
+    # Z for the shipped mesh), so bbox-centring leaves the dense body
+    # hanging to one side and below the grip point — it looks (and grasps)
+    # off-centre.  Centring on the COM puts the mass symmetric between the
+    # pads.  ``center_mass`` needs a watertight mesh; fall back to the
+    # area centroid otherwise.
+    centre = tm.center_mass if tm.is_watertight else tm.centroid
+    tm.apply_translation(-np.asarray(centre, dtype=np.float64))
+    _BUNNY_MESH_CACHE[key] = tm
+    return tm
+
+
+def bunny_grasp_half_width(obj: ObjectParams, tm=None,
+                           band_frac: float = 0.5) -> float:
+    """Half-extent [m] along the closing (X) axis over the central band.
+
+    The pads contact the bunny near its vertical centre, so the relevant
+    width is the cross-section there — **not** the bunny's global max
+    X-extent, which can come from a protrusion at a different height (an
+    ear, the base).  Using the global max would spawn the pads too far
+    out: they would stop ``squeeze_depth`` short of the global max and
+    never reach — let alone penetrate — the surface at the grasp height,
+    so the grasp applies no force and the object never lifts.
+
+    Returns the half-width over vertices within ``band_frac · half_height``
+    of the centre plane (``z = 0`` in the centred mesh).  ``band_frac =
+    0.5`` covers ±¼·height, comfortably spanning both the dome (~20 mm)
+    and box (~40 mm) pad faces on a 100 mm-tall bunny.
+    """
+    tm = tm if tm is not None else make_bunny_trimesh(obj)
+    v = np.asarray(tm.vertices)
+    half_h = 0.5 * float(tm.extents[2])
+    in_band = np.abs(v[:, 2]) <= band_frac * half_h
+    xs = v[in_band, 0] if in_band.any() else v[:, 0]
+    return 0.5 * float(xs.max() - xs.min())
+
+
+def make_mesh_target(tm, n_samples: int) -> dict[str, np.ndarray]:
+    """Lloyd/CVT-sample a mesh surface into a CSLC point-set target.
+
+    Same sampler as the pad contact face
+    (:func:`cslc_main.grasp.pads.sample_pad_contact_face`) and the
+    preview still-life: draw ``n_samples`` centroidal-Voronoi points with
+    ``point_cloud_utils`` and recover each sample's outward normal from
+    the nearest triangle.  Returns the same
+    ``{positions, radii, normals, areas}`` dict layout as
+    :func:`make_box_target` / :func:`make_sphere_target` so the CSLC
+    handler consumes all object kinds uniformly.
+
+    Args:
+        tm: the body-local ``trimesh.Trimesh`` to sample (already scaled
+            and centred — see :func:`make_bunny_trimesh`).
+        n_samples: number of Lloyd surface samples.
+
+    Returns:
+        Dict with four ``np.ndarray`` fields, all body-local:
+          * ``positions``: ``(N, 3) float32``
+          * ``radii``:     ``(N,) float32`` -- placeholder (not read by
+            the half-space kernels), for return-dict parity.
+          * ``normals``:   ``(N, 3) float32`` -- outward face normal.
+          * ``areas``:     ``(N,) float32`` [m²] -- uniform Voronoi cell
+            ``surface_area / N`` (Lloyd samples are area-equalising), so
+            the discrete sum over samples recovers the full surface area.
+    """
+    import point_cloud_utils as pcu  # local: heavy optional dep
+    import trimesh  # local: banned at module level (TID253)
+
+    if n_samples < 4:
+        raise ValueError(f"n_samples ≥ 4 required, got {n_samples}")
+    v = np.asarray(tm.vertices, dtype=np.float64)
+    f = np.asarray(tm.faces, dtype=np.int32)
+    pts = np.asarray(pcu.sample_mesh_lloyd(v, f, int(n_samples)))
+    _, _, tri_id = trimesh.proximity.closest_point(tm, pts)
+    normals = np.asarray(tm.face_normals)[tri_id]
+    n = int(pts.shape[0])
+    area_per_sample = float(tm.area) / max(n, 1)
+    return {
+        "positions": pts.astype(np.float32),
+        "radii": np.full(n, 1.0e-3, dtype=np.float32),
+        "normals": normals.astype(np.float32),
+        "areas": np.full(n, area_per_sample, dtype=np.float32),
+    }
+
+
+def resolve_bunny_n_samples(obj: ObjectParams, tm) -> int:
+    """Resolve the bunny target sample count.
+
+    ``obj.bunny_n_samples > 0`` is used verbatim; ``0`` auto-matches the
+    sphere's surface point **density** (samples / m²) so inter-point
+    spacing reads consistently across object kinds — the same rule the
+    preview still-life uses.
+    """
+    if obj.bunny_n_samples > 0:
+        return int(obj.bunny_n_samples)
+    sphere_density = obj.sphere_n_samples / (4.0 * math.pi * obj.radius ** 2)
+    return max(50, int(round(sphere_density * float(tm.area))))
 
 
 def box_face_area(half_extents: tuple[float, float, float], face: str) -> float:

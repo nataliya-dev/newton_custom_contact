@@ -85,6 +85,34 @@ def load_morphit_lattice(volume_data: str | Path | dict[str, Any]) -> dict[str, 
     }
 
 
+def _build_lattice_neighbors(centers: np.ndarray, k_neighbors: int) -> list[list[int]]:
+    """Symmetric k-nearest-neighbour adjacency over lattice rest centres.
+
+    Returns a per-sphere list of LOCAL neighbour indices (0..n-1) that seeds
+    the CSLC lateral graph-Laplacian coupling (``f_lateral = -k_l Σ_j
+    (δ_i - δ_j)``). Brute-force O(n^2) over the small (≲250) per-lattice
+    sphere set, so no scipy dependency. The graph is symmetrised (edge i-j
+    implies j-i) so the discrete Laplacian is symmetric. Distances use the
+    raw rest centres; any rigid pose (``pos``/``rot``) preserves them, so
+    the topology is pose-invariant.
+    """
+    n = int(centers.shape[0])
+    if n <= 1 or k_neighbors <= 0:
+        return [[] for _ in range(n)]
+    diff = centers[:, None, :] - centers[None, :, :]
+    d2 = np.einsum("ijk,ijk->ij", diff, diff)
+    np.fill_diagonal(d2, np.inf)
+    kk = min(int(k_neighbors), n - 1)
+    nn = np.argpartition(d2, kk - 1, axis=1)[:, :kk]
+    adj: list[set[int]] = [set() for _ in range(n)]
+    for i in range(n):
+        for j in nn[i]:
+            jj = int(j)
+            adj[i].add(jj)
+            adj[jj].add(i)
+    return [sorted(a) for a in adj]
+
+
 def add_lattice_to_builder(
     builder,
     link: int,
@@ -96,6 +124,7 @@ def add_lattice_to_builder(
     k_lateral: float = 5.0e2,
     k_bulk: float = 1.0e5,
     damping: float = 2.0,
+    k_neighbors: int = 6,
 ) -> int:
     """Attach a MorphIt-generated lattice to an articulated link.
 
@@ -167,6 +196,16 @@ def add_lattice_to_builder(
         builder.lattice_k_lateral.append(float(k_lateral))
         builder.lattice_k_bulk.append(float(k_bulk))
         builder.lattice_damping.append(float(damping))
+
+    # Lateral-coupling neighbour graph: symmetric kNN over this lattice's
+    # rest centres, stored as GLOBAL lattice-sphere ids (offset by
+    # lattice_start) so they index ``delta_src`` in
+    # ``solve_lattice_jacobi_step`` directly. Built per-lattice so a
+    # sphere's neighbours are confined to its own pad, never across pads.
+    local_adj = _build_lattice_neighbors(centers, k_neighbors)
+    for i in range(n):
+        builder.lattice_neighbors.append(
+            [lattice_start + int(j) for j in local_adj[i]])
 
     return lattice_start
 

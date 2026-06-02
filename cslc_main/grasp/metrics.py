@@ -29,6 +29,14 @@ class Metrics:
     object_xy_drift: list[float] = field(default_factory=list)
     # Per-step contact count (post-narrow-phase, ≥ 0).
     contacts: list[int] = field(default_factory=list)
+    # Per-step normal force per pad side [N] from MuJoCo actuator torques on
+    # the X-DOF (Newton's 3rd law: actuator must supply same magnitude as
+    # contact reaction along X).  Populated for all contact models.
+    F_n_left: list[float] = field(default_factory=list)
+    F_n_right: list[float] = field(default_factory=list)
+    # Per-step pad inward displacement [m] (commanded by SQUEEZE phase).
+    # Used to recover steady-state penetration depth during HOLD.
+    dx_left: list[float] = field(default_factory=list)
 
     # ── Derived (cheap) ─────────────────────────────────────────────
 
@@ -52,15 +60,31 @@ class Metrics:
         return self.max_z > self.min_z + 0.005
 
     @property
-    def held(self, threshold: float = 0.005) -> bool:
-        """True if the object is still clearly airborne at the end.
+    def held(self) -> bool:
+        """True if the object is still clearly airborne AND at a plausible height.
 
-        ``threshold`` is the minimum clearance [m] between object centre
-        and the highest point during the run that we count as "still
-        held".  Default 5 mm — well above numerical jitter, well below
-        a typical pad lift distance.
+        Two conditions, both required:
+
+        1. ``final_z > min_z + 5mm`` — the object rose at least 5 mm
+           above its low point, comfortably above numerical jitter and
+           well below any sensible pad lift distance.
+
+        2. ``final_z < 0.5 m`` — the object did not fly to orbit.  A
+           well-behaved grasp lands the object within a few cm of the
+           pads' final position (≈ 56 mm for the default tennis-ball
+           scene).  Anything above 0.5 m indicates catastrophic solver
+           divergence: contact force overshoots, the PD launches the
+           pad, and the object follows.  Without this upper bound,
+           ``held=True`` is reported for cases where the object reached
+           18 m or higher (seen in the F*=6N matched-F sweep with
+           under-soft rigid-body contact pairs).
         """
-        return self.final_z > self.min_z + threshold
+        floor_threshold = 0.005   # 5 mm
+        ceiling_threshold = 0.5   # 50 cm — well above any reasonable grasp height
+        return (
+            self.final_z > self.min_z + floor_threshold
+            and self.final_z < ceiling_threshold
+        )
 
     @property
     def xy_slip_max(self) -> float:
